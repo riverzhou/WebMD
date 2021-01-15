@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>落雪的 Markdown Editor</title>
+  <meta name="description" content="Markdown Editor" />
+
+  <link crossorigin rel="preload" href="/assets/npm/font-awesome@4.7.0/fonts/fontawesome-webfont.woff2?v=4.7.0"
+    as="font" type="font/woff2" />
+
+  <link rel="preload" href="/assets/npm/font-awesome@4.7.0/css/font-awesome.min.css" as="style" type="text/css" />
+  <link rel="preload" href="/assets/code/prism.min.css" as="style" type="text/css" />
+
+  <script type="text/javascript" defer="defer" src="/assets/font/iconfont.min.js" charset="utf-8"></script>
+  <script type="text/javascript" defer="defer" src="/assets/markdown/lute/lute.min.js" charset="utf-8"></script>
+
+  <script type="text/javascript" id="prismjs" defer="defer" src="/assets/code/prism.min.js" charset="utf-8"></script>
+  <script>
+    document.getElementById("prismjs").onload = function () {
+      var preloadLink = document.createElement("link");
+      preloadLink.rel = "stylesheet";
+      preloadLink.type = "text/css";
+      preloadLink.href = "/assets/code/prism.min.css";
+      document.head.appendChild(preloadLink);
+    };
+  </script>
+
+  <link rel="icon" type="image/svg+xml" href="/assets/img/favicon.svg" />
+
+  <link rel="stylesheet" type="text/css" href="/assets/npm/font-awesome@4.7.0/css/font-awesome.min.css" />
+
+  <!--
+    <script type="text/x-mathjax-config">
+      MathJax.Hub.Config({
+        tex2jax: {
+          inlineMath: [ ['$','$'], ["\\(","\\)"] ],
+          displayMath: [ ['$$','$$'], ["\\[","\\]"] ]
+        }
+        "HTML-CSS": {
+          linebreaks: {
+            automatic: true,
+            width: "container"
+          }
+        }
+      });
+    </script>
+    -->
+  <!--
+    <script type="text/javascript" defer="defer" src="/assets/npm/mathjax@2/MathJax.js?config=TeX-AMS-MML_HTMLorMML"></script>
+    <script type="text/javascript" defer="defer" src="https://cdn.jsdelivr.net/npm/mathjax@2/MathJax.js?config=TeX-AMS-MML_HTMLorMML"></script>
+    -->
+
+  <script type="text/javascript" defer="defer" src="https://cdn.jsdelivr.net/npm/json5/dist/index.min.js"></script>
+  <script type="text/javascript" defer="defer" src="/assets/npm/echarts@5.0.0/dist/echarts.min.js"></script>
+  <script type="text/javascript" defer="defer" src="/assets/js/md2echarts.js"></script>
+
+  <link rel="stylesheet" href="/assets/css/main.css?v=1" type="text/css" />
+</head>
+
+<body>
+  <h1>
+    Hello World!
+    <span class="title-icons">
+      <i class="fa fa-th-list" aria-hidden="true"></i>
+      <svg class="icon" aria-hidden="true">
+        <use xlink:href="#icon-email"></use>
+      </svg>
+      <svg class="icon" aria-hidden="true">
+        <use xlink:href="#icon-git"></use>
+      </svg>
+      <svg class="icon" aria-hidden="true">
+        <use xlink:href="#icon-weibo"></use>
+      </svg>
+      <svg class="icon" aria-hidden="true">
+        <use xlink:href="#icon-zhihu"></use>
+      </svg>
+      <svg class="icon" aria-hidden="true">
+        <use xlink:href="#icon-wangyi"></use>
+      </svg>
+      <svg class="icon" aria-hidden="true">
+        <use xlink:href="#icon-boke"></use>
+      </svg>
+    </span>
+  </h1>
+
+  <textarea id="debug-info" readonly></textarea>
+
+  <article class="from-markdown">
+    <h3 id="c">C</h3>
+    <pre><code class="language-c">#include &lt;stdio.h&gt;
+
+/* the n-th fibonacci number.
+ */
+unsigned int fib(unsigned int n) {
+  unsigned int a = 1, b = 1;
+  unsigned int tmp;
+  while (--n &gt;= 0) {
+    tmp = a;
+    a += b;
+    b = tmp;
+  }
+  return a;
+}
+
+int main(void)
+{
+  printf("%u", fib(10));
+  return 0;
+}
+</code></pre>
+
+    <h3 id="echarts">Echarts</h3>
+    <pre><code class="language-echarts">{
+  title: {
+    text: '某站点用户访问来源',
+    subtext: '纯属虚构',
+    left: 'center'
+  },
+  tooltip: {
+    trigger: 'item',
+    formatter: '{a} <br/>{b} : {c} ({d}%)'
+  },
+  legend: {
+    orient: 'vertical',
+    left: 'left',
+  },
+  series: [
+    {
+      name: '访问来源',
+      type: 'pie',
+      radius: '50%',
+      data: [
+        {value: 1048, name: '搜索引擎'},
+        {value: 735, name: '直接访问'},
+        {value: 580, name: '邮件营销'},
+        {value: 484, name: '联盟广告'},
+        {value: 300, name: '视频广告'}
+      ],
+      emphasis: {
+        itemStyle: {
+            shadowBlur: 10,
+            shadowOffsetX: 0,
+            shadowColor: 'rgba(0, 0, 0, 0.5)'
+        }
+      }
+    }
+  ]
+}
+</code></pre>
+
+    <h3 id="echarts">Echarts 2</h3>
+    <pre><code class="language-echarts">{
+    tooltip: {
+        trigger: 'item',
+        formatter: '{a} <br/>{b}: {c} ({d}%)'
+    },
+    legend: {
+        data: ['直达', '营销广告', '搜索引擎', '邮件营销', '联盟广告', '视频广告', '百度', '谷歌', '必应', '其他']
+    },
+    series: [
+        {
+            name: '访问来源',
+            type: 'pie',
+            selectedMode: 'single',
+            radius: [0, '30%'],
+            label: {
+                position: 'inner',
+                fontSize: 14,
+            },
+            labelLine: {
+                show: false
+            },
+            data: [
+                {value: 1548, name: '搜索引擎'},
+                {value: 775, name: '直达'},
+                {value: 679, name: '营销广告', selected: true}
+            ]
+        },
+        {
+            name: '访问来源',
+            type: 'pie',
+            radius: ['45%', '60%'],
+            labelLine: {
+                length: 30,
+            },
+            label: {
+                formatter: '{a|{a}}{abg|}\n{hr|}\n  {b|{b}：}{c}  {per|{d}%}  ',
+                backgroundColor: '#F6F8FC',
+                borderColor: '#8C8D8E',
+                borderWidth: 1,
+                borderRadius: 4,
+                
+                rich: {
+                    a: {
+                        color: '#6E7079',
+                        lineHeight: 22,
+                        align: 'center'
+                    },
+                    hr: {
+                        borderColor: '#8C8D8E',
+                        width: '100%',
+                        borderWidth: 1,
+                        height: 0
+                    },
+                    b: {
+                        color: '#4C5058',
+                        fontSize: 14,
+                        fontWeight: 'bold',
+                        lineHeight: 33
+                    },
+                    per: {
+                        color: '#fff',
+                        backgroundColor: '#4C5058',
+                        padding: [3, 4],
+                        borderRadius: 4
+                    }
+                }
+            },
+            data: [
+                {value: 1048, name: '百度'},
+                {value: 335, name: '直达'},
+                {value: 310, name: '邮件营销'},
+                {value: 251, name: '谷歌'},
+                {value: 234, name: '联盟广告'},
+                {value: 147, name: '必应'},
+                {value: 135, name: '视频广告'},
+                {value: 102, name: '其他'}
+            ]
+        }
+    ]
+}
+</code></pre>
+
+  </article>
+</body>
+
+</html>

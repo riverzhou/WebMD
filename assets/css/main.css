@@ -1,0 +1,48 @@
+body {
+  width: 1200px;
+}
+
+.title-icons {
+  float: right;
+}
+
+.title-icons .icon {
+  color: #777;
+  width: 1.05em;
+  height: 1.05em;
+  vertical-align: -0.1em;
+  fill: currentColor;
+  overflow: hidden;
+}
+
+.title-icons .icon:hover {
+  color: #333;
+}
+
+#debug-info {
+  resize: none;
+  width: 100%;
+  height: 80px;
+  border-width: 1px 0px 1px 0px;
+}
+#debug-info:focus {
+  outline: 0;
+  background-color: rgb(0, 0, 0, 0.08);
+}
+
+.control-area {
+  display: inline-block;
+}
+
+article.from-markdown {
+  margin-top: 3px;
+  border: solid rgb(0, 0, 0, 0.08);
+  border-width: 1px 0px;
+  background-color: rgb(0, 0, 0, 0.03);
+}
+
+.echarts-canvas {
+  width: 640px;
+  height: 480px;
+  background-color: white;
+}
