@@ -5,6 +5,7 @@ let btnLoad = document.getElementById('btnLoad');
 let btnSave = document.getElementById('btnSave');
 let btnSaveAs = document.getElementById('btnSaveAs');
 let btnView = document.getElementById('btnView');
+let btnDebug = document.getElementById('btnDebug');
 let article = document.getElementById('article-text');
 
 let app = {
@@ -12,6 +13,15 @@ let app = {
 };
 
 let lute = Lute.New();
+
+btnDebug.onclick = function () {
+    let debugArea = document.getElementById("debug-info");
+    if (debugArea.style.display != "none"){
+        debugArea.style.display = "none";
+    } else{
+        debugArea.style.display = "inline-block";
+    }
+}
 
 btnNew.onclick = async function (e) {
     printf('btn New');
