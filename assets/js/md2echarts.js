@@ -7,15 +7,20 @@ function printf(info) {
     showInfo.scrollTop = showInfo.scrollHeight;
 }
 
-function renderEcharts() {
-    let codeBlock = document.getElementsByClassName("language-echarts");
+function renderEchartsList(codeBlock){
+    printf(`total echart block number ${codeBlock.length}`);
     for (let i = 0; i < codeBlock.length; i++) {
         let bincode;
         let block = codeBlock[i];
 
+        if (block.tagName != "CODE"){
+            continue;
+        }
+
         try {
             bincode = JSON5.parse(block.innerHTML);
         } catch (e) {
+            printf(block.innerHTML);
             printf(e);
             continue;
         }
@@ -34,6 +39,13 @@ function renderEcharts() {
 
         printf(`render echarts ${i} ok!`)
     }
+}
+
+function renderEcharts() {
+    let codeBlock = document.getElementsByClassName("language-echart");
+    renderEchartsList(codeBlock);
+    let codeBlock2 = document.getElementsByClassName("language-echarts");
+    renderEchartsList(codeBlock2);
 }
 
 renderEcharts();

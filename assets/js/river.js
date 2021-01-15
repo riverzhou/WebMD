@@ -11,6 +11,8 @@ let app = {
     appName: 'River Editor',
 };
 
+let lute = Lute.New();
+
 btnNew.onclick = async function (e) {
     printf('btn New');
     app.Text = ''
@@ -58,7 +60,9 @@ btnLoad.onclick = async function (e) {
         printf(msg + ex);
     }
 
-    article.innerHTML = app.Text;
+    article.innerHTML = lute.MarkdownStr("", app.Text);
+    Prism.highlightAll();
+    renderEcharts();
 }
 
 btnSave.onclick = async function (e) {
@@ -110,3 +114,4 @@ btnSaveAs.onclick = async function (e) {
 btnView.onclick = async function (e) {
     printf('btn View');
 }
+

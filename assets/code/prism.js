@@ -449,6 +449,7 @@ var _ = {
 	 */
 	highlightAll: function(async, callback) {
 		_.highlightAllUnder(document, async, callback);
+        enablePrismCSS();
 	},
 
 	/**

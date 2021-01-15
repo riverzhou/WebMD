@@ -16,16 +16,21 @@
   <script type="text/javascript" defer="defer" src="/assets/font/iconfont.min.js" charset="utf-8"></script>
   <script type="text/javascript" defer="defer" src="/assets/markdown/lute/lute.min.js" charset="utf-8"></script>
 
-  <script type="text/javascript" id="prismjs" defer="defer" src="/assets/code/prism.min.js" charset="utf-8"></script>
   <script>
-    document.getElementById("prismjs").onload = function () {
+    function enablePrismCSS() {
+      if (document.getElementById("PrismCSS")) {
+        printf('PrismCSS already enabled.');
+        return;
+      }
       var preloadLink = document.createElement("link");
       preloadLink.rel = "stylesheet";
       preloadLink.type = "text/css";
       preloadLink.href = "/assets/code/prism.min.css";
+      preloadLink.id = "PrismCSS";
       document.head.appendChild(preloadLink);
     };
   </script>
+  <script type="text/javascript" id="prismjs" defer="defer" src="/assets/code/prism.js" charset="utf-8"></script>
 
   <link rel="icon" type="image/svg+xml" href="/assets/img/favicon.svg" />
 
