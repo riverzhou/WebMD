@@ -7,9 +7,11 @@ let btnSaveAs = document.getElementById('btnSaveAs');
 let btnView = document.getElementById('btnView');
 let btnDebug = document.getElementById('btnDebug');
 let article = document.getElementById('article-text');
+let divCM = document.getElementById('codemirror');
 
 let app = {
     appName: "K.I.S.S Editor",
+    Type: "md",
 };
 
 let pickerOpts = {
@@ -111,18 +113,10 @@ btnLoad.onclick = async function () {
     printf(`文件类型 ${app.Type}`);
 
     document.title = app.FileName;
-    if (app.Type == "md" || app.Type == "json") {
-        article.innerHTML = lute.MarkdownStr("", app.Text);
-        Prism.highlightAll();
-        renderEcharts();
-    } else if (app.Type == "html" || app.Type == 'htm' || app.Type == "shtml") {
-        app.Text = turn.turndown(app.Text);
-        article.innerHTML = lute.MarkdownStr("", app.Text);
-        Prism.highlightAll();
-        renderEcharts();
-    } else if (app.Type == 'txt' || app.Type == "text") {
-        article.innerHTML = `<pre>${app.Text}</pre>`;
-    }
+
+    cm.dispatch({
+        changes: { from: 0, to: cm.state.doc.length, insert: app.Text }
+    });
 }
 
 btnSave.onclick = async function () {
@@ -173,6 +167,36 @@ btnSaveAs.onclick = async function () {
 
 btnView.onclick = async function () {
     printf('btn View');
+    if (article.style.display != "none") {
+        article.style.display = "none";
+        divCM.style.display = "block";
+        return;
+    }
+
+    article.style.display = "block";
+    divCM.style.display = "none";
+
+    app.Text = cm.state.doc.toString()
+
+    if (app.Type == "md" || app.Type == "json") {
+        article.innerHTML = lute.MarkdownStr("", app.Text);
+        Prism.highlightAll();
+        renderEcharts();
+    } else if (app.Type == "html" || app.Type == 'htm' || app.Type == "shtml") {
+        app.Text = turn.turndown(app.Text);
+        article.innerHTML = lute.MarkdownStr("", app.Text);
+        Prism.highlightAll();
+        renderEcharts();
+    } else if (app.Type == 'txt' || app.Type == "text") {
+        article.innerHTML = `<pre>${app.Text}</pre>`;
+    }
 }
 
 document.title = app.appName;
+
+cm.dispatch({
+    changes: { from: 0, to: cm.state.doc.length, insert: "# I am K.I.S.S Markdown\n" }
+});
+
+article.style.display = "none";
+divCM.style.display = "block";
