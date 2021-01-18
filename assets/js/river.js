@@ -111,6 +111,9 @@ btnLoad.onclick = async function () {
     }
 
     printf(`文件类型 ${app.Type}`);
+    if (app.Type == "html" || app.Type == 'htm' || app.Type == "shtml") {
+        app.Text = turn.turndown(app.Text);
+    }
 
     document.title = app.FileName;
 
@@ -183,7 +186,7 @@ btnView.onclick = async function () {
         Prism.highlightAll();
         renderEcharts();
     } else if (app.Type == "html" || app.Type == 'htm' || app.Type == "shtml") {
-        app.Text = turn.turndown(app.Text);
+        //app.Text = turn.turndown(app.Text);
         article.innerHTML = lute.MarkdownStr("", app.Text);
         Prism.highlightAll();
         renderEcharts();
