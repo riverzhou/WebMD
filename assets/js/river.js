@@ -39,8 +39,6 @@ let pickerOpts = {
     multiple: false
 };
 
-let lute = Lute.New();
-
 let turnOpts = {
     headingStyle: 'atx',
     hr: '---',
@@ -179,15 +177,15 @@ btnView.onclick = async function () {
     article.style.display = "block";
     divCM.style.display = "none";
 
-    app.Text = cm.state.doc.toString()
+    app.Text = cm.state.doc.toString();
 
     if (app.Type == "md" || app.Type == "json") {
-        article.innerHTML = lute.MarkdownStr("", app.Text);
+        article.innerHTML = Md2Html(app.Text);
         Prism.highlightAll();
         renderEcharts();
     } else if (app.Type == "html" || app.Type == 'htm' || app.Type == "shtml") {
-        //app.Text = turn.turndown(app.Text);
-        article.innerHTML = lute.MarkdownStr("", app.Text);
+        app.Text = turn.turndown(app.Text);
+        article.innerHTML = Md2Html(app.Text);
         Prism.highlightAll();
         renderEcharts();
     } else if (app.Type == 'txt' || app.Type == "text") {
