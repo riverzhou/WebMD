@@ -219,7 +219,7 @@ const cm = (function () {
             for (let i = 0;; i++) {
                 let string = this.text[i], end = offset + string.length;
                 if ((isLine ? line : end) >= target)
-                    return new Line(offset, end, line, string);
+                    return new Line$1(offset, end, line, string);
                 offset = end + 1;
                 line++;
             }
@@ -531,7 +531,7 @@ const cm = (function () {
     }
     /// This type describes a line in the document. It is created
     /// on-demand when lines are [queried](#text.Text.lineAt).
-    class Line {
+    class Line$1 {
         /// @internal
         constructor(
         /// The position of the start of the line.
@@ -1131,8 +1131,8 @@ const cm = (function () {
         }
         /// Map this range through a change, producing a valid range in the
         /// updated document.
-        map(change) {
-            let from = change.mapPos(this.from), to = change.mapPos(this.to);
+        map(change, assoc = -1) {
+            let from = change.mapPos(this.from, assoc), to = change.mapPos(this.to, assoc);
             return from == this.from && to == this.to ? this : new SelectionRange(from, to, this.flags);
         }
         /// Extend this range to cover at least `from` to `to`.
@@ -1171,10 +1171,10 @@ const cm = (function () {
         }
         /// Map a selection through a change. Used to adjust the selection
         /// position for changes.
-        map(change) {
+        map(change, assoc = -1) {
             if (change.empty)
                 return this;
-            return EditorSelection.create(this.ranges.map(r => r.map(change)), this.mainIndex);
+            return EditorSelection.create(this.ranges.map(r => r.map(change, assoc)), this.mainIndex);
         }
         /// Compare this selection to another selection.
         eq(other) {
@@ -1298,7 +1298,7 @@ const cm = (function () {
         }
         /// Define a new facet.
         static define(config = {}) {
-            return new Facet(config.combine || ((a) => a), config.compareInput || ((a, b) => a === b), config.compare || (!config.combine ? sameArray : (a, b) => a === b), !!config.static, config.enables);
+            return new Facet(config.combine || ((a) => a), config.compareInput || ((a, b) => a === b), config.compare || (!config.combine ? sameArray$1 : (a, b) => a === b), !!config.static, config.enables);
         }
         /// Returns an extension that adds the given value for this facet.
         of(value) {
@@ -1330,7 +1330,7 @@ const cm = (function () {
             return this.compute([field], state => get(state.field(field)));
         }
     }
-    function sameArray(a, b) {
+    function sameArray$1(a, b) {
         return a == b || a.length == b.length && a.every((e, i) => e === b[i]);
     }
     class FacetProvider {
@@ -1356,7 +1356,7 @@ const cm = (function () {
                     depAddrs.push(addresses[dep.id]);
             }
             return (state, tr) => {
-                if (!tr || tr.reconfigure) {
+                if (!tr || tr.reconfigured) {
                     state.values[idx] = getter(state);
                     return 1 /* Changed */;
                 }
@@ -1388,7 +1388,7 @@ const cm = (function () {
         let dynamic = providerAddrs.filter(p => !(p & 1));
         let idx = addresses[facet.id] >> 1;
         return (state, tr) => {
-            let oldAddr = !tr ? null : tr.reconfigure ? tr.startState.config.address[facet.id] : idx << 1;
+            let oldAddr = !tr ? null : tr.reconfigured ? tr.startState.config.address[facet.id] : idx << 1;
             let changed = oldAddr == null;
             for (let dynAddr of dynamic) {
                 if (ensureAddr(state, dynAddr) & 1 /* Changed */)
@@ -1453,7 +1453,7 @@ const cm = (function () {
                     return 1 /* Changed */;
                 }
                 let oldVal, changed = 0;
-                if (tr.reconfigure) {
+                if (tr.reconfigured) {
                     let oldIdx = maybeIndex(tr.startState, this.id);
                     oldVal = oldIdx == null ? this.create(tr.startState) : tr.startState.values[oldIdx];
                     changed = 1 /* Changed */;
@@ -1506,16 +1506,31 @@ const cm = (function () {
             this.prec = prec;
         }
     }
-    class TaggedExtension {
-        constructor(tag, inner) {
-            this.tag = tag;
+    /// Extension compartments can be used to make a configuration
+    /// dynamic. By [wrapping](#state.Compartment.of) part of your
+    /// configuration in a compartment, you can later
+    /// [replace](#state.Compartment.reconfigure) that part through a
+    /// transaction.
+    class Compartment {
+        /// Create an instance of this compartment to add to your [state
+        /// configuration](#state.EditorStateConfig.extensions).
+        of(ext) { return new CompartmentInstance(this, ext); }
+        /// Create an [effect](#state.TransactionSpec.effects) that
+        /// reconfigures this compartment.
+        reconfigure(content) {
+            return Compartment.reconfigure.of({ compartment: this, extension: content });
+        }
+    }
+    class CompartmentInstance {
+        constructor(compartment, inner) {
+            this.compartment = compartment;
             this.inner = inner;
         }
     }
     class Configuration {
-        constructor(source, replacements, dynamicSlots, address, staticValues) {
-            this.source = source;
-            this.replacements = replacements;
+        constructor(base, compartments, dynamicSlots, address, staticValues) {
+            this.base = base;
+            this.compartments = compartments;
             this.dynamicSlots = dynamicSlots;
             this.address = address;
             this.staticValues = staticValues;
@@ -1527,10 +1542,11 @@ const cm = (function () {
             let addr = this.address[facet.id];
             return addr == null ? facet.default : this.staticValues[addr >> 1];
         }
-        static resolve(extension, replacements = Object.create(null), oldState) {
+        static resolve(base, compartments, oldState) {
             let fields = [];
             let facets = Object.create(null);
-            for (let ext of flatten(extension, replacements)) {
+            let usedCompartments = new Set();
+            for (let ext of flatten(base, compartments, usedCompartments)) {
                 if (ext instanceof StateField)
                     fields.push(ext);
                 else
@@ -1571,16 +1587,23 @@ const cm = (function () {
                     dynamicSlots.push(a => dynamicFacetSlot(a, facet, providers));
                 }
             }
-            return new Configuration(extension, replacements, dynamicSlots.map(f => f(address)), address, staticValues);
+            return new Configuration(base, removeUnused(compartments, usedCompartments), dynamicSlots.map(f => f(address)), address, staticValues);
         }
     }
-    function allKeys(obj) {
-        return (Object.getOwnPropertySymbols ? Object.getOwnPropertySymbols(obj) : []).concat(Object.keys(obj));
+    function removeUnused(compartments, usedCompartments) {
+        let dropped = [];
+        compartments.forEach((_, c) => { if (!usedCompartments.has(c))
+            dropped.push(c); });
+        if (!dropped.length)
+            return compartments;
+        let newCompartments = new Map();
+        compartments.forEach((e, c) => { if (dropped.indexOf(c) < 0)
+            newCompartments.set(c, e); });
+        return newCompartments;
     }
-    function flatten(extension, replacements) {
+    function flatten(extension, compartments, compartmentsSeen) {
         let result = [[], [], [], []];
         let seen = new Map();
-        let tagsSeen = Object.create(null);
         function inner(ext, prec) {
             let known = seen.get(ext);
             if (known != null) {
@@ -1589,17 +1612,19 @@ const cm = (function () {
                 let found = result[known].indexOf(ext);
                 if (found > -1)
                     result[known].splice(found, 1);
+                if (ext instanceof CompartmentInstance)
+                    compartmentsSeen.delete(ext.compartment);
             }
             seen.set(ext, prec);
             if (Array.isArray(ext)) {
                 for (let e of ext)
                     inner(e, prec);
             }
-            else if (ext instanceof TaggedExtension) {
-                if (ext.tag in tagsSeen)
-                    throw new RangeError(`Duplicate use of tag '${String(ext.tag)}' in extensions`);
-                tagsSeen[ext.tag] = true;
-                inner(replacements[ext.tag] || ext.inner, prec);
+            else if (ext instanceof CompartmentInstance) {
+                if (compartmentsSeen.has(ext.compartment))
+                    throw new RangeError(`Duplicate use of compartment in extensions`);
+                compartmentsSeen.add(ext.compartment);
+                inner(compartments.get(ext.compartment) || ext.inner, prec);
             }
             else if (ext instanceof PrecExtension) {
                 inner(ext.inner, ext.prec);
@@ -1615,15 +1640,13 @@ const cm = (function () {
                     inner(ext.facet.extensions, prec);
             }
             else {
-                inner(ext.extension, prec);
+                let content = ext.extension;
+                if (!content)
+                    throw new Error(`Unrecognized extension value in extension set (${ext}). This sometimes happens because multiple instances of @codemirror/state are loaded, breaking instanceof checks.`);
+                inner(content, prec);
             }
         }
         inner(extension, Prec_.default);
-        for (let key of allKeys(replacements))
-            if (!(key in tagsSeen) && key != "full" && replacements[key]) {
-                tagsSeen[key] = true;
-                inner(replacements[key], Prec_.default);
-            }
         return result.reduce((a, b) => a.concat(b));
     }
     function ensureAddr(state, addr) {
@@ -1681,6 +1704,23 @@ const cm = (function () {
         /// Create an instance of this annotation.
         of(value) { return new Annotation(this, value); }
     }
+    /// Representation of a type of state effect. Defined with
+    /// [`StateEffect.define`](#state.StateEffect^define).
+    class StateEffectType {
+        /// @internal
+        constructor(
+        // The `any` types in these function types are there to work
+        // around TypeScript issue #37631, where the type guard on
+        // `StateEffect.is` mysteriously stops working when these properly
+        // have type `Value`.
+        /// @internal
+        map) {
+            this.map = map;
+        }
+        /// Create a [state effect](#state.StateEffect) instance of this
+        /// type.
+        of(value) { return new StateEffect(this, value); }
+    }
     /// State effects can be used to represent additional effects
     /// associated with a [transaction](#state.Transaction.effects). They
     /// are often useful to model changes to custom [state
@@ -1723,23 +1763,14 @@ const cm = (function () {
             return result;
         }
     }
-    /// Representation of a type of state effect. Defined with
-    /// [`StateEffect.define`](#state.StateEffect^define).
-    class StateEffectType {
-        /// @internal
-        constructor(
-        // The `any` types in these function types are there to work
-        // around TypeScript issue #37631, where the type guard on
-        // `StateEffect.is` mysteriously stops working when these properly
-        // have type `Value`.
-        /// @internal
-        map) {
-            this.map = map;
-        }
-        /// Create a [state effect](#state.StateEffect) instance of this
-        /// type.
-        of(value) { return new StateEffect(this, value); }
-    }
+    /// This effect can be used to reconfigure the root extensions of
+    /// the editor. Doing this will discard any extensions
+    /// [appended](#state.StateEffect^appendConfig), but does not reset
+    /// the content of [reconfigured](#state.Compartment.reconfigure)
+    /// compartments.
+    StateEffect.reconfigure = StateEffect.define();
+    /// Append extensions to the top-level configuration of the editor.
+    StateEffect.appendConfig = StateEffect.define();
     /// Changes to the editor state are grouped into transactions.
     /// Typically, a user action creates a single transaction, which may
     /// contain any number of document changes, may change the selection,
@@ -1759,9 +1790,6 @@ const cm = (function () {
         effects, 
         /// @internal
         annotations, 
-        /// Holds an object when this transaction
-        /// [reconfigures](#state.ReconfigurationSpec) the state.
-        reconfigure, 
         /// Whether the selection should be scrolled into view after this
         /// transaction is dispatched.
         scrollIntoView) {
@@ -1770,7 +1798,6 @@ const cm = (function () {
             this.selection = selection;
             this.effects = effects;
             this.annotations = annotations;
-            this.reconfigure = reconfigure;
             this.scrollIntoView = scrollIntoView;
             /// @internal
             this._doc = null;
@@ -1815,6 +1842,11 @@ const cm = (function () {
         }
         /// Indicates whether the transaction changed the document.
         get docChanged() { return !this.changes.empty; }
+        /// Indicates whether this transaction reconfigures the state
+        /// (through a [configuration compartment](#state.Compartment) or
+        /// with a top-level configuration
+        /// [effect](#state.StateEffect^reconfigure).
+        get reconfigured() { return this.startState.config != this.state.config; }
     }
     /// Annotation used to store transaction timestamps.
     Transaction.time = Annotation.define();
@@ -1870,28 +1902,18 @@ const cm = (function () {
             selection: b.selection ? b.selection.map(mapForB) : (_a = a.selection) === null || _a === void 0 ? void 0 : _a.map(mapForA),
             effects: StateEffect.mapEffects(a.effects, mapForA).concat(StateEffect.mapEffects(b.effects, mapForB)),
             annotations: a.annotations.length ? a.annotations.concat(b.annotations) : b.annotations,
-            scrollIntoView: a.scrollIntoView || b.scrollIntoView,
-            reconfigure: !b.reconfigure ? a.reconfigure : b.reconfigure.full || !a.reconfigure ? b.reconfigure
-                : Object.assign({}, a.reconfigure, b.reconfigure)
+            scrollIntoView: a.scrollIntoView || b.scrollIntoView
         };
     }
     function resolveTransactionInner(state, spec, docSize) {
-        let reconf = spec.reconfigure;
-        if (reconf && reconf.append) {
-            reconf = Object.assign({}, reconf);
-            let tag = typeof Symbol == "undefined" ? "__append" + Math.floor(Math.random() * 0xffffffff) : Symbol("appendConf");
-            reconf[tag] = reconf.append;
-            reconf.append = undefined;
-        }
         let sel = spec.selection;
         return {
             changes: spec.changes instanceof ChangeSet ? spec.changes
                 : ChangeSet.of(spec.changes || [], docSize, state.facet(lineSeparator)),
             selection: sel && (sel instanceof EditorSelection ? sel : EditorSelection.single(sel.anchor, sel.head)),
-            effects: asArray(spec.effects),
-            annotations: asArray(spec.annotations),
-            scrollIntoView: !!spec.scrollIntoView,
-            reconfigure: reconf
+            effects: asArray$1(spec.effects),
+            annotations: asArray$1(spec.annotations),
+            scrollIntoView: !!spec.scrollIntoView
         };
     }
     function resolveTransaction(state, specs, filter) {
@@ -1904,7 +1926,7 @@ const cm = (function () {
             let seq = !!specs[i].sequential;
             s = mergeTransaction(s, resolveTransactionInner(state, specs[i], seq ? s.changes.newLength : state.doc.length), seq);
         }
-        let tr = new Transaction(state, s.changes, s.selection, s.effects, s.annotations, s.reconfigure, s.scrollIntoView);
+        let tr = new Transaction(state, s.changes, s.selection, s.effects, s.annotations, s.scrollIntoView);
         return extendTransaction(filter ? filterTransaction(tr) : tr);
     }
     // Finish a transaction by applying filters if necessary.
@@ -1932,7 +1954,7 @@ const cm = (function () {
                 changes = filtered.changes;
                 back = filtered.filtered.invertedDesc;
             }
-            tr = new Transaction(state, changes, tr.selection && tr.selection.map(back), StateEffect.mapEffects(tr.effects, back), tr.annotations, tr.reconfigure, tr.scrollIntoView);
+            tr = new Transaction(state, changes, tr.selection && tr.selection.map(back), StateEffect.mapEffects(tr.effects, back), tr.annotations, tr.scrollIntoView);
         }
         // Transaction filters
         let filters = state.facet(transactionFilter);
@@ -1943,7 +1965,7 @@ const cm = (function () {
             else if (Array.isArray(filtered) && filtered.length == 1 && filtered[0] instanceof Transaction)
                 tr = filtered[0];
             else
-                tr = resolveTransaction(state, asArray(filtered), false);
+                tr = resolveTransaction(state, asArray$1(filtered), false);
         }
         return tr;
     }
@@ -1954,11 +1976,11 @@ const cm = (function () {
             if (extension && Object.keys(extension).length)
                 spec = mergeTransaction(tr, resolveTransactionInner(state, extension, tr.changes.newLength), true);
         }
-        return spec == tr ? tr : new Transaction(state, tr.changes, tr.selection, spec.effects, spec.annotations, spec.reconfigure, spec.scrollIntoView);
+        return spec == tr ? tr : new Transaction(state, tr.changes, tr.selection, spec.effects, spec.annotations, spec.scrollIntoView);
     }
-    const none = [];
-    function asArray(value) {
-        return value == null ? none : Array.isArray(value) ? value : [value];
+    const none$5 = [];
+    function asArray$1(value) {
+        return value == null ? none$5 : Array.isArray(value) ? value : [value];
     }
 
     /// The categories produced by a [character
@@ -2024,7 +2046,7 @@ const cm = (function () {
             /// @internal
             this.applying = null;
             this.status = config.statusTemplate.slice();
-            if (tr && !tr.reconfigure) {
+            if (tr && tr.startState.config == config) {
                 this.values = tr.startState.values.slice();
             }
             else {
@@ -2067,19 +2089,33 @@ const cm = (function () {
         /// [effects](#state.TransactionSpec.effects) are assumed to refer
         /// to the document created by its _own_ changes. The resulting
         /// transaction contains the combined effect of all the different
-        /// specs. For things like
-        /// [selection](#state.TransactionSpec.selection) or
-        /// [reconfiguration](#state.TransactionSpec.reconfigure), later
+        /// specs. For [selection](#state.TransactionSpec.selection), later
         /// specs take precedence over earlier ones.
         update(...specs) {
             return resolveTransaction(this, specs, true);
         }
         /// @internal
         applyTransaction(tr) {
-            let conf = this.config;
-            if (tr.reconfigure)
-                conf = Configuration.resolve(tr.reconfigure.full || conf.source, Object.assign(conf.replacements, tr.reconfigure, { full: undefined }), this);
-            new EditorState(conf, tr.newDoc, tr.newSelection, tr);
+            let conf = this.config, { base, compartments } = conf;
+            for (let effect of tr.effects) {
+                if (effect.is(Compartment.reconfigure)) {
+                    if (conf) {
+                        compartments = new Map;
+                        conf.compartments.forEach((val, key) => compartments.set(key, val));
+                        conf = null;
+                    }
+                    compartments.set(effect.value.compartment, effect.value.extension);
+                }
+                else if (effect.is(StateEffect.reconfigure)) {
+                    conf = null;
+                    base = effect.value;
+                }
+                else if (effect.is(StateEffect.appendConfig)) {
+                    conf = null;
+                    base = asArray$1(base).concat(effect.value);
+                }
+            }
+            new EditorState(conf || Configuration.resolve(base, compartments, this), tr.newDoc, tr.newSelection, tr);
         }
         /// Create a [transaction spec](#state.TransactionSpec) that
         /// replaces every selection range with the given content.
@@ -2102,7 +2138,7 @@ const cm = (function () {
             let sel = this.selection;
             let result1 = f(sel.ranges[0]);
             let changes = this.changes(result1.changes), ranges = [result1.range];
-            let effects = asArray(result1.effects);
+            let effects = asArray$1(result1.effects);
             for (let i = 1; i < sel.ranges.length; i++) {
                 let result = f(sel.ranges[i]);
                 let newChanges = this.changes(result.changes), newMapped = newChanges.map(changes);
@@ -2111,7 +2147,7 @@ const cm = (function () {
                 let mapBy = changes.mapDesc(newChanges, true);
                 ranges.push(result.range.map(mapBy));
                 changes = changes.compose(newMapped);
-                effects = StateEffect.mapEffects(effects, newMapped).concat(StateEffect.mapEffects(asArray(result.effects), mapBy));
+                effects = StateEffect.mapEffects(effects, newMapped).concat(StateEffect.mapEffects(asArray$1(result.effects), mapBy));
             }
             return {
                 changes,
@@ -2182,7 +2218,7 @@ const cm = (function () {
         /// initializing an editor—updated states are created by applying
         /// transactions.
         static create(config = {}) {
-            let configuration = Configuration.resolve(config.extensions || []);
+            let configuration = Configuration.resolve(config.extensions || [], new Map);
             let doc = config.doc instanceof Text ? config.doc
                 : Text.of((config.doc || "").split(configuration.staticFacet(EditorState.lineSeparator) || DefaultSplit));
             let selection = !config.selection ? EditorSelection.single(0)
@@ -2295,16 +2331,16 @@ const cm = (function () {
     /// This is a more limited form of
     /// [`transactionFilter`](#state.EditorState^transactionFilter),
     /// which can only add
-    /// [annotations](#state.TransactionSpec.annotations),
-    /// [effects](#state.TransactionSpec.effects), and
-    /// [configuration](#state.TransactionSpec.reconfigure) info. _But_,
-    /// this type of filter runs even the transaction has disabled
-    /// regular [filtering](#state.TransactionSpec.filter), making it
-    /// suitable for effects that don't need to touch the changes or
-    /// selection, but do want to process every transaction.
+    /// [annotations](#state.TransactionSpec.annotations) and
+    /// [effects](#state.TransactionSpec.effects). _But_, this type
+    /// of filter runs even the transaction has disabled regular
+    /// [filtering](#state.TransactionSpec.filter), making it suitable
+    /// for effects that don't need to touch the changes or selection,
+    /// but do want to process every transaction.
     ///
     /// Extenders run _after_ filters, when both are applied.
     EditorState.transactionExtender = transactionExtender;
+    Compartment.reconfigure = StateEffect.define();
 
     /// Utility function for combining behaviors to fill in a config
     /// object from an array of provided configs. Will, by default, error
@@ -2345,43 +2381,41 @@ const cm = (function () {
     // of style modules that were used. So to avoid leaking rules, don't
     // create these dynamically, but treat them as one-time allocations.
     class StyleModule {
-      // :: (Object<Style>, ?{process: (string) → string, extend: (string, string) → string})
+      // :: (Object<Style>, ?{finish: ?(string) → string})
       // Create a style module from the given spec.
       //
-      // When `process` is given, it is called on regular (non-`@`)
-      // selector properties to provide the actual selector. When `extend`
-      // is given, it is called when a property containing an `&` is
-      // found, and should somehow combine the `&`-template (its first
-      // argument) with the selector (its second argument) to produce an
-      // extended selector.
+      // When `finish` is given, it is called on regular (non-`@`)
+      // selectors (after `&` expansion) to compute the final selector.
       constructor(spec, options) {
         this.rules = [];
-        let {process, extend} = options || {};
+        let {finish} = options || {};
 
-        function processSelector(selector) {
-          if (/^@/.test(selector)) return [selector]
-          let selectors = selector.split(",");
-          return process ? selectors.map(process) : selectors
+        function splitSelector(selector) {
+          return /^@/.test(selector) ? [selector] : selector.split(/,\s*/)
         }
 
-        function render(selectors, spec, target) {
-          let local = [], isAt = /^@(\w+)\b/.exec(selectors[0]);
+        function render(selectors, spec, target, isKeyframes) {
+          let local = [], isAt = /^@(\w+)\b/.exec(selectors[0]), keyframes = isAt && isAt[1] == "keyframes";
           if (isAt && spec == null) return target.push(selectors[0] + ";")
           for (let prop in spec) {
             let value = spec[prop];
             if (/&/.test(prop)) {
-              render(selectors.map(s => extend ? extend(prop, s) : prop.replace(/&/, s)), value, target);
+              render(prop.split(/,\s*/).map(part => selectors.map(sel => part.replace(/&/, sel))).reduce((a, b) => a.concat(b)),
+                     value, target);
             } else if (value && typeof value == "object") {
               if (!isAt) throw new RangeError("The value of a property (" + prop + ") should be a primitive value.")
-              render(isAt[1] == "keyframes" ? [prop] : processSelector(prop), value, local);
+              render(splitSelector(prop), value, local, keyframes);
             } else if (value != null) {
               local.push(prop.replace(/_.*/, "").replace(/[A-Z]/g, l => "-" + l.toLowerCase()) + ": " + value + ";");
             }
           }
-          if (local.length || isAt && isAt[1] == "keyframes") target.push(selectors.join(",") + " {" + local.join(" ") + "}");
+          if (local.length || keyframes) {
+            target.push((finish && !isAt && !isKeyframes ? selectors.map(finish) : selectors).join(", ") +
+                        " {" + local.join(" ") + "}");
+          }
         }
 
-        for (let prop in spec) render(processSelector(prop), spec[prop], this.rules);
+        for (let prop in spec) render(splitSelector(prop), spec[prop], this.rules);
       }
 
       // :: () → string
@@ -3274,12 +3308,12 @@ const cm = (function () {
       229: "Q"
     };
 
-    var chrome = typeof navigator != "undefined" && /Chrome\/(\d+)/.exec(navigator.userAgent);
-    var safari = typeof navigator != "undefined" && /Apple Computer/.test(navigator.vendor);
-    var gecko = typeof navigator != "undefined" && /Gecko\/\d+/.test(navigator.userAgent);
+    var chrome$1 = typeof navigator != "undefined" && /Chrome\/(\d+)/.exec(navigator.userAgent);
+    var safari$1 = typeof navigator != "undefined" && /Apple Computer/.test(navigator.vendor);
+    var gecko$1 = typeof navigator != "undefined" && /Gecko\/\d+/.test(navigator.userAgent);
     var mac = typeof navigator != "undefined" && /Mac/.test(navigator.platform);
-    var ie = typeof navigator != "undefined" && /MSIE \d|Trident\/(?:[7-9]|\d{2,})\..*rv:(\d+)/.exec(navigator.userAgent);
-    var brokenModifierNames = chrome && (mac || +chrome[1] < 57) || gecko && mac;
+    var ie$1 = typeof navigator != "undefined" && /MSIE \d|Trident\/(?:[7-9]|\d{2,})\..*rv:(\d+)/.exec(navigator.userAgent);
+    var brokenModifierNames = chrome$1 && (mac || +chrome$1[1] < 57) || gecko$1 && mac;
 
     // Fill in the digit keys
     for (var i = 0; i < 10; i++) base[48 + i] = base[96 + i] = String(i);
@@ -3300,7 +3334,7 @@ const cm = (function () {
       // Don't trust event.key in Chrome when there are modifiers until
       // they fix https://bugs.chromium.org/p/chromium/issues/detail?id=633838
       var ignoreKey = brokenModifierNames && (event.ctrlKey || event.altKey || event.metaKey) ||
-        (safari || ie) && event.shiftKey && event.key && event.key.length == 1;
+        (safari$1 || ie$1) && event.shiftKey && event.key && event.key.length == 1;
       var name = (!ignoreKey && event.key) ||
         (event.shiftKey ? shift : base)[event.keyCode] ||
         event.key || "Unidentified";
@@ -3321,23 +3355,23 @@ const cm = (function () {
     const ie_edge = /Edge\/(\d+)/.exec(nav.userAgent);
     const ie_upto10 = /MSIE \d/.test(nav.userAgent);
     const ie_11up = /Trident\/(?:[7-9]|\d{2,})\..*rv:(\d+)/.exec(nav.userAgent);
-    const ie$1 = !!(ie_upto10 || ie_11up || ie_edge);
-    const gecko$1 = !ie$1 && /gecko\/(\d+)/i.test(nav.userAgent);
-    const chrome$1 = !ie$1 && /Chrome\/(\d+)/.exec(nav.userAgent);
+    const ie = !!(ie_upto10 || ie_11up || ie_edge);
+    const gecko = !ie && /gecko\/(\d+)/i.test(nav.userAgent);
+    const chrome = !ie && /Chrome\/(\d+)/.exec(nav.userAgent);
     const webkit = "webkitFontSmoothing" in doc.documentElement.style;
-    const safari$1 = !ie$1 && /Apple Computer/.test(nav.vendor);
+    const safari = !ie && /Apple Computer/.test(nav.vendor);
     var browser = {
         mac: /Mac/.test(nav.platform),
-        ie: ie$1,
+        ie,
         ie_version: ie_upto10 ? doc.documentMode || 6 : ie_11up ? +ie_11up[1] : ie_edge ? +ie_edge[1] : 0,
-        gecko: gecko$1,
-        gecko_version: gecko$1 ? +(/Firefox\/(\d+)/.exec(nav.userAgent) || [0, 0])[1] : 0,
-        chrome: !!chrome$1,
-        chrome_version: chrome$1 ? +chrome$1[1] : 0,
-        ios: safari$1 && (/Mobile\/\w+/.test(nav.userAgent) || nav.maxTouchPoints > 2),
+        gecko,
+        gecko_version: gecko ? +(/Firefox\/(\d+)/.exec(nav.userAgent) || [0, 0])[1] : 0,
+        chrome: !!chrome,
+        chrome_version: chrome ? +chrome[1] : 0,
+        ios: safari && (/Mobile\/\w+/.test(nav.userAgent) || nav.maxTouchPoints > 2),
         android: /Android\b/.test(nav.userAgent),
         webkit,
-        safari: safari$1,
+        safari,
         webkit_version: webkit ? +(/\bAppleWebKit\/(\d+)/.exec(navigator.userAgent) || [0, 0])[1] : 0,
         tabSize: doc.documentElement.style.tabSize != null ? "tab-size" : "-moz-tab-size"
     };
@@ -3419,6 +3453,7 @@ const cm = (function () {
     function maxOffset(node) {
         return node.nodeType == 3 ? node.nodeValue.length : node.childNodes.length;
     }
+    const Rect0 = { left: 0, right: 0, top: 0, bottom: 0 };
     function flattenRect(rect, left) {
         let x = left ? rect.left : rect.right;
         return { left: x, right: x, top: rect.top, bottom: rect.bottom };
@@ -3547,7 +3582,7 @@ const cm = (function () {
         static before(dom, precise) { return new DOMPos(dom.parentNode, domIndex(dom), precise); }
         static after(dom, precise) { return new DOMPos(dom.parentNode, domIndex(dom) + 1, precise); }
     }
-    const none$1 = [];
+    const none$3 = [];
     class ContentView {
         constructor() {
             this.parent = null;
@@ -3602,7 +3637,7 @@ const cm = (function () {
                 if (next && track && track.node == parent)
                     track.written = true;
                 while (next)
-                    next = rm(next);
+                    next = rm$1(next);
             }
             else if (this.dirty & 1 /* Child */) {
                 for (let child of this.children)
@@ -3704,7 +3739,7 @@ const cm = (function () {
                 v = parent;
             }
         }
-        replaceChildren(from, to, children = none$1) {
+        replaceChildren(from, to, children = none$3) {
             this.markDirty();
             for (let i = from; i < to; i++)
                 this.children[i].parent = null;
@@ -3730,7 +3765,7 @@ const cm = (function () {
     }
     ContentView.prototype.breakAfter = 0;
     // Remove a DOM node and return its next sibling.
-    function rm(dom) {
+    function rm$1(dom) {
         let next = dom.nextSibling;
         dom.parentNode.removeChild(dom);
         return next;
@@ -3739,7 +3774,7 @@ const cm = (function () {
         let next = after ? after.nextSibling : parent.firstChild;
         if (dom.parentNode == parent)
             while (next != dom)
-                next = rm(next);
+                next = rm$1(next);
         else
             parent.insertBefore(dom, next);
     }
@@ -3763,7 +3798,7 @@ const cm = (function () {
         }
     }
 
-    const none$1$1 = [];
+    const none$2$1 = [];
     class InlineView extends ContentView {
         /// Return true when this view is equivalent to `other` and can take
         /// on its role.
@@ -3773,7 +3808,7 @@ const cm = (function () {
         // positive number when after its position.
         getSide() { return 0; }
     }
-    InlineView.prototype.children = none$1$1;
+    InlineView.prototype.children = none$2$1;
     const MaxJoinLen = 256;
     class TextView extends InlineView {
         constructor(text) {
@@ -3847,7 +3882,7 @@ const cm = (function () {
             if (source && (!(source instanceof MarkView && source.mark.eq(this.mark)) ||
                 (from && openStart <= 0) || (to < this.length && openEnd <= 0)))
                 return false;
-            mergeInlineChildren(this, from, to, source ? source.children : none$1$1, openStart - 1, openEnd - 1);
+            mergeInlineChildren(this, from, to, source ? source.children : none$2$1, openStart - 1, openEnd - 1);
             this.markDirty();
             return true;
         }
@@ -3887,7 +3922,10 @@ const cm = (function () {
         let range = tempRange();
         range.setEnd(text, to);
         range.setStart(text, from);
-        let rects = range.getClientRects(), rect = rects[(flatten ? flatten < 0 : side >= 0) ? 0 : rects.length - 1];
+        let rects = range.getClientRects();
+        if (!rects.length)
+            return Rect0;
+        let rect = rects[(flatten ? flatten < 0 : side >= 0) ? 0 : rects.length - 1];
         if (browser.safari && !flatten && rect.width == 0)
             rect = Array.prototype.find.call(rects, r => r.width) || rect;
         return flatten ? flattenRect(rect, flatten < 0) : rect;
@@ -3946,6 +3984,8 @@ const cm = (function () {
         domBoundsAround() { return null; }
         coordsAt(pos, side) {
             let rects = this.dom.getClientRects(), rect = null;
+            if (!rects.length)
+                return Rect0;
             for (let i = pos > 0 ? rects.length - 1 : 0;; i += (pos > 0 ? -1 : 1)) {
                 rect = rects[i];
                 if (pos > 0 ? i == 0 : i == rects.length - 1 || rect.top < rect.bottom)
@@ -4339,184 +4379,6 @@ const cm = (function () {
             ranges.push(from, to);
     }
 
-    const theme = Facet.define({ combine: strs => strs.join(" ") });
-    const darkTheme = Facet.define({ combine: values => values.indexOf(true) > -1 });
-    const baseThemeID = StyleModule.newName();
-    function expandThemeClasses(sel) {
-        return sel.replace(/\$\w[\w\.]*/g, cls => {
-            let parts = cls.slice(1).split("."), result = "";
-            for (let i = 1; i <= parts.length; i++)
-                result += ".cm-" + parts.slice(0, i).join("-");
-            return result;
-        });
-    }
-    function buildTheme(main, spec) {
-        return new StyleModule(spec, {
-            process(sel) {
-                sel = expandThemeClasses(sel);
-                return /\$/.test(sel) ? sel.replace(/\$/, main) : main + " " + sel;
-            },
-            extend(template, sel) {
-                template = expandThemeClasses(template);
-                return sel.slice(0, main.length + 1) == main + " "
-                    ? main + " " + template.replace(/&/, sel.slice(main.length + 1))
-                    : template.replace(/&/, sel);
-            }
-        });
-    }
-    /// Create a set of CSS class names for the given theme class, which
-    /// can be added to a DOM element within an editor to make themes able
-    /// to style it. Theme classes can be single words or words separated
-    /// by dot characters. In the latter case, the returned classes
-    /// combine those that match the full name and those that match some
-    /// prefix—for example `"panel.search"` will match both the theme
-    /// styles specified as `"panel.search"` and those with just
-    /// `"panel"`. More specific theme classes (with more dots) take
-    /// precedence over less specific ones.
-    function themeClass(selector) {
-        if (selector.indexOf(".") < 0)
-            return "cm-" + selector;
-        let parts = selector.split("."), result = "";
-        for (let i = 1; i <= parts.length; i++)
-            result += (result ? " " : "") + "cm-" + parts.slice(0, i).join("-");
-        return result;
-    }
-    const baseTheme = buildTheme("." + baseThemeID, {
-        $: {
-            position: "relative !important",
-            boxSizing: "border-box",
-            "&$focused": {
-                // FIXME it would be great if we could directly use the browser's
-                // default focus outline, but it appears we can't, so this tries to
-                // approximate that
-                outline_fallback: "1px dotted #212121",
-                outline: "5px auto -webkit-focus-ring-color"
-            },
-            display: "flex !important",
-            flexDirection: "column"
-        },
-        $scroller: {
-            display: "flex !important",
-            alignItems: "flex-start !important",
-            fontFamily: "monospace",
-            lineHeight: 1.4,
-            height: "100%",
-            overflowX: "auto",
-            position: "relative",
-            zIndex: 0
-        },
-        $content: {
-            margin: 0,
-            flexGrow: 2,
-            minHeight: "100%",
-            display: "block",
-            whiteSpace: "pre",
-            boxSizing: "border-box",
-            padding: "4px 0",
-            outline: "none"
-        },
-        "$$light $content": { caretColor: "black" },
-        "$$dark $content": { caretColor: "white" },
-        $line: {
-            display: "block",
-            padding: "0 2px 0 4px"
-        },
-        $selectionLayer: {
-            zIndex: -1,
-            contain: "size style"
-        },
-        $selectionBackground: {
-            position: "absolute",
-        },
-        "$$light $selectionBackground": {
-            background: "#d9d9d9"
-        },
-        "$$dark $selectionBackground": {
-            background: "#222"
-        },
-        "$$focused$light $selectionBackground": {
-            background: "#d7d4f0"
-        },
-        "$$focused$dark $selectionBackground": {
-            background: "#233"
-        },
-        $cursorLayer: {
-            zIndex: 100,
-            contain: "size style",
-            pointerEvents: "none"
-        },
-        "$$focused $cursorLayer": {
-            animation: "steps(1) cm-blink 1.2s infinite"
-        },
-        // Two animations defined so that we can switch between them to
-        // restart the animation without forcing another style
-        // recomputation.
-        "@keyframes cm-blink": { "0%": {}, "50%": { visibility: "hidden" }, "100%": {} },
-        "@keyframes cm-blink2": { "0%": {}, "50%": { visibility: "hidden" }, "100%": {} },
-        $cursor: {
-            position: "absolute",
-            borderLeft: "1.2px solid black",
-            marginLeft: "-0.6px",
-            pointerEvents: "none",
-            display: "none"
-        },
-        "$$dark $cursor": {
-            borderLeftColor: "#444"
-        },
-        "$$focused $cursor": {
-            display: "block"
-        },
-        "$$light $activeLine": { backgroundColor: "#f3f9ff" },
-        "$$dark $activeLine": { backgroundColor: "#223039" },
-        "$$light $specialChar": { color: "red" },
-        "$$dark $specialChar": { color: "#f78" },
-        "$tab": {
-            display: "inline-block",
-            overflow: "hidden",
-            verticalAlign: "bottom"
-        },
-        $placeholder: {
-            color: "#888",
-            display: "inline-block"
-        },
-        $button: {
-            verticalAlign: "middle",
-            color: "inherit",
-            fontSize: "70%",
-            padding: ".2em 1em",
-            borderRadius: "3px"
-        },
-        "$$light $button": {
-            backgroundImage: "linear-gradient(#eff1f5, #d9d9df)",
-            border: "1px solid #888",
-            "&:active": {
-                backgroundImage: "linear-gradient(#b4b4b4, #d0d3d6)"
-            }
-        },
-        "$$dark $button": {
-            backgroundImage: "linear-gradient(#555, #111)",
-            border: "1px solid #888",
-            "&:active": {
-                backgroundImage: "linear-gradient(#111, #333)"
-            }
-        },
-        $textfield: {
-            verticalAlign: "middle",
-            color: "inherit",
-            fontSize: "70%",
-            border: "1px solid silver",
-            padding: ".2em .5em"
-        },
-        "$$light $textfield": {
-            backgroundColor: "white"
-        },
-        "$$dark $textfield": {
-            border: "1px solid #555",
-            backgroundColor: "inherit"
-        }
-    });
-
-    const LineClass = themeClass("line");
     class LineView extends ContentView {
         constructor() {
             super(...arguments);
@@ -4536,7 +4398,7 @@ const cm = (function () {
             }
             if (takeDeco)
                 this.setDeco(source ? source.attrs : null);
-            mergeInlineChildren(this, from, to, source ? source.children : none$2, openStart, openEnd);
+            mergeInlineChildren(this, from, to, source ? source.children : none$1$1, openStart, openEnd);
             return true;
         }
         split(at) {
@@ -4594,12 +4456,12 @@ const cm = (function () {
         sync(track) {
             if (!this.dom) {
                 this.setDOM(document.createElement("div"));
-                this.dom.className = LineClass;
+                this.dom.className = "cm-line";
                 this.prevAttrs = this.attrs ? null : undefined;
             }
             if (this.prevAttrs !== undefined) {
                 updateAttrs(this.dom, this.prevAttrs, this.attrs);
-                this.dom.classList.add(LineClass);
+                this.dom.classList.add("cm-line");
                 this.prevAttrs = undefined;
             }
             super.sync(track);
@@ -4642,7 +4504,7 @@ const cm = (function () {
             }
         }
     }
-    const none$2 = [];
+    const none$1$1 = [];
     class BlockWidgetView extends ContentView {
         constructor(widget, length, type) {
             super();
@@ -4666,7 +4528,7 @@ const cm = (function () {
             this.length = at;
             return new BlockWidgetView(this.widget, len, this.type);
         }
-        get children() { return none$2; }
+        get children() { return none$1$1; }
         sync() {
             if (!this.dom || !this.widget.updateDOM(this.dom)) {
                 this.setDOM(this.widget.toDOM(this.editorView));
@@ -4817,6 +4679,783 @@ const cm = (function () {
         eq(other) { return other.tag == this.tag; }
         toDOM() { return document.createElement(this.tag); }
         updateDOM(elt) { return elt.nodeName.toLowerCase() == this.tag; }
+    }
+
+    const none$4 = [];
+    const clickAddsSelectionRange = Facet.define();
+    const dragMovesSelection$1 = Facet.define();
+    const mouseSelectionStyle = Facet.define();
+    const exceptionSink = Facet.define();
+    const updateListener = Facet.define();
+    const inputHandler = Facet.define();
+    /// Log or report an unhandled exception in client code. Should
+    /// probably only be used by extension code that allows client code to
+    /// provide functions, and calls those functions in a context where an
+    /// exception can't be propagated to calling code in a reasonable way
+    /// (for example when in an event handler).
+    ///
+    /// Either calls a handler registered with
+    /// [`EditorView.exceptionSink`](#view.EditorView^exceptionSink),
+    /// `window.onerror`, if defined, or `console.error` (in which case
+    /// it'll pass `context`, when given, as first argument).
+    function logException(state, exception, context) {
+        let handler = state.facet(exceptionSink);
+        if (handler.length)
+            handler[0](exception);
+        else if (window.onerror)
+            window.onerror(String(exception), context, undefined, undefined, exception);
+        else if (context)
+            console.error(context + ":", exception);
+        else
+            console.error(exception);
+    }
+    const editable = Facet.define({ combine: values => values.length ? values[0] : true });
+    /// Used to [declare](#view.PluginSpec.provide) which
+    /// [fields](#view.PluginValue) a [view plugin](#view.ViewPlugin)
+    /// provides.
+    class PluginFieldProvider {
+        /// @internal
+        constructor(
+        /// @internal
+        field, 
+        /// @internal
+        get) {
+            this.field = field;
+            this.get = get;
+        }
+    }
+    /// Plugin fields are a mechanism for allowing plugins to provide
+    /// values that can be retrieved through the
+    /// [`pluginField`](#view.EditorView.pluginField) view method.
+    class PluginField {
+        /// Create a [provider](#view.PluginFieldProvider) for this field,
+        /// to use with a plugin's [provide](#view.PluginSpec.provide)
+        /// option.
+        from(get) {
+            return new PluginFieldProvider(this, get);
+        }
+        /// Define a new plugin field.
+        static define() { return new PluginField(); }
+    }
+    /// This field can be used by plugins to provide
+    /// [decorations](#view.Decoration).
+    ///
+    /// **Note**: For reasons of data flow (plugins are only updated
+    /// after the viewport is computed), decorations produced by plugins
+    /// are _not_ taken into account when predicting the vertical
+    /// layout structure of the editor. Thus, things like large widgets
+    /// or big replacements (i.e. code folding) should be provided
+    /// through the state-level [`decorations`
+    /// facet](#view.EditorView^decorations), not this plugin field.
+    PluginField.decorations = PluginField.define();
+    /// Plugins can provide additional scroll margins (space around the
+    /// sides of the scrolling element that should be considered
+    /// invisible) through this field. This can be useful when the
+    /// plugin introduces elements that cover part of that element (for
+    /// example a horizontally fixed gutter).
+    PluginField.scrollMargins = PluginField.define();
+    let nextPluginID = 0;
+    const viewPlugin = Facet.define();
+    /// View plugins associate stateful values with a view. They can
+    /// influence the way the content is drawn, and are notified of things
+    /// that happen in the view.
+    class ViewPlugin {
+        constructor(
+        /// @internal
+        id, 
+        /// @internal
+        create, 
+        /// @internal
+        fields) {
+            this.id = id;
+            this.create = create;
+            this.fields = fields;
+            this.extension = viewPlugin.of(this);
+        }
+        /// Define a plugin from a constructor function that creates the
+        /// plugin's value, given an editor view.
+        static define(create, spec) {
+            let { eventHandlers, provide, decorations } = spec || {};
+            let fields = [];
+            if (provide)
+                for (let provider of Array.isArray(provide) ? provide : [provide])
+                    fields.push(provider);
+            if (eventHandlers)
+                fields.push(domEventHandlers.from((value) => ({ plugin: value, handlers: eventHandlers })));
+            if (decorations)
+                fields.push(PluginField.decorations.from(decorations));
+            return new ViewPlugin(nextPluginID++, create, fields);
+        }
+        /// Create a plugin for a class whose constructor takes a single
+        /// editor view as argument.
+        static fromClass(cls, spec) {
+            return ViewPlugin.define(view => new cls(view), spec);
+        }
+    }
+    const domEventHandlers = PluginField.define();
+    class PluginInstance {
+        constructor(spec) {
+            this.spec = spec;
+            // When starting an update, all plugins have this field set to the
+            // update object, indicating they need to be updated. When finished
+            // updating, it is set to `false`. Retrieving a plugin that needs to
+            // be updated with `view.plugin` forces an eager update.
+            this.mustUpdate = null;
+            // This is null when the plugin is initially created, but
+            // initialized on the first update.
+            this.value = null;
+        }
+        takeField(type, target) {
+            for (let { field, get } of this.spec.fields)
+                if (field == type)
+                    target.push(get(this.value));
+        }
+        update(view) {
+            if (!this.value) {
+                try {
+                    this.value = this.spec.create(view);
+                }
+                catch (e) {
+                    logException(view.state, e, "CodeMirror plugin crashed");
+                    return PluginInstance.dummy;
+                }
+            }
+            else if (this.mustUpdate) {
+                let update = this.mustUpdate;
+                this.mustUpdate = null;
+                if (!this.value.update)
+                    return this;
+                try {
+                    this.value.update(update);
+                }
+                catch (e) {
+                    logException(update.state, e, "CodeMirror plugin crashed");
+                    if (this.value.destroy)
+                        try {
+                            this.value.destroy();
+                        }
+                        catch (_) { }
+                    return PluginInstance.dummy;
+                }
+            }
+            return this;
+        }
+        destroy(view) {
+            var _a;
+            if ((_a = this.value) === null || _a === void 0 ? void 0 : _a.destroy) {
+                try {
+                    this.value.destroy();
+                }
+                catch (e) {
+                    logException(view.state, e, "CodeMirror plugin crashed");
+                }
+            }
+        }
+    }
+    PluginInstance.dummy = new PluginInstance(ViewPlugin.define(() => ({})));
+    const editorAttributes = Facet.define({
+        combine: values => values.reduce((a, b) => combineAttrs(b, a), {})
+    });
+    const contentAttributes = Facet.define({
+        combine: values => values.reduce((a, b) => combineAttrs(b, a), {})
+    });
+    // Provide decorations
+    const decorations = Facet.define();
+    const styleModule = Facet.define();
+    class ChangedRange {
+        constructor(fromA, toA, fromB, toB) {
+            this.fromA = fromA;
+            this.toA = toA;
+            this.fromB = fromB;
+            this.toB = toB;
+        }
+        join(other) {
+            return new ChangedRange(Math.min(this.fromA, other.fromA), Math.max(this.toA, other.toA), Math.min(this.fromB, other.fromB), Math.max(this.toB, other.toB));
+        }
+        addToSet(set) {
+            let i = set.length, me = this;
+            for (; i > 0; i--) {
+                let range = set[i - 1];
+                if (range.fromA > me.toA)
+                    continue;
+                if (range.toA < me.fromA)
+                    break;
+                me = me.join(range);
+                set.splice(i - 1, 1);
+            }
+            set.splice(i, 0, me);
+            return set;
+        }
+        static extendWithRanges(diff, ranges) {
+            if (ranges.length == 0)
+                return diff;
+            let result = [];
+            for (let dI = 0, rI = 0, posA = 0, posB = 0;; dI++) {
+                let next = dI == diff.length ? null : diff[dI], off = posA - posB;
+                let end = next ? next.fromB : 1e9;
+                while (rI < ranges.length && ranges[rI] < end) {
+                    let from = ranges[rI], to = ranges[rI + 1];
+                    let fromB = Math.max(posB, from), toB = Math.min(end, to);
+                    if (fromB <= toB)
+                        new ChangedRange(fromB + off, toB + off, fromB, toB).addToSet(result);
+                    if (to > end)
+                        break;
+                    else
+                        rI += 2;
+                }
+                if (!next)
+                    return result;
+                new ChangedRange(next.fromA, next.toA, next.fromB, next.toB).addToSet(result);
+                posA = next.toA;
+                posB = next.toB;
+            }
+        }
+    }
+    /// View [plugins](#view.ViewPlugin) are given instances of this
+    /// class, which describe what happened, whenever the view is updated.
+    class ViewUpdate {
+        /// @internal
+        constructor(
+        /// The editor view that the update is associated with.
+        view, 
+        /// The new editor state.
+        state, 
+        /// The transactions involved in the update. May be empty.
+        transactions = none$4) {
+            this.view = view;
+            this.state = state;
+            this.transactions = transactions;
+            /// @internal
+            this.flags = 0;
+            this.startState = view.state;
+            this.changes = ChangeSet.empty(this.startState.doc.length);
+            for (let tr of transactions)
+                this.changes = this.changes.compose(tr.changes);
+            let changedRanges = [];
+            this.changes.iterChangedRanges((fromA, toA, fromB, toB) => changedRanges.push(new ChangedRange(fromA, toA, fromB, toB)));
+            this.changedRanges = changedRanges;
+            let focus = view.hasFocus;
+            if (focus != view.inputState.notifiedFocused) {
+                view.inputState.notifiedFocused = focus;
+                this.flags |= 1 /* Focus */;
+            }
+            if (this.docChanged)
+                this.flags |= 2 /* Height */;
+        }
+        /// Tells you whether the viewport changed in this update.
+        get viewportChanged() {
+            return (this.flags & 4 /* Viewport */) > 0;
+        }
+        /// Indicates whether the line height in the editor changed in this update.
+        get heightChanged() {
+            return (this.flags & 2 /* Height */) > 0;
+        }
+        /// Returns true when the document changed or the size of the editor
+        /// or the lines or characters within it has changed.
+        get geometryChanged() {
+            return this.docChanged || (this.flags & (16 /* Geometry */ | 2 /* Height */)) > 0;
+        }
+        /// True when this update indicates a focus change.
+        get focusChanged() {
+            return (this.flags & 1 /* Focus */) > 0;
+        }
+        /// Whether the document changed in this update.
+        get docChanged() {
+            return this.transactions.some(tr => tr.docChanged);
+        }
+        /// Whether the selection was explicitly set in this update.
+        get selectionSet() {
+            return this.transactions.some(tr => tr.selection);
+        }
+        /// @internal
+        get empty() { return this.flags == 0 && this.transactions.length == 0; }
+    }
+
+    class DocView extends ContentView {
+        constructor(view) {
+            super();
+            this.view = view;
+            this.compositionDeco = Decoration.none;
+            this.decorations = [];
+            // Track a minimum width for the editor. When measuring sizes in
+            // checkLayout, this is updated to point at the width of a given
+            // element and its extent in the document. When a change happens in
+            // that range, these are reset. That way, once we've seen a
+            // line/element of a given length, we keep the editor wide enough to
+            // fit at least that element, until it is changed, at which point we
+            // forget it again.
+            this.minWidth = 0;
+            this.minWidthFrom = 0;
+            this.minWidthTo = 0;
+            // Track whether the DOM selection was set in a lossy way, so that
+            // we don't mess it up when reading it back it
+            this.impreciseAnchor = null;
+            this.impreciseHead = null;
+            this.setDOM(view.contentDOM);
+            this.children = [new LineView];
+            this.children[0].setParent(this);
+            this.updateInner([new ChangedRange(0, 0, 0, view.state.doc.length)], this.updateDeco(), 0);
+        }
+        get root() { return this.view.root; }
+        get editorView() { return this.view; }
+        get length() { return this.view.state.doc.length; }
+        // Update the document view to a given state. scrollIntoView can be
+        // used as a hint to compute a new viewport that includes that
+        // position, if we know the editor is going to scroll that position
+        // into view.
+        update(update) {
+            let changedRanges = update.changedRanges;
+            if (this.minWidth > 0 && changedRanges.length) {
+                if (!changedRanges.every(({ fromA, toA }) => toA < this.minWidthFrom || fromA > this.minWidthTo)) {
+                    this.minWidth = 0;
+                }
+                else {
+                    this.minWidthFrom = update.changes.mapPos(this.minWidthFrom, 1);
+                    this.minWidthTo = update.changes.mapPos(this.minWidthTo, 1);
+                }
+            }
+            if (this.view.inputState.composing < 0)
+                this.compositionDeco = Decoration.none;
+            else if (update.transactions.length)
+                this.compositionDeco = computeCompositionDeco(this.view, update.changes);
+            // When the DOM nodes around the selection are moved to another
+            // parent, Chrome sometimes reports a different selection through
+            // getSelection than the one that it actually shows to the user.
+            // This forces a selection update when lines are joined to work
+            // around that. Issue #54
+            let forceSelection = (browser.ie || browser.chrome) && !this.compositionDeco.size && update &&
+                update.state.doc.lines != update.startState.doc.lines;
+            let prevDeco = this.decorations, deco = this.updateDeco();
+            let decoDiff = findChangedDeco(prevDeco, deco, update.changes);
+            changedRanges = ChangedRange.extendWithRanges(changedRanges, decoDiff);
+            let pointerSel = update.transactions.some(tr => tr.annotation(Transaction.userEvent) == "pointerselection");
+            if (this.dirty == 0 /* Not */ && changedRanges.length == 0 &&
+                !(update.flags & (4 /* Viewport */ | 8 /* LineGaps */)) &&
+                update.state.selection.main.from >= this.view.viewport.from &&
+                update.state.selection.main.to <= this.view.viewport.to) {
+                this.updateSelection(forceSelection, pointerSel);
+                return false;
+            }
+            else {
+                this.updateInner(changedRanges, deco, update.startState.doc.length, forceSelection, pointerSel);
+                return true;
+            }
+        }
+        // Used both by update and checkLayout do perform the actual DOM
+        // update
+        updateInner(changes, deco, oldLength, forceSelection = false, pointerSel = false) {
+            this.updateChildren(changes, deco, oldLength);
+            this.view.observer.ignore(() => {
+                // Lock the height during redrawing, since Chrome sometimes
+                // messes with the scroll position during DOM mutation (though
+                // no relayout is triggered and I cannot imagine how it can
+                // recompute the scroll position without a layout)
+                this.dom.style.height = this.view.viewState.domHeight + "px";
+                this.dom.style.minWidth = this.minWidth ? this.minWidth + "px" : "";
+                // Chrome will sometimes, when DOM mutations occur directly
+                // around the selection, get confused and report a different
+                // selection from the one it displays (issue #218). This tries
+                // to detect that situation.
+                let track = browser.chrome ? { node: getSelection(this.view.root).focusNode, written: false } : undefined;
+                this.sync(track);
+                this.dirty = 0 /* Not */;
+                if (track === null || track === void 0 ? void 0 : track.written)
+                    forceSelection = true;
+                this.updateSelection(forceSelection, pointerSel);
+                this.dom.style.height = "";
+            });
+        }
+        updateChildren(changes, deco, oldLength) {
+            let cursor = this.childCursor(oldLength);
+            for (let i = changes.length - 1;; i--) {
+                let next = i >= 0 ? changes[i] : null;
+                if (!next)
+                    break;
+                let { fromA, toA, fromB, toB } = next;
+                let { content, breakAtStart, openStart, openEnd } = ContentBuilder.build(this.view.state.doc, fromB, toB, deco);
+                let { i: toI, off: toOff } = cursor.findPos(toA, 1);
+                let { i: fromI, off: fromOff } = cursor.findPos(fromA, -1);
+                this.replaceRange(fromI, fromOff, toI, toOff, content, breakAtStart, openStart, openEnd);
+            }
+        }
+        replaceRange(fromI, fromOff, toI, toOff, content, breakAtStart, openStart, openEnd) {
+            let before = this.children[fromI], last = content.length ? content[content.length - 1] : null;
+            let breakAtEnd = last ? last.breakAfter : breakAtStart;
+            // Change within a single line
+            if (fromI == toI && !breakAtStart && !breakAtEnd && content.length < 2 &&
+                before.merge(fromOff, toOff, content.length ? last : null, fromOff == 0, openStart, openEnd))
+                return;
+            let after = this.children[toI];
+            // Make sure the end of the line after the update is preserved in `after`
+            if (toOff < after.length || after.children.length && after.children[after.children.length - 1].length == 0) {
+                // If we're splitting a line, separate part of the start line to
+                // avoid that being mangled when updating the start line.
+                if (fromI == toI) {
+                    after = after.split(toOff);
+                    toOff = 0;
+                }
+                // If the element after the replacement should be merged with
+                // the last replacing element, update `content`
+                if (!breakAtEnd && last && after.merge(0, toOff, last, true, 0, openEnd)) {
+                    content[content.length - 1] = after;
+                }
+                else {
+                    // Remove the start of the after element, if necessary, and
+                    // add it to `content`.
+                    if (toOff || after.children.length && after.children[0].length == 0)
+                        after.merge(0, toOff, null, false, 0, openEnd);
+                    content.push(after);
+                }
+            }
+            else if (after.breakAfter) {
+                // The element at `toI` is entirely covered by this range.
+                // Preserve its line break, if any.
+                if (last)
+                    last.breakAfter = 1;
+                else
+                    breakAtStart = 1;
+            }
+            // Since we've handled the next element from the current elements
+            // now, make sure `toI` points after that.
+            toI++;
+            before.breakAfter = breakAtStart;
+            if (fromOff > 0) {
+                if (!breakAtStart && content.length && before.merge(fromOff, before.length, content[0], false, openStart, 0)) {
+                    before.breakAfter = content.shift().breakAfter;
+                }
+                else if (fromOff < before.length || before.children.length && before.children[before.children.length - 1].length == 0) {
+                    before.merge(fromOff, before.length, null, false, openStart, 0);
+                }
+                fromI++;
+            }
+            // Try to merge widgets on the boundaries of the replacement
+            while (fromI < toI && content.length) {
+                if (this.children[toI - 1].match(content[content.length - 1]))
+                    toI--, content.pop();
+                else if (this.children[fromI].match(content[0]))
+                    fromI++, content.shift();
+                else
+                    break;
+            }
+            if (fromI < toI || content.length)
+                this.replaceChildren(fromI, toI, content);
+        }
+        // Sync the DOM selection to this.state.selection
+        updateSelection(force = false, fromPointer = false) {
+            if (!(fromPointer || this.mayControlSelection()))
+                return;
+            let main = this.view.state.selection.main;
+            // FIXME need to handle the case where the selection falls inside a block range
+            let anchor = this.domAtPos(main.anchor);
+            let head = main.empty ? anchor : this.domAtPos(main.head);
+            if (browser.gecko && main.empty && betweenUneditable(anchor)) {
+                let dummy = document.createTextNode("");
+                this.view.observer.ignore(() => anchor.node.insertBefore(dummy, anchor.node.childNodes[anchor.offset] || null));
+                anchor = head = new DOMPos(dummy, 0);
+                force = true;
+            }
+            let domSel = getSelection(this.root);
+            // If the selection is already here, or in an equivalent position, don't touch it
+            if (force || !domSel.focusNode ||
+                (browser.gecko && main.empty && nextToUneditable(domSel.focusNode, domSel.focusOffset)) ||
+                !isEquivalentPosition(anchor.node, anchor.offset, domSel.anchorNode, domSel.anchorOffset) ||
+                !isEquivalentPosition(head.node, head.offset, domSel.focusNode, domSel.focusOffset)) {
+                this.view.observer.ignore(() => {
+                    if (main.empty) {
+                        // Work around https://bugzilla.mozilla.org/show_bug.cgi?id=1612076
+                        if (browser.gecko) {
+                            let nextTo = nextToUneditable(anchor.node, anchor.offset);
+                            if (nextTo && nextTo != (1 /* Before */ | 2 /* After */)) {
+                                let text = nearbyTextNode(anchor.node, anchor.offset, nextTo == 1 /* Before */ ? 1 : -1);
+                                if (text)
+                                    anchor = new DOMPos(text, nextTo == 1 /* Before */ ? 0 : text.nodeValue.length);
+                            }
+                        }
+                        domSel.collapse(anchor.node, anchor.offset);
+                        if (main.bidiLevel != null && domSel.cursorBidiLevel != null)
+                            domSel.cursorBidiLevel = main.bidiLevel;
+                    }
+                    else if (domSel.extend) {
+                        // Selection.extend can be used to create an 'inverted' selection
+                        // (one where the focus is before the anchor), but not all
+                        // browsers support it yet.
+                        domSel.collapse(anchor.node, anchor.offset);
+                        domSel.extend(head.node, head.offset);
+                    }
+                    else {
+                        // Primitive (IE) way
+                        let range = document.createRange();
+                        if (main.anchor > main.head)
+                            [anchor, head] = [head, anchor];
+                        range.setEnd(head.node, head.offset);
+                        range.setStart(anchor.node, anchor.offset);
+                        domSel.removeAllRanges();
+                        domSel.addRange(range);
+                    }
+                });
+            }
+            this.impreciseAnchor = anchor.precise ? null : new DOMPos(domSel.anchorNode, domSel.anchorOffset);
+            this.impreciseHead = head.precise ? null : new DOMPos(domSel.focusNode, domSel.focusOffset);
+        }
+        enforceCursorAssoc() {
+            let cursor = this.view.state.selection.main;
+            let sel = getSelection(this.root);
+            if (!cursor.empty || !cursor.assoc || !sel.modify)
+                return;
+            let line = LineView.find(this, cursor.head); // FIXME provide view-line-range finding helper
+            if (!line)
+                return;
+            let lineStart = line.posAtStart;
+            if (cursor.head == lineStart || cursor.head == lineStart + line.length)
+                return;
+            let before = this.coordsAt(cursor.head, -1), after = this.coordsAt(cursor.head, 1);
+            if (!before || !after || before.bottom > after.top)
+                return;
+            let dom = this.domAtPos(cursor.head + cursor.assoc);
+            sel.collapse(dom.node, dom.offset);
+            sel.modify("move", cursor.assoc < 0 ? "forward" : "backward", "lineboundary");
+        }
+        mayControlSelection() {
+            return this.view.state.facet(editable) ? this.root.activeElement == this.dom : hasSelection(this.dom, getSelection(this.root));
+        }
+        nearest(dom) {
+            for (let cur = dom; cur;) {
+                let domView = ContentView.get(cur);
+                if (domView && domView.rootView == this)
+                    return domView;
+                cur = cur.parentNode;
+            }
+            return null;
+        }
+        posFromDOM(node, offset) {
+            let view = this.nearest(node);
+            if (!view)
+                throw new RangeError("Trying to find position for a DOM position outside of the document");
+            return view.localPosFromDOM(node, offset) + view.posAtStart;
+        }
+        domAtPos(pos) {
+            let { i, off } = this.childCursor().findPos(pos, -1);
+            for (; i < this.children.length - 1;) {
+                let child = this.children[i];
+                if (off < child.length || child instanceof LineView)
+                    break;
+                i++;
+                off = 0;
+            }
+            return this.children[i].domAtPos(off);
+        }
+        coordsAt(pos, side) {
+            for (let off = this.length, i = this.children.length - 1;; i--) {
+                let child = this.children[i], start = off - child.breakAfter - child.length;
+                if (pos > start || pos == start && (child.type == BlockType.Text || !i || this.children[i - 1].breakAfter))
+                    return child.coordsAt(pos - start, side);
+                off = start;
+            }
+        }
+        measureVisibleLineHeights() {
+            let result = [], { from, to } = this.view.viewState.viewport;
+            let minWidth = Math.max(this.view.scrollDOM.clientWidth, this.minWidth) + 1;
+            for (let pos = 0, i = 0; i < this.children.length; i++) {
+                let child = this.children[i], end = pos + child.length;
+                if (end > to)
+                    break;
+                if (pos >= from) {
+                    result.push(child.dom.getBoundingClientRect().height);
+                    let width = child.dom.scrollWidth;
+                    if (width > minWidth) {
+                        this.minWidth = minWidth = width;
+                        this.minWidthFrom = pos;
+                        this.minWidthTo = end;
+                    }
+                }
+                pos = end + child.breakAfter;
+            }
+            return result;
+        }
+        measureTextSize() {
+            for (let child of this.children) {
+                if (child instanceof LineView) {
+                    let measure = child.measureTextSize();
+                    if (measure)
+                        return measure;
+                }
+            }
+            // If no workable line exists, force a layout of a measurable element
+            let dummy = document.createElement("div"), lineHeight, charWidth;
+            dummy.className = "cm-line";
+            dummy.textContent = "abc def ghi jkl mno pqr stu";
+            this.view.observer.ignore(() => {
+                this.dom.appendChild(dummy);
+                let rect = clientRectsFor(dummy.firstChild)[0];
+                lineHeight = dummy.getBoundingClientRect().height;
+                charWidth = rect ? rect.width / 27 : 7;
+                dummy.remove();
+            });
+            return { lineHeight, charWidth };
+        }
+        childCursor(pos = this.length) {
+            // Move back to start of last element when possible, so that
+            // `ChildCursor.findPos` doesn't have to deal with the edge case
+            // of being after the last element.
+            let i = this.children.length;
+            if (i)
+                pos -= this.children[--i].length;
+            return new ChildCursor(this.children, pos, i);
+        }
+        computeBlockGapDeco() {
+            let deco = [], vs = this.view.viewState;
+            for (let pos = 0, i = 0;; i++) {
+                let next = i == vs.viewports.length ? null : vs.viewports[i];
+                let end = next ? next.from - 1 : this.length;
+                if (end > pos) {
+                    let height = vs.lineAt(end, 0).bottom - vs.lineAt(pos, 0).top;
+                    deco.push(Decoration.replace({ widget: new BlockGapWidget(height), block: true, inclusive: true }).range(pos, end));
+                }
+                if (!next)
+                    break;
+                pos = next.to + 1;
+            }
+            return Decoration.set(deco);
+        }
+        updateDeco() {
+            return this.decorations = [
+                this.computeBlockGapDeco(),
+                this.view.viewState.lineGapDeco,
+                this.compositionDeco,
+                ...this.view.state.facet(decorations),
+                ...this.view.pluginField(PluginField.decorations)
+            ];
+        }
+        scrollPosIntoView(pos, side) {
+            let rect = this.coordsAt(pos, side);
+            if (!rect)
+                return;
+            let mLeft = 0, mRight = 0, mTop = 0, mBottom = 0;
+            for (let margins of this.view.pluginField(PluginField.scrollMargins))
+                if (margins) {
+                    let { left, right, top, bottom } = margins;
+                    if (left != null)
+                        mLeft = Math.max(mLeft, left);
+                    if (right != null)
+                        mRight = Math.max(mRight, right);
+                    if (top != null)
+                        mTop = Math.max(mTop, top);
+                    if (bottom != null)
+                        mBottom = Math.max(mBottom, bottom);
+                }
+            scrollRectIntoView(this.dom, {
+                left: rect.left - mLeft, top: rect.top - mTop,
+                right: rect.right + mRight, bottom: rect.bottom + mBottom
+            });
+        }
+    }
+    function betweenUneditable(pos) {
+        return pos.node.nodeType == 1 && pos.node.firstChild &&
+            (pos.offset == 0 || pos.node.childNodes[pos.offset - 1].contentEditable == "false") &&
+            (pos.offset < pos.node.childNodes.length || pos.node.childNodes[pos.offset].contentEditable == "false");
+    }
+    class BlockGapWidget extends WidgetType {
+        constructor(height) {
+            super();
+            this.height = height;
+        }
+        toDOM() {
+            let elt = document.createElement("div");
+            this.updateDOM(elt);
+            return elt;
+        }
+        eq(other) { return other.height == this.height; }
+        updateDOM(elt) {
+            elt.style.height = this.height + "px";
+            return true;
+        }
+        get estimatedHeight() { return this.height; }
+    }
+    function computeCompositionDeco(view, changes) {
+        let sel = getSelection(view.root);
+        let textNode = sel.focusNode && nearbyTextNode(sel.focusNode, sel.focusOffset, 0);
+        if (!textNode)
+            return Decoration.none;
+        let cView = view.docView.nearest(textNode);
+        let from, to, topNode = textNode;
+        if (cView instanceof InlineView) {
+            while (cView.parent instanceof InlineView)
+                cView = cView.parent;
+            from = cView.posAtStart;
+            to = from + cView.length;
+            topNode = cView.dom;
+        }
+        else if (cView instanceof LineView) {
+            while (topNode.parentNode != cView.dom)
+                topNode = topNode.parentNode;
+            let prev = topNode.previousSibling;
+            while (prev && !ContentView.get(prev))
+                prev = prev.previousSibling;
+            from = to = prev ? ContentView.get(prev).posAtEnd : cView.posAtStart;
+        }
+        else {
+            return Decoration.none;
+        }
+        let newFrom = changes.mapPos(from, 1), newTo = Math.max(newFrom, changes.mapPos(to, -1));
+        let text = textNode.nodeValue, { state } = view;
+        if (newTo - newFrom < text.length) {
+            if (state.sliceDoc(newFrom, Math.min(state.doc.length, newFrom + text.length)) == text)
+                newTo = newFrom + text.length;
+            else if (state.sliceDoc(Math.max(0, newTo - text.length), newTo) == text)
+                newFrom = newTo - text.length;
+            else
+                return Decoration.none;
+        }
+        else if (state.sliceDoc(newFrom, newTo) != text) {
+            return Decoration.none;
+        }
+        return Decoration.set(Decoration.replace({ widget: new CompositionWidget(topNode, textNode) }).range(newFrom, newTo));
+    }
+    class CompositionWidget extends WidgetType {
+        constructor(top, text) {
+            super();
+            this.top = top;
+            this.text = text;
+        }
+        eq(other) { return this.top == other.top && this.text == other.text; }
+        toDOM() { return this.top; }
+        ignoreEvent() { return false; }
+        get customView() { return CompositionView; }
+    }
+    function nearbyTextNode(node, offset, side) {
+        for (;;) {
+            if (node.nodeType == 3)
+                return node;
+            if (node.nodeType == 1 && offset > 0 && side <= 0) {
+                node = node.childNodes[offset - 1];
+                offset = maxOffset(node);
+            }
+            else if (node.nodeType == 1 && offset < node.childNodes.length && side >= 0) {
+                node = node.childNodes[offset];
+                offset = 0;
+            }
+            else {
+                return null;
+            }
+        }
+    }
+    function nextToUneditable(node, offset) {
+        if (node.nodeType != 1)
+            return 0;
+        return (offset && node.childNodes[offset - 1].contentEditable == "false" ? 1 /* Before */ : 0) |
+            (offset < node.childNodes.length && node.childNodes[offset].contentEditable == "false" ? 2 /* After */ : 0);
+    }
+    class DecorationComparator$1 {
+        constructor() {
+            this.changes = [];
+        }
+        compareRange(from, to) { addRange(from, to, this.changes); }
+        comparePoint(from, to) { addRange(from, to, this.changes); }
+    }
+    function findChangedDeco(a, b, diff) {
+        let comp = new DecorationComparator$1;
+        RangeSet.compare(a, b, diff, comp);
+        return comp.changes;
     }
 
     /// Used to indicate [text direction](#view.EditorView.textDirection).
@@ -5050,6 +5689,839 @@ const cm = (function () {
             return EditorSelection.cursor(nextSpan.side(!forward, dir) + line.from, 0, nextSpan.level);
         return EditorSelection.cursor(nextIndex + line.from, 0, span.level);
     }
+
+    function groupAt(state, pos, bias = 1) {
+        let categorize = state.charCategorizer(pos);
+        let line = state.doc.lineAt(pos), linePos = pos - line.from;
+        if (line.length == 0)
+            return EditorSelection.cursor(pos);
+        if (linePos == 0)
+            bias = 1;
+        else if (linePos == line.length)
+            bias = -1;
+        let from = linePos, to = linePos;
+        if (bias < 0)
+            from = findClusterBreak(line.text, linePos, false);
+        else
+            to = findClusterBreak(line.text, linePos);
+        let cat = categorize(line.text.slice(from, to));
+        while (from > 0) {
+            let prev = findClusterBreak(line.text, from, false);
+            if (categorize(line.text.slice(prev, from)) != cat)
+                break;
+            from = prev;
+        }
+        while (to < line.length) {
+            let next = findClusterBreak(line.text, to);
+            if (categorize(line.text.slice(to, next)) != cat)
+                break;
+            to = next;
+        }
+        return EditorSelection.range(from + line.from, to + line.from);
+    }
+    // Search the DOM for the {node, offset} position closest to the given
+    // coordinates. Very inefficient and crude, but can usually be avoided
+    // by calling caret(Position|Range)FromPoint instead.
+    // FIXME holding arrow-up/down at the end of the viewport is a rather
+    // common use case that will repeatedly trigger this code. Maybe
+    // introduce some element of binary search after all?
+    function getdx(x, rect) {
+        return rect.left > x ? rect.left - x : Math.max(0, x - rect.right);
+    }
+    function getdy(y, rect) {
+        return rect.top > y ? rect.top - y : Math.max(0, y - rect.bottom);
+    }
+    function yOverlap(a, b) {
+        return a.top < b.bottom - 1 && a.bottom > b.top + 1;
+    }
+    function upTop(rect, top) {
+        return top < rect.top ? { top, left: rect.left, right: rect.right, bottom: rect.bottom } : rect;
+    }
+    function upBot(rect, bottom) {
+        return bottom > rect.bottom ? { top: rect.top, left: rect.left, right: rect.right, bottom } : rect;
+    }
+    function domPosAtCoords(parent, x, y) {
+        let closest, closestRect, closestX, closestY;
+        let above, below, aboveRect, belowRect;
+        for (let child = parent.firstChild; child; child = child.nextSibling) {
+            let rects = clientRectsFor(child);
+            for (let i = 0; i < rects.length; i++) {
+                let rect = rects[i];
+                if (closestRect && yOverlap(closestRect, rect))
+                    rect = upTop(upBot(rect, closestRect.bottom), closestRect.top);
+                let dx = getdx(x, rect), dy = getdy(y, rect);
+                if (dx == 0 && dy == 0)
+                    return child.nodeType == 3 ? domPosInText(child, x, y) : domPosAtCoords(child, x, y);
+                if (!closest || closestY > dy || closestY == dy && closestX > dx) {
+                    closest = child;
+                    closestRect = rect;
+                    closestX = dx;
+                    closestY = dy;
+                }
+                if (dx == 0) {
+                    if (y > rect.bottom && (!aboveRect || aboveRect.bottom < rect.bottom)) {
+                        above = child;
+                        aboveRect = rect;
+                    }
+                    else if (y < rect.top && (!belowRect || belowRect.top > rect.top)) {
+                        below = child;
+                        belowRect = rect;
+                    }
+                }
+                else if (aboveRect && yOverlap(aboveRect, rect)) {
+                    aboveRect = upBot(aboveRect, rect.bottom);
+                }
+                else if (belowRect && yOverlap(belowRect, rect)) {
+                    belowRect = upTop(belowRect, rect.top);
+                }
+            }
+        }
+        if (aboveRect && aboveRect.bottom >= y) {
+            closest = above;
+            closestRect = aboveRect;
+        }
+        else if (belowRect && belowRect.top <= y) {
+            closest = below;
+            closestRect = belowRect;
+        }
+        if (!closest)
+            return { node: parent, offset: 0 };
+        let clipX = Math.max(closestRect.left, Math.min(closestRect.right, x));
+        if (closest.nodeType == 3)
+            return domPosInText(closest, clipX, y);
+        if (!closestX && closest.contentEditable == "true")
+            return domPosAtCoords(closest, clipX, y);
+        let offset = Array.prototype.indexOf.call(parent.childNodes, closest) +
+            (x >= (closestRect.left + closestRect.right) / 2 ? 1 : 0);
+        return { node: parent, offset };
+    }
+    function domPosInText(node, x, y) {
+        let len = node.nodeValue.length, range = tempRange();
+        for (let i = 0; i < len; i++) {
+            range.setEnd(node, i + 1);
+            range.setStart(node, i);
+            let rects = range.getClientRects();
+            for (let j = 0; j < rects.length; j++) {
+                let rect = rects[j];
+                if (rect.top == rect.bottom)
+                    continue;
+                if (rect.left - 1 <= x && rect.right + 1 >= x &&
+                    rect.top - 1 <= y && rect.bottom + 1 >= y) {
+                    let right = x >= (rect.left + rect.right) / 2, after = right;
+                    if (browser.chrome || browser.gecko) {
+                        // Check for RTL on browsers that support getting client
+                        // rects for empty ranges.
+                        range.setEnd(node, i);
+                        let rectBefore = range.getBoundingClientRect();
+                        if (rectBefore.left == rect.right)
+                            after = !right;
+                    }
+                    return { node, offset: i + (after ? 1 : 0) };
+                }
+            }
+        }
+        return { node, offset: 0 };
+    }
+    function posAtCoords(view, { x, y }, bias = -1) {
+        let content = view.contentDOM.getBoundingClientRect(), block;
+        let halfLine = view.defaultLineHeight / 2;
+        for (let bounced = false;;) {
+            block = view.blockAtHeight(y, content.top);
+            if (block.top > y || block.bottom < y) {
+                bias = block.top > y ? -1 : 1;
+                y = Math.min(block.bottom - halfLine, Math.max(block.top + halfLine, y));
+                if (bounced)
+                    return -1;
+                else
+                    bounced = true;
+            }
+            if (block.type == BlockType.Text)
+                break;
+            y = bias > 0 ? block.bottom + halfLine : block.top - halfLine;
+        }
+        let lineStart = block.from;
+        // If this is outside of the rendered viewport, we can't determine a position
+        if (lineStart < view.viewport.from)
+            return view.viewport.from == 0 ? 0 : null;
+        if (lineStart > view.viewport.to)
+            return view.viewport.to == view.state.doc.length ? view.state.doc.length : null;
+        // Clip x to the viewport sides
+        x = Math.max(content.left + 1, Math.min(content.right - 1, x));
+        let root = view.root, element = root.elementFromPoint(x, y);
+        // There's visible editor content under the point, so we can try
+        // using caret(Position|Range)FromPoint as a shortcut
+        let node, offset = -1;
+        if (element && view.contentDOM.contains(element) && !(view.docView.nearest(element) instanceof WidgetView)) {
+            if (root.caretPositionFromPoint) {
+                let pos = root.caretPositionFromPoint(x, y);
+                if (pos)
+                    ({ offsetNode: node, offset } = pos);
+            }
+            else if (root.caretRangeFromPoint) {
+                let range = root.caretRangeFromPoint(x, y);
+                if (range)
+                    ({ startContainer: node, startOffset: offset } = range);
+            }
+        }
+        // No luck, do our own (potentially expensive) search
+        if (!node || !view.docView.dom.contains(node)) {
+            let line = LineView.find(view.docView, lineStart);
+            ({ node, offset } = domPosAtCoords(line.dom, x, y));
+        }
+        return view.docView.posFromDOM(node, offset);
+    }
+    function moveToLineBoundary(view, start, forward, includeWrap) {
+        let line = view.state.doc.lineAt(start.head);
+        let coords = !includeWrap || !view.lineWrapping ? null
+            : view.coordsAtPos(start.assoc < 0 && start.head > line.from ? start.head - 1 : start.head);
+        if (coords) {
+            let editorRect = view.dom.getBoundingClientRect();
+            let pos = view.posAtCoords({ x: forward == (view.textDirection == Direction.LTR) ? editorRect.right - 1 : editorRect.left + 1,
+                y: (coords.top + coords.bottom) / 2 });
+            if (pos != null)
+                return EditorSelection.cursor(pos, forward ? -1 : 1);
+        }
+        let lineView = LineView.find(view.docView, start.head);
+        let end = lineView ? (forward ? lineView.posAtEnd : lineView.posAtStart) : (forward ? line.to : line.from);
+        return EditorSelection.cursor(end, forward ? -1 : 1);
+    }
+    function moveByChar(view, start, forward, by) {
+        let line = view.state.doc.lineAt(start.head), spans = view.bidiSpans(line);
+        for (let cur = start, check = null;;) {
+            let next = moveVisually(line, spans, view.textDirection, cur, forward), char = movedOver;
+            if (!next) {
+                if (line.number == (forward ? view.state.doc.lines : 1))
+                    return cur;
+                char = "\n";
+                line = view.state.doc.line(line.number + (forward ? 1 : -1));
+                spans = view.bidiSpans(line);
+                next = EditorSelection.cursor(forward ? line.from : line.to);
+            }
+            if (!check) {
+                if (!by)
+                    return next;
+                check = by(char);
+            }
+            else if (!check(char)) {
+                return cur;
+            }
+            cur = next;
+        }
+    }
+    function byGroup(view, pos, start) {
+        let categorize = view.state.charCategorizer(pos);
+        let cat = categorize(start);
+        return (next) => {
+            let nextCat = categorize(next);
+            if (cat == CharCategory.Space)
+                cat = nextCat;
+            return cat == nextCat;
+        };
+    }
+    function moveVertically(view, start, forward, distance) {
+        var _a;
+        let startPos = start.head, dir = forward ? 1 : -1;
+        if (startPos == (forward ? view.state.doc.length : 0))
+            return EditorSelection.cursor(startPos);
+        let startCoords = view.coordsAtPos(startPos);
+        if (startCoords) {
+            let rect = view.dom.getBoundingClientRect();
+            let goal = (_a = start.goalColumn) !== null && _a !== void 0 ? _a : startCoords.left - rect.left;
+            let resolvedGoal = rect.left + goal;
+            let dist = distance !== null && distance !== void 0 ? distance : (view.defaultLineHeight >> 1);
+            for (let startY = dir < 0 ? startCoords.top : startCoords.bottom, extra = 0; extra < 50; extra += 10) {
+                let pos = posAtCoords(view, { x: resolvedGoal, y: startY + (dist + extra) * dir }, dir);
+                if (pos == null)
+                    break;
+                if (pos != startPos)
+                    return EditorSelection.cursor(pos, undefined, undefined, goal);
+            }
+        }
+        // Outside of the drawn viewport, use a crude column-based approach
+        let { doc } = view.state, line = doc.lineAt(startPos), tabSize = view.state.tabSize;
+        let goal = start.goalColumn, goalCol = 0;
+        if (goal == null) {
+            for (const iter = doc.iterRange(line.from, startPos); !iter.next().done;)
+                goalCol = countColumn(iter.value, goalCol, tabSize);
+            goal = goalCol * view.defaultCharacterWidth;
+        }
+        else {
+            goalCol = Math.round(goal / view.defaultCharacterWidth);
+        }
+        if (dir < 0 && line.from == 0)
+            return EditorSelection.cursor(0);
+        else if (dir > 0 && line.to == doc.length)
+            return EditorSelection.cursor(line.to);
+        let otherLine = doc.line(line.number + dir);
+        let result = otherLine.from;
+        let seen = 0;
+        for (const iter = doc.iterRange(otherLine.from, otherLine.to); seen >= goalCol && !iter.next().done;) {
+            const { offset, leftOver } = findColumn(iter.value, seen, goalCol, tabSize);
+            seen = goalCol - leftOver;
+            result += offset;
+        }
+        return EditorSelection.cursor(result, undefined, undefined, goal);
+    }
+
+    // This will also be where dragging info and such goes
+    class InputState {
+        constructor(view) {
+            this.lastKeyCode = 0;
+            this.lastKeyTime = 0;
+            this.lastSelectionOrigin = null;
+            this.lastSelectionTime = 0;
+            this.lastEscPress = 0;
+            this.scrollHandlers = [];
+            this.registeredEvents = [];
+            this.customHandlers = [];
+            // -1 means not in a composition. Otherwise, this counts the number
+            // of changes made during the composition. The count is used to
+            // avoid treating the start state of the composition, before any
+            // changes have been made, as part of the composition.
+            this.composing = -1;
+            this.compositionEndedAt = 0;
+            this.mouseSelection = null;
+            for (let type in handlers) {
+                let handler = handlers[type];
+                view.contentDOM.addEventListener(type, (event) => {
+                    if (!eventBelongsToEditor(view, event) || this.ignoreDuringComposition(event) ||
+                        type == "keydown" && this.screenKeyEvent(view, event))
+                        return;
+                    if (this.mustFlushObserver(event))
+                        view.observer.forceFlush();
+                    if (this.runCustomHandlers(type, view, event))
+                        event.preventDefault();
+                    else
+                        handler(view, event);
+                });
+                this.registeredEvents.push(type);
+            }
+            // Must always run, even if a custom handler handled the event
+            view.contentDOM.addEventListener("keydown", (event) => {
+                view.inputState.lastKeyCode = event.keyCode;
+                view.inputState.lastKeyTime = Date.now();
+            });
+            this.notifiedFocused = view.hasFocus;
+            this.ensureHandlers(view);
+        }
+        setSelectionOrigin(origin) {
+            this.lastSelectionOrigin = origin;
+            this.lastSelectionTime = Date.now();
+        }
+        ensureHandlers(view) {
+            let handlers = this.customHandlers = view.pluginField(domEventHandlers);
+            for (let set of handlers) {
+                for (let type in set.handlers)
+                    if (this.registeredEvents.indexOf(type) < 0 && type != "scroll") {
+                        this.registeredEvents.push(type);
+                        view.contentDOM.addEventListener(type, (event) => {
+                            if (!eventBelongsToEditor(view, event))
+                                return;
+                            if (this.runCustomHandlers(type, view, event))
+                                event.preventDefault();
+                        });
+                    }
+            }
+        }
+        runCustomHandlers(type, view, event) {
+            for (let set of this.customHandlers) {
+                let handler = set.handlers[type], handled = false;
+                if (handler) {
+                    try {
+                        handled = handler.call(set.plugin, event, view);
+                    }
+                    catch (e) {
+                        logException(view.state, e);
+                    }
+                    if (handled || event.defaultPrevented) {
+                        // Chrome for Android often applies a bunch of nonsensical
+                        // DOM changes after an enter press, even when
+                        // preventDefault-ed. This tries to ignore those.
+                        if (browser.android && type == "keydown" && event.keyCode == 13)
+                            view.observer.flushSoon();
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+        runScrollHandlers(view, event) {
+            for (let set of this.customHandlers) {
+                let handler = set.handlers.scroll;
+                if (handler) {
+                    try {
+                        handler.call(set.plugin, event, view);
+                    }
+                    catch (e) {
+                        logException(view.state, e);
+                    }
+                }
+            }
+        }
+        ignoreDuringComposition(event) {
+            if (!/^key/.test(event.type))
+                return false;
+            if (this.composing > 0)
+                return true;
+            // See https://www.stum.de/2016/06/24/handling-ime-events-in-javascript/.
+            // On some input method editors (IMEs), the Enter key is used to
+            // confirm character selection. On Safari, when Enter is pressed,
+            // compositionend and keydown events are sometimes emitted in the
+            // wrong order. The key event should still be ignored, even when
+            // it happens after the compositionend event.
+            if (browser.safari && event.timeStamp - this.compositionEndedAt < 500) {
+                this.compositionEndedAt = 0;
+                return true;
+            }
+            return false;
+        }
+        screenKeyEvent(view, event) {
+            let protectedTab = event.keyCode == 9 && Date.now() < this.lastEscPress + 2000;
+            if (event.keyCode == 27)
+                this.lastEscPress = Date.now();
+            else if (modifierCodes.indexOf(event.keyCode) < 0)
+                this.lastEscPress = 0;
+            return protectedTab;
+        }
+        mustFlushObserver(event) {
+            return (event.type == "keydown" && event.keyCode != 229) || event.type == "compositionend";
+        }
+        startMouseSelection(view, event, style) {
+            if (this.mouseSelection)
+                this.mouseSelection.destroy();
+            this.mouseSelection = new MouseSelection(this, view, event, style);
+        }
+        update(update) {
+            if (this.mouseSelection)
+                this.mouseSelection.update(update);
+            this.lastKeyCode = this.lastSelectionTime = 0;
+        }
+        destroy() {
+            if (this.mouseSelection)
+                this.mouseSelection.destroy();
+        }
+    }
+    // Key codes for modifier keys
+    const modifierCodes = [16, 17, 18, 20, 91, 92, 224, 225];
+    class MouseSelection {
+        constructor(inputState, view, startEvent, style) {
+            this.inputState = inputState;
+            this.view = view;
+            this.startEvent = startEvent;
+            this.style = style;
+            let doc = view.contentDOM.ownerDocument;
+            doc.addEventListener("mousemove", this.move = this.move.bind(this));
+            doc.addEventListener("mouseup", this.up = this.up.bind(this));
+            this.extend = startEvent.shiftKey;
+            this.multiple = view.state.facet(EditorState.allowMultipleSelections) && addsSelectionRange(view, startEvent);
+            this.dragMove = dragMovesSelection(view, startEvent);
+            this.dragging = isInPrimarySelection(view, startEvent) ? null : false;
+            // When clicking outside of the selection, immediately apply the
+            // effect of starting the selection
+            if (this.dragging === false) {
+                startEvent.preventDefault();
+                this.select(startEvent);
+            }
+        }
+        move(event) {
+            if (event.buttons == 0)
+                return this.destroy();
+            if (this.dragging !== false)
+                return;
+            this.select(event);
+        }
+        up(event) {
+            if (this.dragging == null)
+                this.select(this.startEvent);
+            if (!this.dragging)
+                event.preventDefault();
+            this.destroy();
+        }
+        destroy() {
+            let doc = this.view.contentDOM.ownerDocument;
+            doc.removeEventListener("mousemove", this.move);
+            doc.removeEventListener("mouseup", this.up);
+            this.inputState.mouseSelection = null;
+        }
+        select(event) {
+            let selection = this.style.get(event, this.extend, this.multiple);
+            if (!selection.eq(this.view.state.selection) || selection.main.assoc != this.view.state.selection.main.assoc)
+                this.view.dispatch({
+                    selection,
+                    annotations: Transaction.userEvent.of("pointerselection"),
+                    scrollIntoView: true
+                });
+        }
+        update(update) {
+            if (update.docChanged && this.dragging)
+                this.dragging = this.dragging.map(update.changes);
+            this.style.update(update);
+        }
+    }
+    function addsSelectionRange(view, event) {
+        let facet = view.state.facet(clickAddsSelectionRange);
+        return facet.length ? facet[0](event) : browser.mac ? event.metaKey : event.ctrlKey;
+    }
+    function dragMovesSelection(view, event) {
+        let facet = view.state.facet(dragMovesSelection$1);
+        return facet.length ? facet[0](event) : browser.mac ? !event.altKey : !event.ctrlKey;
+    }
+    function isInPrimarySelection(view, event) {
+        let { main } = view.state.selection;
+        if (main.empty)
+            return false;
+        // On boundary clicks, check whether the coordinates are inside the
+        // selection's client rectangles
+        let sel = getSelection(view.root);
+        if (sel.rangeCount == 0)
+            return true;
+        let rects = sel.getRangeAt(0).getClientRects();
+        for (let i = 0; i < rects.length; i++) {
+            let rect = rects[i];
+            if (rect.left <= event.clientX && rect.right >= event.clientX &&
+                rect.top <= event.clientY && rect.bottom >= event.clientY)
+                return true;
+        }
+        return false;
+    }
+    function eventBelongsToEditor(view, event) {
+        if (!event.bubbles)
+            return true;
+        if (event.defaultPrevented)
+            return false;
+        for (let node = event.target, cView; node != view.contentDOM; node = node.parentNode)
+            if (!node || node.nodeType == 11 || ((cView = ContentView.get(node)) && cView.ignoreEvent(event)))
+                return false;
+        return true;
+    }
+    const handlers = Object.create(null);
+    // This is very crude, but unfortunately both these browsers _pretend_
+    // that they have a clipboard API—all the objects and methods are
+    // there, they just don't work, and they are hard to test.
+    const brokenClipboardAPI = (browser.ie && browser.ie_version < 15) ||
+        (browser.ios && browser.webkit_version < 604);
+    function capturePaste(view) {
+        let parent = view.dom.parentNode;
+        if (!parent)
+            return;
+        let target = parent.appendChild(document.createElement("textarea"));
+        target.style.cssText = "position: fixed; left: -10000px; top: 10px";
+        target.focus();
+        setTimeout(() => {
+            view.focus();
+            target.remove();
+            doPaste(view, target.value);
+        }, 50);
+    }
+    function doPaste(view, input) {
+        let { state } = view, changes, i = 1, text = state.toText(input);
+        let byLine = text.lines == state.selection.ranges.length;
+        let linewise = lastLinewiseCopy && state.selection.ranges.every(r => r.empty) && lastLinewiseCopy == text.toString();
+        if (linewise) {
+            let lastLine = -1;
+            changes = state.changeByRange(range => {
+                let line = state.doc.lineAt(range.from);
+                if (line.from == lastLine)
+                    return { range };
+                lastLine = line.from;
+                let insert = state.toText((byLine ? text.line(i++).text : input) + state.lineBreak);
+                return { changes: { from: line.from, insert },
+                    range: EditorSelection.cursor(range.from + insert.length) };
+            });
+        }
+        else if (byLine) {
+            changes = state.changeByRange(range => {
+                let line = text.line(i++);
+                return { changes: { from: range.from, to: range.to, insert: line.text },
+                    range: EditorSelection.cursor(range.from + line.length) };
+            });
+        }
+        else {
+            changes = state.replaceSelection(text);
+        }
+        view.dispatch(changes, {
+            annotations: Transaction.userEvent.of("paste"),
+            scrollIntoView: true
+        });
+    }
+    function mustCapture(event) {
+        let mods = (event.ctrlKey ? 1 /* Ctrl */ : 0) | (event.metaKey ? 8 /* Meta */ : 0) |
+            (event.altKey ? 2 /* Alt */ : 0) | (event.shiftKey ? 4 /* Shift */ : 0);
+        let code = event.keyCode, macCtrl = browser.mac && mods == 1 /* Ctrl */;
+        return code == 8 || (macCtrl && code == 72) || // Backspace, Ctrl-h on Mac
+            code == 46 || (macCtrl && code == 68) || // Delete, Ctrl-d on Mac
+            code == 27 || // Esc
+            (mods == (browser.mac ? 8 /* Meta */ : 1 /* Ctrl */) && // Ctrl/Cmd-[biyz]
+                (code == 66 || code == 73 || code == 89 || code == 90));
+    }
+    handlers.keydown = (view, event) => {
+        if (mustCapture(event))
+            event.preventDefault();
+        view.inputState.setSelectionOrigin("keyboardselection");
+    };
+    let lastTouch = 0;
+    function mouseLikeTouchEvent(e) {
+        return e.touches.length == 1 && e.touches[0].radiusX <= 1 && e.touches[0].radiusY <= 1;
+    }
+    handlers.touchstart = (view, e) => {
+        if (!mouseLikeTouchEvent(e))
+            lastTouch = Date.now();
+        view.inputState.setSelectionOrigin("pointerselection");
+    };
+    handlers.touchmove = view => {
+        view.inputState.setSelectionOrigin("pointerselection");
+    };
+    handlers.mousedown = (view, event) => {
+        view.observer.flush();
+        if (lastTouch > Date.now() - 2000)
+            return; // Ignore touch interaction
+        let style = null;
+        for (let makeStyle of view.state.facet(mouseSelectionStyle)) {
+            style = makeStyle(view, event);
+            if (style)
+                break;
+        }
+        if (!style && event.button == 0)
+            style = basicMouseSelection(view, event);
+        if (style) {
+            if (view.root.activeElement != view.contentDOM)
+                view.observer.ignore(() => focusPreventScroll(view.contentDOM));
+            view.inputState.startMouseSelection(view, event, style);
+        }
+    };
+    function rangeForClick(view, pos, bias, type) {
+        if (type == 1) { // Single click
+            return EditorSelection.cursor(pos, bias);
+        }
+        else if (type == 2) { // Double click
+            return groupAt(view.state, pos, bias);
+        }
+        else { // Triple click
+            let line = LineView.find(view.docView, pos);
+            if (line)
+                return EditorSelection.range(line.posAtStart, line.posAtEnd);
+            let { from, to } = view.state.doc.lineAt(pos);
+            return EditorSelection.range(from, to);
+        }
+    }
+    let insideY = (y, rect) => y >= rect.top && y <= rect.bottom;
+    let inside = (x, y, rect) => insideY(y, rect) && x >= rect.left && x <= rect.right;
+    // Try to determine, for the given coordinates, associated with the
+    // given position, whether they are related to the element before or
+    // the element after the position.
+    function findPositionSide(view, pos, x, y) {
+        let line = LineView.find(view.docView, pos);
+        if (!line)
+            return 1;
+        let off = pos - line.posAtStart;
+        // Line boundaries point into the line
+        if (off == 0)
+            return 1;
+        if (off == line.length)
+            return -1;
+        // Positions on top of an element point at that element
+        let before = line.coordsAt(off, -1);
+        if (before && inside(x, y, before))
+            return -1;
+        let after = line.coordsAt(off, 1);
+        if (after && inside(x, y, after))
+            return 1;
+        // This is probably a line wrap point. Pick before if the point is
+        // beside it.
+        return before && insideY(y, before) ? -1 : 1;
+    }
+    function queryPos(view, event) {
+        let pos = view.posAtCoords({ x: event.clientX, y: event.clientY });
+        if (pos == null)
+            return null;
+        return { pos, bias: findPositionSide(view, pos, event.clientX, event.clientY) };
+    }
+    const BadMouseDetail = browser.ie && browser.ie_version <= 11;
+    let lastMouseDown = null, lastMouseDownCount = 0;
+    function getClickType(event) {
+        if (!BadMouseDetail)
+            return event.detail;
+        let last = lastMouseDown;
+        lastMouseDown = event;
+        return lastMouseDownCount = !last || (last.timeStamp > Date.now() - 400 && Math.abs(last.clientX - event.clientX) < 2 &&
+            Math.abs(last.clientY - event.clientY) < 2) ? (lastMouseDownCount + 1) % 3 : 1;
+    }
+    function basicMouseSelection(view, event) {
+        let start = queryPos(view, event), type = getClickType(event);
+        let startSel = view.state.selection;
+        let last = start, lastEvent = event;
+        return {
+            update(update) {
+                if (update.changes) {
+                    if (start)
+                        start.pos = update.changes.mapPos(start.pos);
+                    startSel = startSel.map(update.changes);
+                }
+            },
+            get(event, extend, multiple) {
+                let cur;
+                if (event.clientX == lastEvent.clientX && event.clientY == lastEvent.clientY)
+                    cur = last;
+                else {
+                    cur = last = queryPos(view, event);
+                    lastEvent = event;
+                }
+                if (!cur || !start)
+                    return startSel;
+                let range = rangeForClick(view, cur.pos, cur.bias, type);
+                if (start.pos != cur.pos && !extend) {
+                    let startRange = rangeForClick(view, start.pos, start.bias, type);
+                    let from = Math.min(startRange.from, range.from), to = Math.max(startRange.to, range.to);
+                    range = from < range.from ? EditorSelection.range(from, to) : EditorSelection.range(to, from);
+                }
+                if (extend)
+                    return startSel.replaceRange(startSel.main.extend(range.from, range.to));
+                else if (multiple)
+                    return startSel.addRange(range);
+                else
+                    return EditorSelection.create([range]);
+            }
+        };
+    }
+    handlers.dragstart = (view, event) => {
+        let { selection: { main } } = view.state;
+        let { mouseSelection } = view.inputState;
+        if (mouseSelection)
+            mouseSelection.dragging = main;
+        if (event.dataTransfer) {
+            event.dataTransfer.setData("Text", view.state.sliceDoc(main.from, main.to));
+            event.dataTransfer.effectAllowed = "copyMove";
+        }
+    };
+    handlers.drop = (view, event) => {
+        if (!event.dataTransfer)
+            return;
+        let dropPos = view.posAtCoords({ x: event.clientX, y: event.clientY });
+        let text = event.dataTransfer.getData("Text");
+        if (dropPos == null || !text)
+            return;
+        event.preventDefault();
+        let { mouseSelection } = view.inputState;
+        let del = mouseSelection && mouseSelection.dragging && mouseSelection.dragMove ?
+            { from: mouseSelection.dragging.from, to: mouseSelection.dragging.to } : null;
+        let ins = { from: dropPos, insert: text };
+        let changes = view.state.changes(del ? [del, ins] : ins);
+        view.focus();
+        view.dispatch({
+            changes,
+            selection: { anchor: changes.mapPos(dropPos, -1), head: changes.mapPos(dropPos, 1) },
+            annotations: Transaction.userEvent.of("drop")
+        });
+    };
+    handlers.paste = (view, event) => {
+        view.observer.flush();
+        let data = brokenClipboardAPI ? null : event.clipboardData;
+        let text = data && data.getData("text/plain");
+        if (text) {
+            doPaste(view, text);
+            event.preventDefault();
+        }
+        else {
+            capturePaste(view);
+        }
+    };
+    function captureCopy(view, text) {
+        // The extra wrapper is somehow necessary on IE/Edge to prevent the
+        // content from being mangled when it is put onto the clipboard
+        let parent = view.dom.parentNode;
+        if (!parent)
+            return;
+        let target = parent.appendChild(document.createElement("textarea"));
+        target.style.cssText = "position: fixed; left: -10000px; top: 10px";
+        target.value = text;
+        target.focus();
+        target.selectionEnd = text.length;
+        target.selectionStart = 0;
+        setTimeout(() => {
+            target.remove();
+            view.focus();
+        }, 50);
+    }
+    function copiedRange(state) {
+        let content = [], ranges = [], linewise = false;
+        for (let range of state.selection.ranges)
+            if (!range.empty) {
+                content.push(state.sliceDoc(range.from, range.to));
+                ranges.push(range);
+            }
+        if (!content.length) {
+            // Nothing selected, do a line-wise copy
+            let upto = -1;
+            for (let { from } of state.selection.ranges) {
+                let line = state.doc.lineAt(from);
+                if (line.number > upto) {
+                    content.push(line.text);
+                    ranges.push({ from: line.from, to: Math.min(state.doc.length, line.to + 1) });
+                }
+                upto = line.number;
+            }
+            linewise = true;
+        }
+        return { text: content.join(state.lineBreak), ranges, linewise };
+    }
+    let lastLinewiseCopy = null;
+    handlers.copy = handlers.cut = (view, event) => {
+        let { text, ranges, linewise } = copiedRange(view.state);
+        if (!text)
+            return;
+        lastLinewiseCopy = linewise ? text : null;
+        let data = brokenClipboardAPI ? null : event.clipboardData;
+        if (data) {
+            event.preventDefault();
+            data.clearData();
+            data.setData("text/plain", text);
+        }
+        else {
+            captureCopy(view, text);
+        }
+        if (event.type == "cut")
+            view.dispatch({
+                changes: ranges,
+                scrollIntoView: true,
+                annotations: Transaction.userEvent.of("cut")
+            });
+    };
+    handlers.focus = handlers.blur = view => {
+        setTimeout(() => {
+            if (view.hasFocus != view.inputState.notifiedFocused)
+                view.update([]);
+        }, 10);
+    };
+    handlers.beforeprint = view => {
+        view.viewState.printing = true;
+        view.requestMeasure();
+        setTimeout(() => {
+            view.viewState.printing = false;
+            view.requestMeasure();
+        }, 2000);
+    };
+    function forceClearComposition(view) {
+        if (view.docView.compositionDeco.size)
+            view.update([]);
+    }
+    handlers.compositionstart = handlers.compositionupdate = view => {
+        if (view.inputState.composing < 0) {
+            if (view.docView.compositionDeco.size) {
+                view.observer.flush();
+                forceClearComposition(view);
+            }
+            // FIXME possibly set a timeout to clear it again on Android
+            view.inputState.composing = 0;
+        }
+    };
+    handlers.compositionend = view => {
+        view.inputState.composing = -1;
+        view.inputState.compositionEndedAt = Date.now();
+        setTimeout(() => {
+            if (view.inputState.composing < 0)
+                forceClearComposition(view);
+        }, 50);
+    };
 
     const wrappingWhiteSpace = ["pre-wrap", "normal", "pre-line"];
     class HeightOracle {
@@ -5673,296 +7145,6 @@ const cm = (function () {
         }
     }
 
-    const none$3 = [];
-    const clickAddsSelectionRange = Facet.define();
-    const dragMovesSelection = Facet.define();
-    const mouseSelectionStyle = Facet.define();
-    const exceptionSink = Facet.define();
-    const updateListener = Facet.define();
-    const inputHandler = Facet.define();
-    /// Log or report an unhandled exception in client code. Should
-    /// probably only be used by extension code that allows client code to
-    /// provide functions, and calls those functions in a context where an
-    /// exception can't be propagated to calling code in a reasonable way
-    /// (for example when in an event handler).
-    ///
-    /// Either calls a handler registered with
-    /// [`EditorView.exceptionSink`](#view.EditorView^exceptionSink),
-    /// `window.onerror`, if defined, or `console.error` (in which case
-    /// it'll pass `context`, when given, as first argument).
-    function logException(state, exception, context) {
-        let handler = state.facet(exceptionSink);
-        if (handler.length)
-            handler[0](exception);
-        else if (window.onerror)
-            window.onerror(String(exception), context, undefined, undefined, exception);
-        else if (context)
-            console.error(context + ":", exception);
-        else
-            console.error(exception);
-    }
-    const editable = Facet.define({ combine: values => values.length ? values[0] : true });
-    /// Used to [declare](#view.PluginSpec.provide) which
-    /// [fields](#view.PluginValue) a [view plugin](#view.ViewPlugin)
-    /// provides.
-    class PluginFieldProvider {
-        /// @internal
-        constructor(
-        /// @internal
-        field, 
-        /// @internal
-        get) {
-            this.field = field;
-            this.get = get;
-        }
-    }
-    /// Plugin fields are a mechanism for allowing plugins to provide
-    /// values that can be retrieved through the
-    /// [`pluginField`](#view.EditorView.pluginField) view method.
-    class PluginField {
-        /// Create a [provider](#view.PluginFieldProvider) for this field,
-        /// to use with a plugin's [provide](#view.PluginSpec.provide)
-        /// option.
-        from(get) {
-            return new PluginFieldProvider(this, get);
-        }
-        /// Define a new plugin field.
-        static define() { return new PluginField(); }
-    }
-    /// This field can be used by plugins to provide
-    /// [decorations](#view.Decoration).
-    ///
-    /// **Note**: For reasons of data flow (plugins are only updated
-    /// after the viewport is computed), decorations produced by plugins
-    /// are _not_ taken into account when predicting the vertical
-    /// layout structure of the editor. Thus, things like large widgets
-    /// or big replacements (i.e. code folding) should be provided
-    /// through the state-level [`decorations`
-    /// facet](#view.EditorView^decorations), not this plugin field.
-    PluginField.decorations = PluginField.define();
-    /// Plugins can provide additional scroll margins (space around the
-    /// sides of the scrolling element that should be considered
-    /// invisible) through this field. This can be useful when the
-    /// plugin introduces elements that cover part of that element (for
-    /// example a horizontally fixed gutter).
-    PluginField.scrollMargins = PluginField.define();
-    let nextPluginID = 0;
-    const viewPlugin = Facet.define();
-    /// View plugins associate stateful values with a view. They can
-    /// influence the way the content is drawn, and are notified of things
-    /// that happen in the view.
-    class ViewPlugin {
-        constructor(
-        /// @internal
-        id, 
-        /// @internal
-        create, 
-        /// @internal
-        fields) {
-            this.id = id;
-            this.create = create;
-            this.fields = fields;
-            this.extension = viewPlugin.of(this);
-        }
-        /// Define a plugin from a constructor function that creates the
-        /// plugin's value, given an editor view.
-        static define(create, spec) {
-            let { eventHandlers, provide, decorations } = spec || {};
-            let fields = [];
-            if (provide)
-                for (let provider of Array.isArray(provide) ? provide : [provide])
-                    fields.push(provider);
-            if (eventHandlers)
-                fields.push(domEventHandlers.from((value) => ({ plugin: value, handlers: eventHandlers })));
-            if (decorations)
-                fields.push(PluginField.decorations.from(decorations));
-            return new ViewPlugin(nextPluginID++, create, fields);
-        }
-        /// Create a plugin for a class whose constructor takes a single
-        /// editor view as argument.
-        static fromClass(cls, spec) {
-            return ViewPlugin.define(view => new cls(view), spec);
-        }
-    }
-    const domEventHandlers = PluginField.define();
-    class PluginInstance {
-        constructor(spec) {
-            this.spec = spec;
-            // When starting an update, all plugins have this field set to the
-            // update object, indicating they need to be updated. When finished
-            // updating, it is set to `false`. Retrieving a plugin that needs to
-            // be updated with `view.plugin` forces an eager update.
-            this.mustUpdate = null;
-            // This is null when the plugin is initially created, but
-            // initialized on the first update.
-            this.value = null;
-        }
-        takeField(type, target) {
-            for (let { field, get } of this.spec.fields)
-                if (field == type)
-                    target.push(get(this.value));
-        }
-        update(view) {
-            if (!this.value) {
-                try {
-                    this.value = this.spec.create(view);
-                }
-                catch (e) {
-                    logException(view.state, e, "CodeMirror plugin crashed");
-                    return PluginInstance.dummy;
-                }
-            }
-            else if (this.mustUpdate) {
-                let update = this.mustUpdate;
-                this.mustUpdate = null;
-                if (!this.value.update)
-                    return this;
-                try {
-                    this.value.update(update);
-                }
-                catch (e) {
-                    logException(update.state, e, "CodeMirror plugin crashed");
-                    if (this.value.destroy)
-                        try {
-                            this.value.destroy();
-                        }
-                        catch (_) { }
-                    return PluginInstance.dummy;
-                }
-            }
-            return this;
-        }
-        destroy(view) {
-            var _a;
-            if ((_a = this.value) === null || _a === void 0 ? void 0 : _a.destroy) {
-                try {
-                    this.value.destroy();
-                }
-                catch (e) {
-                    logException(view.state, e, "CodeMirror plugin crashed");
-                }
-            }
-        }
-    }
-    PluginInstance.dummy = new PluginInstance(ViewPlugin.define(() => ({})));
-    const editorAttributes = Facet.define({
-        combine: values => values.reduce((a, b) => combineAttrs(b, a), {})
-    });
-    const contentAttributes = Facet.define({
-        combine: values => values.reduce((a, b) => combineAttrs(b, a), {})
-    });
-    // Provide decorations
-    const decorations = Facet.define();
-    const styleModule = Facet.define();
-    class ChangedRange {
-        constructor(fromA, toA, fromB, toB) {
-            this.fromA = fromA;
-            this.toA = toA;
-            this.fromB = fromB;
-            this.toB = toB;
-        }
-        join(other) {
-            return new ChangedRange(Math.min(this.fromA, other.fromA), Math.max(this.toA, other.toA), Math.min(this.fromB, other.fromB), Math.max(this.toB, other.toB));
-        }
-        addToSet(set) {
-            let i = set.length, me = this;
-            for (; i > 0; i--) {
-                let range = set[i - 1];
-                if (range.fromA > me.toA)
-                    continue;
-                if (range.toA < me.fromA)
-                    break;
-                me = me.join(range);
-                set.splice(i - 1, 1);
-            }
-            set.splice(i, 0, me);
-            return set;
-        }
-        static extendWithRanges(diff, ranges) {
-            if (ranges.length == 0)
-                return diff;
-            let result = [];
-            for (let dI = 0, rI = 0, posA = 0, posB = 0;; dI++) {
-                let next = dI == diff.length ? null : diff[dI], off = posA - posB;
-                let end = next ? next.fromB : 1e9;
-                while (rI < ranges.length && ranges[rI] < end) {
-                    let from = ranges[rI], to = ranges[rI + 1];
-                    let fromB = Math.max(posB, from), toB = Math.min(end, to);
-                    if (fromB <= toB)
-                        new ChangedRange(fromB + off, toB + off, fromB, toB).addToSet(result);
-                    if (to > end)
-                        break;
-                    else
-                        rI += 2;
-                }
-                if (!next)
-                    return result;
-                new ChangedRange(next.fromA, next.toA, next.fromB, next.toB).addToSet(result);
-                posA = next.toA;
-                posB = next.toB;
-            }
-        }
-    }
-    /// View [plugins](#view.ViewPlugin) are given instances of this
-    /// class, which describe what happened, whenever the view is updated.
-    class ViewUpdate {
-        /// @internal
-        constructor(
-        /// The editor view that the update is associated with.
-        view, 
-        /// The new editor state.
-        state, 
-        /// The transactions involved in the update. May be empty.
-        transactions = none$3) {
-            this.view = view;
-            this.state = state;
-            this.transactions = transactions;
-            /// @internal
-            this.flags = 0;
-            this.startState = view.state;
-            this.changes = ChangeSet.empty(this.startState.doc.length);
-            for (let tr of transactions)
-                this.changes = this.changes.compose(tr.changes);
-            let changedRanges = [];
-            this.changes.iterChangedRanges((fromA, toA, fromB, toB) => changedRanges.push(new ChangedRange(fromA, toA, fromB, toB)));
-            this.changedRanges = changedRanges;
-            let focus = view.hasFocus;
-            if (focus != view.inputState.notifiedFocused) {
-                view.inputState.notifiedFocused = focus;
-                this.flags |= 1 /* Focus */;
-            }
-            if (this.docChanged)
-                this.flags |= 2 /* Height */;
-        }
-        /// Tells you whether the viewport changed in this update.
-        get viewportChanged() {
-            return (this.flags & 4 /* Viewport */) > 0;
-        }
-        /// Indicates whether the line height in the editor changed in this update.
-        get heightChanged() {
-            return (this.flags & 2 /* Height */) > 0;
-        }
-        /// Returns true when the document changed or the size of the editor
-        /// or the lines or characters within it has changed.
-        get geometryChanged() {
-            return this.docChanged || (this.flags & (16 /* Geometry */ | 2 /* Height */)) > 0;
-        }
-        /// True when this update indicates a focus change.
-        get focusChanged() {
-            return (this.flags & 1 /* Focus */) > 0;
-        }
-        /// Whether the document changed in this update.
-        get docChanged() {
-            return this.transactions.some(tr => tr.docChanged);
-        }
-        /// Whether the selection was explicitly set in this update.
-        get selectionSet() {
-            return this.transactions.some(tr => tr.selection);
-        }
-        /// @internal
-        get empty() { return this.flags == 0 && this.transactions.length == 0; }
-    }
-
     function visiblePixelRange(dom, paddingTop) {
         let rect = dom.getBoundingClientRect();
         let left = Math.max(0, rect.left), right = Math.min(innerWidth, rect.right);
@@ -6043,7 +7225,8 @@ const cm = (function () {
             this.paddingBottom = 0;
             this.contentWidth = 0;
             this.heightOracle = new HeightOracle;
-            this.heightMap = HeightMap.empty();
+            // See VP.MaxDOMHeight
+            this.scaler = IdScaler;
             this.scrollTo = null;
             // Briefly set to true when printing, to disable viewport limiting
             this.printing = false;
@@ -6057,11 +7240,25 @@ const cm = (function () {
             // boundary and, if so, reset it to make sure it is positioned in
             // the right place.
             this.mustEnforceCursorAssoc = false;
-            this.heightMap = this.heightMap.applyChanges(state.facet(decorations), Text.empty, this.heightOracle.setDoc(state.doc), [new ChangedRange(0, 0, 0, state.doc.length)]);
+            this.heightMap = HeightMap.empty().applyChanges(state.facet(decorations), Text.empty, this.heightOracle.setDoc(state.doc), [new ChangedRange(0, 0, 0, state.doc.length)]);
             this.viewport = this.getViewport(0, null);
+            this.updateForViewport();
             this.lineGaps = this.ensureLineGaps([]);
             this.lineGapDeco = Decoration.set(this.lineGaps.map(gap => gap.draw(false)));
             this.computeVisibleRanges();
+        }
+        updateForViewport() {
+            let viewports = [this.viewport], { main } = this.state.selection;
+            for (let i = 0; i <= 1; i++) {
+                let pos = i ? main.head : main.anchor;
+                if (!viewports.some(({ from, to }) => pos >= from && pos <= to)) {
+                    let { from, to } = this.lineAt(pos, 0);
+                    viewports.push(new Viewport(from, to));
+                }
+            }
+            this.viewports = viewports.sort((a, b) => a.from - b.from);
+            this.scaler = this.heightMap.height <= 7000000 /* MaxDOMHeight */ ? IdScaler :
+                new BigScaler(this.heightOracle.doc, this.heightMap, this.viewports);
         }
         update(update, scrollTo = null) {
             let prev = this.state;
@@ -6080,6 +7277,7 @@ const cm = (function () {
                 this.viewport = viewport;
                 update.flags |= 4 /* Viewport */;
             }
+            this.updateForViewport();
             if (this.lineGaps.length || this.viewport.to - this.viewport.from > 15000 /* MinViewPort */)
                 update.flags |= this.updateLineGaps(this.ensureLineGaps(this.mapLineGaps(this.lineGaps, update.changes)));
             this.computeVisibleRanges();
@@ -6139,6 +7337,7 @@ const cm = (function () {
                     result |= 4 /* Viewport */;
                 }
             }
+            this.updateForViewport();
             if (this.lineGaps.length || this.viewport.to - this.viewport.from > 15000 /* MinViewPort */)
                 result |= this.updateLineGaps(this.ensureLineGaps(refresh ? [] : this.lineGaps));
             this.computeVisibleRanges();
@@ -6152,22 +7351,24 @@ const cm = (function () {
             }
             return result;
         }
+        get visibleTop() { return this.scaler.fromDOM(this.pixelViewport.top, 0); }
+        get visibleBottom() { return this.scaler.fromDOM(this.pixelViewport.bottom, 0); }
         getViewport(bias, scrollTo) {
             // This will divide VP.Margin between the top and the
             // bottom, depending on the bias (the change in viewport position
             // since the last update). It'll hold a number between 0 and 1
             let marginTop = 0.5 - Math.max(-0.5, Math.min(0.5, bias / 1000 /* Margin */ / 2));
-            let map = this.heightMap, doc = this.state.doc, { top, bottom } = this.pixelViewport;
-            let viewport = new Viewport(map.lineAt(top - marginTop * 1000 /* Margin */, QueryType.ByHeight, doc, 0, 0).from, map.lineAt(bottom + (1 - marginTop) * 1000 /* Margin */, QueryType.ByHeight, doc, 0, 0).to);
+            let map = this.heightMap, doc = this.state.doc, { visibleTop, visibleBottom } = this;
+            let viewport = new Viewport(map.lineAt(visibleTop - marginTop * 1000 /* Margin */, QueryType.ByHeight, doc, 0, 0).from, map.lineAt(visibleBottom + (1 - marginTop) * 1000 /* Margin */, QueryType.ByHeight, doc, 0, 0).to);
             // If scrollTo is given, make sure the viewport includes that position
             if (scrollTo) {
                 if (scrollTo.head < viewport.from) {
                     let { top: newTop } = map.lineAt(scrollTo.head, QueryType.ByPos, doc, 0, 0);
-                    viewport = new Viewport(map.lineAt(newTop - 1000 /* Margin */ / 2, QueryType.ByHeight, doc, 0, 0).from, map.lineAt(newTop + (bottom - top) + 1000 /* Margin */ / 2, QueryType.ByHeight, doc, 0, 0).to);
+                    viewport = new Viewport(map.lineAt(newTop - 1000 /* Margin */ / 2, QueryType.ByHeight, doc, 0, 0).from, map.lineAt(newTop + (visibleBottom - visibleTop) + 1000 /* Margin */ / 2, QueryType.ByHeight, doc, 0, 0).to);
                 }
                 else if (scrollTo.head > viewport.to) {
                     let { bottom: newBottom } = map.lineAt(scrollTo.head, QueryType.ByPos, doc, 0, 0);
-                    viewport = new Viewport(map.lineAt(newBottom - (bottom - top) - 1000 /* Margin */ / 2, QueryType.ByHeight, doc, 0, 0).from, map.lineAt(newBottom + 1000 /* Margin */ / 2, QueryType.ByHeight, doc, 0, 0).to);
+                    viewport = new Viewport(map.lineAt(newBottom - (visibleBottom - visibleTop) - 1000 /* Margin */ / 2, QueryType.ByHeight, doc, 0, 0).from, map.lineAt(newBottom + 1000 /* Margin */ / 2, QueryType.ByHeight, doc, 0, 0).to);
                 }
             }
             return viewport;
@@ -6181,10 +7382,11 @@ const cm = (function () {
         viewportIsAppropriate({ from, to }, bias = 0) {
             let { top } = this.heightMap.lineAt(from, QueryType.ByPos, this.state.doc, 0, 0);
             let { bottom } = this.heightMap.lineAt(to, QueryType.ByPos, this.state.doc, 0, 0);
-            return (from == 0 || top <= this.pixelViewport.top - Math.max(10 /* MinCoverMargin */, Math.min(-bias, 250 /* MaxCoverMargin */))) &&
+            let { visibleTop, visibleBottom } = this;
+            return (from == 0 || top <= visibleTop - Math.max(10 /* MinCoverMargin */, Math.min(-bias, 250 /* MaxCoverMargin */))) &&
                 (to == this.state.doc.length ||
-                    bottom >= this.pixelViewport.bottom + Math.max(10 /* MinCoverMargin */, Math.min(bias, 250 /* MaxCoverMargin */))) &&
-                (top > this.pixelViewport.top - 2 * 1000 /* Margin */ && bottom < this.pixelViewport.bottom + 2 * 1000 /* Margin */);
+                    bottom >= visibleBottom + Math.max(10 /* MinCoverMargin */, Math.min(bias, 250 /* MaxCoverMargin */))) &&
+                (top > visibleTop - 2 * 1000 /* Margin */ && bottom < visibleBottom + 2 * 1000 /* Margin */);
         }
         mapLineGaps(gaps, changes) {
             if (!gaps.length || changes.empty)
@@ -6218,11 +7420,11 @@ const cm = (function () {
                     if (line.from != this.viewport.from)
                         viewFrom = line.from;
                     else
-                        viewFrom = findPosition(structure, (this.pixelViewport.top - line.top) / line.height);
+                        viewFrom = findPosition(structure, (this.visibleTop - line.top) / line.height);
                     if (line.to != this.viewport.to)
                         viewTo = line.to;
                     else
-                        viewTo = findPosition(structure, (this.pixelViewport.bottom - line.top) / line.height);
+                        viewTo = findPosition(structure, (this.visibleBottom - line.top) / line.height);
                 }
                 else {
                     let totalWidth = structure.total * this.heightOracle.charWidth;
@@ -6276,16 +7478,26 @@ const cm = (function () {
             this.visibleRanges = ranges;
         }
         lineAt(pos, editorTop) {
-            return this.heightMap.lineAt(pos, QueryType.ByPos, this.state.doc, editorTop + this.paddingTop, 0);
+            editorTop += this.paddingTop;
+            return scaleBlock(this.heightMap.lineAt(pos, QueryType.ByPos, this.state.doc, editorTop, 0), this.scaler, editorTop);
         }
         lineAtHeight(height, editorTop) {
-            return this.heightMap.lineAt(height, QueryType.ByHeight, this.state.doc, editorTop + this.paddingTop, 0);
+            editorTop += this.paddingTop;
+            return scaleBlock(this.heightMap.lineAt(this.scaler.fromDOM(height, editorTop), QueryType.ByHeight, this.state.doc, editorTop, 0), this.scaler, editorTop);
         }
         blockAtHeight(height, editorTop) {
-            return this.heightMap.blockAt(height, this.state.doc, editorTop + this.paddingTop, 0);
+            editorTop += this.paddingTop;
+            return scaleBlock(this.heightMap.blockAt(this.scaler.fromDOM(height, editorTop), this.state.doc, editorTop, 0), this.scaler, editorTop);
         }
         forEachLine(from, to, f, editorTop) {
-            return this.heightMap.forEachLine(from, to, this.state.doc, editorTop + this.paddingTop, 0, f);
+            editorTop += this.paddingTop;
+            return this.heightMap.forEachLine(from, to, this.state.doc, editorTop, 0, this.scaler.scale == 1 ? f : b => f(scaleBlock(b, this.scaler, editorTop)));
+        }
+        get contentHeight() {
+            return this.domHeight + this.paddingTop + this.paddingBottom;
+        }
+        get domHeight() {
+            return this.scaler.toDOM(this.heightMap.height, this.paddingTop);
         }
     }
     /// Indicates the range of the document that is in the visible
@@ -6345,1327 +7557,219 @@ const cm = (function () {
                 return val;
         return undefined;
     }
-
-    const none$4 = [];
-    class DocView extends ContentView {
-        constructor(view) {
-            super();
-            this.view = view;
-            this.viewports = none$4;
-            this.compositionDeco = Decoration.none;
-            this.decorations = [];
-            // Track a minimum width for the editor. When measuring sizes in
-            // checkLayout, this is updated to point at the width of a given
-            // element and its extent in the document. When a change happens in
-            // that range, these are reset. That way, once we've seen a
-            // line/element of a given length, we keep the editor wide enough to
-            // fit at least that element, until it is changed, at which point we
-            // forget it again.
-            this.minWidth = 0;
-            this.minWidthFrom = 0;
-            this.minWidthTo = 0;
-            // Track whether the DOM selection was set in a lossy way, so that
-            // we don't mess it up when reading it back it
-            this.impreciseAnchor = null;
-            this.impreciseHead = null;
-            this.setDOM(view.contentDOM);
-            this.children = [new LineView];
-            this.children[0].setParent(this);
-            this.updateInner([new ChangedRange(0, 0, 0, view.state.doc.length)], this.updateDeco(), 0);
-        }
-        get root() { return this.view.root; }
-        get editorView() { return this.view; }
-        get length() { return this.view.state.doc.length; }
-        // Update the document view to a given state. scrollIntoView can be
-        // used as a hint to compute a new viewport that includes that
-        // position, if we know the editor is going to scroll that position
-        // into view.
-        update(update) {
-            let changedRanges = update.changedRanges;
-            if (this.minWidth > 0 && changedRanges.length) {
-                if (!changedRanges.every(({ fromA, toA }) => toA < this.minWidthFrom || fromA > this.minWidthTo)) {
-                    this.minWidth = 0;
-                }
-                else {
-                    this.minWidthFrom = update.changes.mapPos(this.minWidthFrom, 1);
-                    this.minWidthTo = update.changes.mapPos(this.minWidthTo, 1);
-                }
-            }
-            if (this.view.inputState.composing < 0)
-                this.compositionDeco = Decoration.none;
-            else if (update.transactions.length)
-                this.compositionDeco = computeCompositionDeco(this.view, update.changes);
-            // When the DOM nodes around the selection are moved to another
-            // parent, Chrome sometimes reports a different selection through
-            // getSelection than the one that it actually shows to the user.
-            // This forces a selection update when lines are joined to work
-            // around that. Issue #54
-            let forceSelection = (browser.ie || browser.chrome) && !this.compositionDeco.size && update &&
-                update.state.doc.lines != update.startState.doc.lines;
-            let prevDeco = this.decorations, deco = this.updateDeco();
-            let decoDiff = findChangedDeco(prevDeco, deco, update.changes);
-            changedRanges = ChangedRange.extendWithRanges(changedRanges, decoDiff);
-            let pointerSel = update.transactions.some(tr => tr.annotation(Transaction.userEvent) == "pointerselection");
-            if (this.dirty == 0 /* Not */ && changedRanges.length == 0 &&
-                !(update.flags & (4 /* Viewport */ | 8 /* LineGaps */)) &&
-                update.state.selection.main.from >= this.view.viewport.from &&
-                update.state.selection.main.to <= this.view.viewport.to) {
-                this.updateSelection(forceSelection, pointerSel);
-                return false;
-            }
-            else {
-                this.updateInner(changedRanges, deco, update.startState.doc.length, forceSelection, pointerSel);
-                return true;
-            }
-        }
-        // Used both by update and checkLayout do perform the actual DOM
-        // update
-        updateInner(changes, deco, oldLength, forceSelection = false, pointerSel = false) {
-            this.updateChildren(changes, deco, oldLength);
-            this.view.observer.ignore(() => {
-                // Lock the height during redrawing, since Chrome sometimes
-                // messes with the scroll position during DOM mutation (though
-                // no relayout is triggered and I cannot imagine how it can
-                // recompute the scroll position without a layout)
-                this.dom.style.height = this.view.viewState.heightMap.height + "px";
-                this.dom.style.minWidth = this.minWidth ? this.minWidth + "px" : "";
-                // Chrome will sometimes, when DOM mutations occur directly
-                // around the selection, get confused and report a different
-                // selection from the one it displays (issue #218). This tries
-                // to detect that situation.
-                let track = browser.chrome ? { node: getSelection(this.view.root).focusNode, written: false } : undefined;
-                this.sync(track);
-                this.dirty = 0 /* Not */;
-                if (track === null || track === void 0 ? void 0 : track.written)
-                    forceSelection = true;
-                this.updateSelection(forceSelection, pointerSel);
-                this.dom.style.height = "";
+    // Don't scale when the document height is within the range of what
+    // the DOM can handle.
+    const IdScaler = {
+        toDOM(n) { return n; },
+        fromDOM(n) { return n; },
+        scale: 1
+    };
+    // When the height is too big (> VP.MaxDOMHeight), scale down the
+    // regions outside the viewports so that the total height is
+    // VP.MaxDOMHeight.
+    class BigScaler {
+        constructor(doc, heightMap, viewports) {
+            let vpHeight = 0, base = 0, domBase = 0;
+            this.viewports = viewports.map(({ from, to }) => {
+                let top = heightMap.lineAt(from, QueryType.ByPos, doc, 0, 0).top;
+                let bottom = heightMap.lineAt(to, QueryType.ByPos, doc, 0, 0).bottom;
+                vpHeight += bottom - top;
+                return { from, to, top, bottom, domTop: 0, domBottom: 0 };
             });
-        }
-        updateChildren(changes, deco, oldLength) {
-            let cursor = this.childCursor(oldLength);
-            for (let i = changes.length - 1;; i--) {
-                let next = i >= 0 ? changes[i] : null;
-                if (!next)
-                    break;
-                let { fromA, toA, fromB, toB } = next;
-                let { content, breakAtStart, openStart, openEnd } = ContentBuilder.build(this.view.state.doc, fromB, toB, deco);
-                let { i: toI, off: toOff } = cursor.findPos(toA, 1);
-                let { i: fromI, off: fromOff } = cursor.findPos(fromA, -1);
-                this.replaceRange(fromI, fromOff, toI, toOff, content, breakAtStart, openStart, openEnd);
+            this.scale = (7000000 /* MaxDOMHeight */ - vpHeight) / (heightMap.height - vpHeight);
+            for (let obj of this.viewports) {
+                obj.domTop = domBase + (obj.top - base) * this.scale;
+                domBase = obj.domBottom = obj.domTop + (obj.bottom - obj.top);
+                base = obj.bottom;
             }
         }
-        replaceRange(fromI, fromOff, toI, toOff, content, breakAtStart, openStart, openEnd) {
-            let before = this.children[fromI], last = content.length ? content[content.length - 1] : null;
-            let breakAtEnd = last ? last.breakAfter : breakAtStart;
-            // Change within a single line
-            if (fromI == toI && !breakAtStart && !breakAtEnd && content.length < 2 &&
-                before.merge(fromOff, toOff, content.length ? last : null, fromOff == 0, openStart, openEnd))
-                return;
-            let after = this.children[toI];
-            // Make sure the end of the line after the update is preserved in `after`
-            if (toOff < after.length || after.children.length && after.children[after.children.length - 1].length == 0) {
-                // If we're splitting a line, separate part of the start line to
-                // avoid that being mangled when updating the start line.
-                if (fromI == toI) {
-                    after = after.split(toOff);
-                    toOff = 0;
-                }
-                // If the element after the replacement should be merged with
-                // the last replacing element, update `content`
-                if (!breakAtEnd && last && after.merge(0, toOff, last, true, 0, openEnd)) {
-                    content[content.length - 1] = after;
-                }
-                else {
-                    // Remove the start of the after element, if necessary, and
-                    // add it to `content`.
-                    if (toOff || after.children.length && after.children[0].length == 0)
-                        after.merge(0, toOff, null, false, 0, openEnd);
-                    content.push(after);
-                }
-            }
-            else if (after.breakAfter) {
-                // The element at `toI` is entirely covered by this range.
-                // Preserve its line break, if any.
-                if (last)
-                    last.breakAfter = 1;
-                else
-                    breakAtStart = 1;
-            }
-            // Since we've handled the next element from the current elements
-            // now, make sure `toI` points after that.
-            toI++;
-            before.breakAfter = breakAtStart;
-            if (fromOff > 0) {
-                if (!breakAtStart && content.length && before.merge(fromOff, before.length, content[0], false, openStart, 0)) {
-                    before.breakAfter = content.shift().breakAfter;
-                }
-                else if (fromOff < before.length || before.children.length && before.children[before.children.length - 1].length == 0) {
-                    before.merge(fromOff, before.length, null, false, openStart, 0);
-                }
-                fromI++;
-            }
-            // Try to merge widgets on the boundaries of the replacement
-            while (fromI < toI && content.length) {
-                if (this.children[toI - 1].match(content[content.length - 1]))
-                    toI--, content.pop();
-                else if (this.children[fromI].match(content[0]))
-                    fromI++, content.shift();
-                else
-                    break;
-            }
-            if (fromI < toI || content.length)
-                this.replaceChildren(fromI, toI, content);
-        }
-        // Sync the DOM selection to this.state.selection
-        updateSelection(force = false, fromPointer = false) {
-            if (!(fromPointer || this.mayControlSelection()))
-                return;
-            let main = this.view.state.selection.main;
-            // FIXME need to handle the case where the selection falls inside a block range
-            let anchor = this.domAtPos(main.anchor);
-            let head = this.domAtPos(main.head);
-            let domSel = getSelection(this.root);
-            // If the selection is already here, or in an equivalent position, don't touch it
-            if (force || !domSel.focusNode ||
-                (browser.gecko && main.empty && nextToUneditable(domSel.focusNode, domSel.focusOffset)) ||
-                !isEquivalentPosition(anchor.node, anchor.offset, domSel.anchorNode, domSel.anchorOffset) ||
-                !isEquivalentPosition(head.node, head.offset, domSel.focusNode, domSel.focusOffset)) {
-                this.view.observer.ignore(() => {
-                    if (main.empty) {
-                        // Work around https://bugzilla.mozilla.org/show_bug.cgi?id=1612076
-                        if (browser.gecko) {
-                            let nextTo = nextToUneditable(anchor.node, anchor.offset);
-                            if (nextTo && nextTo != (1 /* Before */ | 2 /* After */)) {
-                                let text = nearbyTextNode(anchor.node, anchor.offset, nextTo == 1 /* Before */ ? 1 : -1);
-                                if (text)
-                                    anchor = new DOMPos(text, nextTo == 1 /* Before */ ? 0 : text.nodeValue.length);
-                            }
-                        }
-                        domSel.collapse(anchor.node, anchor.offset);
-                        if (main.bidiLevel != null && domSel.cursorBidiLevel != null)
-                            domSel.cursorBidiLevel = main.bidiLevel;
-                    }
-                    else if (domSel.extend) {
-                        // Selection.extend can be used to create an 'inverted' selection
-                        // (one where the focus is before the anchor), but not all
-                        // browsers support it yet.
-                        domSel.collapse(anchor.node, anchor.offset);
-                        domSel.extend(head.node, head.offset);
-                    }
-                    else {
-                        // Primitive (IE) way
-                        let range = document.createRange();
-                        if (main.anchor > main.head)
-                            [anchor, head] = [head, anchor];
-                        range.setEnd(head.node, head.offset);
-                        range.setStart(anchor.node, anchor.offset);
-                        domSel.removeAllRanges();
-                        domSel.addRange(range);
-                    }
-                });
-            }
-            this.impreciseAnchor = anchor.precise ? null : new DOMPos(domSel.anchorNode, domSel.anchorOffset);
-            this.impreciseHead = head.precise ? null : new DOMPos(domSel.focusNode, domSel.focusOffset);
-        }
-        enforceCursorAssoc() {
-            let cursor = this.view.state.selection.main;
-            let sel = getSelection(this.root);
-            if (!cursor.empty || !cursor.assoc || !sel.modify)
-                return;
-            let line = LineView.find(this, cursor.head); // FIXME provide view-line-range finding helper
-            if (!line)
-                return;
-            let lineStart = line.posAtStart;
-            if (cursor.head == lineStart || cursor.head == lineStart + line.length)
-                return;
-            let before = this.coordsAt(cursor.head, -1), after = this.coordsAt(cursor.head, 1);
-            if (!before || !after || before.bottom > after.top)
-                return;
-            let dom = this.domAtPos(cursor.head + cursor.assoc);
-            sel.collapse(dom.node, dom.offset);
-            sel.modify("move", cursor.assoc < 0 ? "forward" : "backward", "lineboundary");
-        }
-        mayControlSelection() {
-            return this.view.state.facet(editable) ? this.root.activeElement == this.dom : hasSelection(this.dom, getSelection(this.root));
-        }
-        nearest(dom) {
-            for (let cur = dom; cur;) {
-                let domView = ContentView.get(cur);
-                if (domView && domView.rootView == this)
-                    return domView;
-                cur = cur.parentNode;
-            }
-            return null;
-        }
-        posFromDOM(node, offset) {
-            let view = this.nearest(node);
-            if (!view)
-                throw new RangeError("Trying to find position for a DOM position outside of the document");
-            return view.localPosFromDOM(node, offset) + view.posAtStart;
-        }
-        domAtPos(pos) {
-            let { i, off } = this.childCursor().findPos(pos, -1);
-            for (; i < this.children.length - 1;) {
-                let child = this.children[i];
-                if (off < child.length || child instanceof LineView)
-                    break;
-                i++;
-                off = 0;
-            }
-            return this.children[i].domAtPos(off);
-        }
-        coordsAt(pos, side) {
-            for (let off = this.length, i = this.children.length - 1;; i--) {
-                let child = this.children[i], start = off - child.breakAfter - child.length;
-                if (pos > start || pos == start && (child.type == BlockType.Text || !i || this.children[i - 1].breakAfter))
-                    return child.coordsAt(pos - start, side);
-                off = start;
+        toDOM(n, top) {
+            n -= top;
+            for (let i = 0, base = 0, domBase = 0;; i++) {
+                let vp = i < this.viewports.length ? this.viewports[i] : null;
+                if (!vp || n < vp.top)
+                    return domBase + (n - base) * this.scale + top;
+                if (n <= vp.bottom)
+                    return vp.domTop + (n - vp.top) + top;
+                base = vp.bottom;
+                domBase = vp.domBottom;
             }
         }
-        measureVisibleLineHeights() {
-            let result = [], { from, to } = this.view.viewState.viewport;
-            let minWidth = Math.max(this.view.scrollDOM.clientWidth, this.minWidth) + 1;
-            for (let pos = 0, i = 0; i < this.children.length; i++) {
-                let child = this.children[i], end = pos + child.length;
-                if (end > to)
-                    break;
-                if (pos >= from) {
-                    result.push(child.dom.getBoundingClientRect().height);
-                    let width = child.dom.scrollWidth;
-                    if (width > minWidth) {
-                        this.minWidth = minWidth = width;
-                        this.minWidthFrom = pos;
-                        this.minWidthTo = end;
-                    }
-                }
-                pos = end + child.breakAfter;
-            }
-            return result;
-        }
-        measureTextSize() {
-            for (let child of this.children) {
-                if (child instanceof LineView) {
-                    let measure = child.measureTextSize();
-                    if (measure)
-                        return measure;
-                }
-            }
-            // If no workable line exists, force a layout of a measurable element
-            let dummy = document.createElement("div"), lineHeight, charWidth;
-            dummy.className = "cm-line";
-            dummy.textContent = "abc def ghi jkl mno pqr stu";
-            this.view.observer.ignore(() => {
-                this.dom.appendChild(dummy);
-                let rect = clientRectsFor(dummy.firstChild)[0];
-                lineHeight = dummy.getBoundingClientRect().height;
-                charWidth = rect ? rect.width / 27 : 7;
-                dummy.remove();
-            });
-            return { lineHeight, charWidth };
-        }
-        childCursor(pos = this.length) {
-            // Move back to start of last element when possible, so that
-            // `ChildCursor.findPos` doesn't have to deal with the edge case
-            // of being after the last element.
-            let i = this.children.length;
-            if (i)
-                pos -= this.children[--i].length;
-            return new ChildCursor(this.children, pos, i);
-        }
-        computeBlockGapDeco() {
-            let visible = this.view.viewState.viewport, viewports = [visible];
-            let { head, anchor } = this.view.state.selection.main;
-            if (head < visible.from || head > visible.to) {
-                let { from, to } = this.view.viewState.lineAt(head, 0);
-                viewports.push(new Viewport(from, to));
-            }
-            if (!viewports.some(({ from, to }) => anchor >= from && anchor <= to)) {
-                let { from, to } = this.view.viewState.lineAt(anchor, 0);
-                viewports.push(new Viewport(from, to));
-            }
-            this.viewports = viewports.sort((a, b) => a.from - b.from);
-            let deco = [];
-            for (let pos = 0, i = 0;; i++) {
-                let next = i == viewports.length ? null : viewports[i];
-                let end = next ? next.from - 1 : this.length;
-                if (end > pos) {
-                    let height = this.view.viewState.lineAt(end, 0).bottom - this.view.viewState.lineAt(pos, 0).top;
-                    deco.push(Decoration.replace({ widget: new BlockGapWidget(height), block: true, inclusive: true }).range(pos, end));
-                }
-                if (!next)
-                    break;
-                pos = next.to + 1;
-            }
-            return Decoration.set(deco);
-        }
-        updateDeco() {
-            return this.decorations = [
-                this.computeBlockGapDeco(),
-                this.view.viewState.lineGapDeco,
-                this.compositionDeco,
-                ...this.view.state.facet(decorations),
-                ...this.view.pluginField(PluginField.decorations)
-            ];
-        }
-        scrollPosIntoView(pos, side) {
-            let rect = this.coordsAt(pos, side);
-            if (!rect)
-                return;
-            let mLeft = 0, mRight = 0, mTop = 0, mBottom = 0;
-            for (let margins of this.view.pluginField(PluginField.scrollMargins))
-                if (margins) {
-                    let { left, right, top, bottom } = margins;
-                    if (left != null)
-                        mLeft = Math.max(mLeft, left);
-                    if (right != null)
-                        mRight = Math.max(mRight, right);
-                    if (top != null)
-                        mTop = Math.max(mTop, top);
-                    if (bottom != null)
-                        mBottom = Math.max(mBottom, bottom);
-                }
-            scrollRectIntoView(this.dom, {
-                left: rect.left - mLeft, top: rect.top - mTop,
-                right: rect.right + mRight, bottom: rect.bottom + mBottom
-            });
-        }
-    }
-    // Browsers appear to reserve a fixed amount of bits for height
-    // styles, and ignore or clip heights above that. For Chrome and
-    // Firefox, this is in the 20 million range, so we try to stay below
-    // that.
-    const MaxNodeHeight = 1e7;
-    class BlockGapWidget extends WidgetType {
-        constructor(height) {
-            super();
-            this.height = height;
-        }
-        toDOM() {
-            let elt = document.createElement("div");
-            this.updateDOM(elt);
-            return elt;
-        }
-        eq(other) { return other.height == this.height; }
-        updateDOM(elt) {
-            while (elt.lastChild)
-                elt.lastChild.remove();
-            if (this.height < MaxNodeHeight) {
-                elt.style.height = this.height + "px";
-            }
-            else {
-                elt.style.height = "";
-                for (let remaining = this.height; remaining > 0; remaining -= MaxNodeHeight) {
-                    let fill = elt.appendChild(document.createElement("div"));
-                    fill.style.height = Math.min(remaining, MaxNodeHeight) + "px";
-                }
-            }
-            return true;
-        }
-        get estimatedHeight() { return this.height; }
-    }
-    function computeCompositionDeco(view, changes) {
-        let sel = getSelection(view.root);
-        let textNode = sel.focusNode && nearbyTextNode(sel.focusNode, sel.focusOffset, 0);
-        if (!textNode)
-            return Decoration.none;
-        let cView = view.docView.nearest(textNode);
-        let from, to, topNode = textNode;
-        if (cView instanceof InlineView) {
-            while (cView.parent instanceof InlineView)
-                cView = cView.parent;
-            from = cView.posAtStart;
-            to = from + cView.length;
-            topNode = cView.dom;
-        }
-        else if (cView instanceof LineView) {
-            while (topNode.parentNode != cView.dom)
-                topNode = topNode.parentNode;
-            let prev = topNode.previousSibling;
-            while (prev && !ContentView.get(prev))
-                prev = prev.previousSibling;
-            from = to = prev ? ContentView.get(prev).posAtEnd : cView.posAtStart;
-        }
-        else {
-            return Decoration.none;
-        }
-        let newFrom = changes.mapPos(from, 1), newTo = Math.max(newFrom, changes.mapPos(to, -1));
-        let text = textNode.nodeValue, { state } = view;
-        if (newTo - newFrom < text.length) {
-            if (state.sliceDoc(newFrom, Math.min(state.doc.length, newFrom + text.length)) == text)
-                newTo = newFrom + text.length;
-            else if (state.sliceDoc(Math.max(0, newTo - text.length), newTo) == text)
-                newFrom = newTo - text.length;
-            else
-                return Decoration.none;
-        }
-        else if (state.sliceDoc(newFrom, newTo) != text) {
-            return Decoration.none;
-        }
-        return Decoration.set(Decoration.replace({ widget: new CompositionWidget(topNode, textNode) }).range(newFrom, newTo));
-    }
-    class CompositionWidget extends WidgetType {
-        constructor(top, text) {
-            super();
-            this.top = top;
-            this.text = text;
-        }
-        eq(other) { return this.top == other.top && this.text == other.text; }
-        toDOM() { return this.top; }
-        ignoreEvent() { return false; }
-        get customView() { return CompositionView; }
-    }
-    function nearbyTextNode(node, offset, side) {
-        for (;;) {
-            if (node.nodeType == 3)
-                return node;
-            if (node.nodeType == 1 && offset > 0 && side <= 0) {
-                node = node.childNodes[offset - 1];
-                offset = maxOffset(node);
-            }
-            else if (node.nodeType == 1 && offset < node.childNodes.length && side >= 0) {
-                node = node.childNodes[offset];
-                offset = 0;
-            }
-            else {
-                return null;
+        fromDOM(n, top) {
+            n -= top;
+            for (let i = 0, base = 0, domBase = 0;; i++) {
+                let vp = i < this.viewports.length ? this.viewports[i] : null;
+                if (!vp || n < vp.domTop)
+                    return base + (n - domBase) / this.scale + top;
+                if (n <= vp.domBottom)
+                    return vp.top + (n - vp.domTop) + top;
+                base = vp.bottom;
+                domBase = vp.domBottom;
             }
         }
     }
-    function nextToUneditable(node, offset) {
-        if (node.nodeType != 1)
-            return 0;
-        return (offset && node.childNodes[offset - 1].contentEditable == "false" ? 1 /* Before */ : 0) |
-            (offset < node.childNodes.length && node.childNodes[offset].contentEditable == "false" ? 2 /* After */ : 0);
-    }
-    class DecorationComparator$1 {
-        constructor() {
-            this.changes = [];
-        }
-        compareRange(from, to) { addRange(from, to, this.changes); }
-        comparePoint(from, to) { addRange(from, to, this.changes); }
-    }
-    function findChangedDeco(a, b, diff) {
-        let comp = new DecorationComparator$1;
-        RangeSet.compare(a, b, diff, comp);
-        return comp.changes;
+    function scaleBlock(block, scaler, top) {
+        if (scaler.scale == 1)
+            return block;
+        let bTop = scaler.toDOM(block.top, top), bBottom = scaler.toDOM(block.bottom, top);
+        return new BlockInfo(block.from, block.length, bTop, bBottom - bTop, Array.isArray(block.type) ? block.type.map(b => scaleBlock(b, scaler, top)) : block.type);
     }
 
-    function groupAt(state, pos, bias = 1) {
-        let categorize = state.charCategorizer(pos);
-        let line = state.doc.lineAt(pos), linePos = pos - line.from;
-        if (line.length == 0)
-            return EditorSelection.cursor(pos);
-        if (linePos == 0)
-            bias = 1;
-        else if (linePos == line.length)
-            bias = -1;
-        let from = linePos, to = linePos;
-        if (bias < 0)
-            from = findClusterBreak(line.text, linePos, false);
-        else
-            to = findClusterBreak(line.text, linePos);
-        let cat = categorize(line.text.slice(from, to));
-        while (from > 0) {
-            let prev = findClusterBreak(line.text, from, false);
-            if (categorize(line.text.slice(prev, from)) != cat)
-                break;
-            from = prev;
-        }
-        while (to < line.length) {
-            let next = findClusterBreak(line.text, to);
-            if (categorize(line.text.slice(to, next)) != cat)
-                break;
-            to = next;
-        }
-        return EditorSelection.range(from + line.from, to + line.from);
-    }
-    // Search the DOM for the {node, offset} position closest to the given
-    // coordinates. Very inefficient and crude, but can usually be avoided
-    // by calling caret(Position|Range)FromPoint instead.
-    // FIXME holding arrow-up/down at the end of the viewport is a rather
-    // common use case that will repeatedly trigger this code. Maybe
-    // introduce some element of binary search after all?
-    function getdx(x, rect) {
-        return rect.left > x ? rect.left - x : Math.max(0, x - rect.right);
-    }
-    function getdy(y, rect) {
-        return rect.top > y ? rect.top - y : Math.max(0, y - rect.bottom);
-    }
-    function yOverlap(a, b) {
-        return a.top < b.bottom - 1 && a.bottom > b.top + 1;
-    }
-    function upTop(rect, top) {
-        return top < rect.top ? { top, left: rect.left, right: rect.right, bottom: rect.bottom } : rect;
-    }
-    function upBot(rect, bottom) {
-        return bottom > rect.bottom ? { top: rect.top, left: rect.left, right: rect.right, bottom } : rect;
-    }
-    function domPosAtCoords(parent, x, y) {
-        let closest, closestRect, closestX, closestY;
-        let above, below, aboveRect, belowRect;
-        for (let child = parent.firstChild; child; child = child.nextSibling) {
-            let rects = clientRectsFor(child);
-            for (let i = 0; i < rects.length; i++) {
-                let rect = rects[i];
-                if (closestRect && yOverlap(closestRect, rect))
-                    rect = upTop(upBot(rect, closestRect.bottom), closestRect.top);
-                let dx = getdx(x, rect), dy = getdy(y, rect);
-                if (dx == 0 && dy == 0)
-                    return child.nodeType == 3 ? domPosInText(child, x, y) : domPosAtCoords(child, x, y);
-                if (!closest || closestY > dy || closestY == dy && closestX > dx) {
-                    closest = child;
-                    closestRect = rect;
-                    closestX = dx;
-                    closestY = dy;
-                }
-                if (dx == 0) {
-                    if (y > rect.bottom && (!aboveRect || aboveRect.bottom < rect.bottom)) {
-                        above = child;
-                        aboveRect = rect;
-                    }
-                    else if (y < rect.top && (!belowRect || belowRect.top > rect.top)) {
-                        below = child;
-                        belowRect = rect;
-                    }
-                }
-                else if (aboveRect && yOverlap(aboveRect, rect)) {
-                    aboveRect = upBot(aboveRect, rect.bottom);
-                }
-                else if (belowRect && yOverlap(belowRect, rect)) {
-                    belowRect = upTop(belowRect, rect.top);
-                }
+    const theme = Facet.define({ combine: strs => strs.join(" ") });
+    const darkTheme = Facet.define({ combine: values => values.indexOf(true) > -1 });
+    const baseThemeID = StyleModule.newName(), baseLightID = StyleModule.newName(), baseDarkID = StyleModule.newName();
+    const lightDarkIDs = { "&light": "." + baseLightID, "&dark": "." + baseDarkID };
+    function buildTheme(main, spec, scopes) {
+        return new StyleModule(spec, {
+            finish(sel) {
+                return /&/.test(sel) ? sel.replace(/&\w*/, m => {
+                    if (m == "&")
+                        return main;
+                    if (!scopes || !scopes[m])
+                        throw new RangeError(`Unsupported selector: ${m}`);
+                    return scopes[m];
+                }) : main + " " + sel;
             }
-        }
-        if (aboveRect && aboveRect.bottom >= y) {
-            closest = above;
-            closestRect = aboveRect;
-        }
-        else if (belowRect && belowRect.top <= y) {
-            closest = below;
-            closestRect = belowRect;
-        }
-        if (!closest)
-            return { node: parent, offset: 0 };
-        let clipX = Math.max(closestRect.left, Math.min(closestRect.right, x));
-        if (closest.nodeType == 3)
-            return domPosInText(closest, clipX, y);
-        if (!closestX && closest.contentEditable == "true")
-            return domPosAtCoords(closest, clipX, y);
-        let offset = Array.prototype.indexOf.call(parent.childNodes, closest) +
-            (x >= (closestRect.left + closestRect.right) / 2 ? 1 : 0);
-        return { node: parent, offset };
-    }
-    function domPosInText(node, x, y) {
-        let len = node.nodeValue.length, range = tempRange();
-        for (let i = 0; i < len; i++) {
-            range.setEnd(node, i + 1);
-            range.setStart(node, i);
-            let rects = range.getClientRects();
-            for (let j = 0; j < rects.length; j++) {
-                let rect = rects[j];
-                if (rect.top == rect.bottom)
-                    continue;
-                if (rect.left - 1 <= x && rect.right + 1 >= x &&
-                    rect.top - 1 <= y && rect.bottom + 1 >= y) {
-                    let right = x >= (rect.left + rect.right) / 2, after = right;
-                    if (browser.chrome || browser.gecko) {
-                        // Check for RTL on browsers that support getting client
-                        // rects for empty ranges.
-                        range.setEnd(node, i);
-                        let rectBefore = range.getBoundingClientRect();
-                        if (rectBefore.left == rect.right)
-                            after = !right;
-                    }
-                    return { node, offset: i + (after ? 1 : 0) };
-                }
-            }
-        }
-        return { node, offset: 0 };
-    }
-    function posAtCoords(view, { x, y }, bias = -1) {
-        let content = view.contentDOM.getBoundingClientRect(), block;
-        let halfLine = view.defaultLineHeight / 2;
-        for (let bounced = false;;) {
-            block = view.blockAtHeight(y, content.top);
-            if (block.top > y || block.bottom < y) {
-                bias = block.top > y ? -1 : 1;
-                y = Math.min(block.bottom - halfLine, Math.max(block.top + halfLine, y));
-                if (bounced)
-                    return -1;
-                else
-                    bounced = true;
-            }
-            if (block.type == BlockType.Text)
-                break;
-            y = bias > 0 ? block.bottom + halfLine : block.top - halfLine;
-        }
-        let lineStart = block.from;
-        // If this is outside of the rendered viewport, we can't determine a position
-        if (lineStart < view.viewport.from)
-            return view.viewport.from == 0 ? 0 : null;
-        if (lineStart > view.viewport.to)
-            return view.viewport.to == view.state.doc.length ? view.state.doc.length : null;
-        // Clip x to the viewport sides
-        x = Math.max(content.left + 1, Math.min(content.right - 1, x));
-        let root = view.root, element = root.elementFromPoint(x, y);
-        // There's visible editor content under the point, so we can try
-        // using caret(Position|Range)FromPoint as a shortcut
-        let node, offset = -1;
-        if (element && view.contentDOM.contains(element) && !(view.docView.nearest(element) instanceof WidgetView)) {
-            if (root.caretPositionFromPoint) {
-                let pos = root.caretPositionFromPoint(x, y);
-                if (pos)
-                    ({ offsetNode: node, offset } = pos);
-            }
-            else if (root.caretRangeFromPoint) {
-                let range = root.caretRangeFromPoint(x, y);
-                if (range)
-                    ({ startContainer: node, startOffset: offset } = range);
-            }
-        }
-        // No luck, do our own (potentially expensive) search
-        if (!node || !view.docView.dom.contains(node)) {
-            let line = LineView.find(view.docView, lineStart);
-            ({ node, offset } = domPosAtCoords(line.dom, x, y));
-        }
-        return view.docView.posFromDOM(node, offset);
-    }
-    function moveToLineBoundary(view, start, forward, includeWrap) {
-        let line = view.state.doc.lineAt(start.head);
-        let coords = !includeWrap || !view.lineWrapping ? null
-            : view.coordsAtPos(start.assoc < 0 && start.head > line.from ? start.head - 1 : start.head);
-        if (coords) {
-            let editorRect = view.dom.getBoundingClientRect();
-            let pos = view.posAtCoords({ x: forward == (view.textDirection == Direction.LTR) ? editorRect.right - 1 : editorRect.left + 1,
-                y: (coords.top + coords.bottom) / 2 });
-            if (pos != null)
-                return EditorSelection.cursor(pos, forward ? -1 : 1);
-        }
-        let lineView = LineView.find(view.docView, start.head);
-        let end = lineView ? (forward ? lineView.posAtEnd : lineView.posAtStart) : (forward ? line.to : line.from);
-        return EditorSelection.cursor(end, forward ? -1 : 1);
-    }
-    function moveByChar(view, start, forward, by) {
-        let line = view.state.doc.lineAt(start.head), spans = view.bidiSpans(line);
-        for (let cur = start, check = null;;) {
-            let next = moveVisually(line, spans, view.textDirection, cur, forward), char = movedOver;
-            if (!next) {
-                if (line.number == (forward ? view.state.doc.lines : 1))
-                    return cur;
-                char = "\n";
-                line = view.state.doc.line(line.number + (forward ? 1 : -1));
-                spans = view.bidiSpans(line);
-                next = EditorSelection.cursor(forward ? line.from : line.to);
-            }
-            if (!check) {
-                if (!by)
-                    return next;
-                check = by(char);
-            }
-            else if (!check(char)) {
-                return cur;
-            }
-            cur = next;
-        }
-    }
-    function byGroup(view, pos, start) {
-        let categorize = view.state.charCategorizer(pos);
-        let cat = categorize(start);
-        return (next) => {
-            let nextCat = categorize(next);
-            if (cat == CharCategory.Space)
-                cat = nextCat;
-            return cat == nextCat;
-        };
-    }
-    function moveVertically(view, start, forward, distance) {
-        var _a;
-        let startPos = start.head, dir = forward ? 1 : -1;
-        if (startPos == (forward ? view.state.doc.length : 0))
-            return EditorSelection.cursor(startPos);
-        let startCoords = view.coordsAtPos(startPos);
-        if (startCoords) {
-            let rect = view.dom.getBoundingClientRect();
-            let goal = (_a = start.goalColumn) !== null && _a !== void 0 ? _a : startCoords.left - rect.left;
-            let resolvedGoal = rect.left + goal;
-            let dist = distance !== null && distance !== void 0 ? distance : 5;
-            for (let startY = dir < 0 ? startCoords.top : startCoords.bottom, extra = 0; extra < 50; extra += 10) {
-                let pos = posAtCoords(view, { x: resolvedGoal, y: startY + (dist + extra) * dir }, dir);
-                if (pos == null)
-                    break;
-                if (pos != startPos)
-                    return EditorSelection.cursor(pos, undefined, undefined, goal);
-            }
-        }
-        // Outside of the drawn viewport, use a crude column-based approach
-        let { doc } = view.state, line = doc.lineAt(startPos), tabSize = view.state.tabSize;
-        let goal = start.goalColumn, goalCol = 0;
-        if (goal == null) {
-            for (const iter = doc.iterRange(line.from, startPos); !iter.next().done;)
-                goalCol = countColumn(iter.value, goalCol, tabSize);
-            goal = goalCol * view.defaultCharacterWidth;
-        }
-        else {
-            goalCol = Math.round(goal / view.defaultCharacterWidth);
-        }
-        if (dir < 0 && line.from == 0)
-            return EditorSelection.cursor(0);
-        else if (dir > 0 && line.to == doc.length)
-            return EditorSelection.cursor(line.to);
-        let otherLine = doc.line(line.number + dir);
-        let result = otherLine.from;
-        let seen = 0;
-        for (const iter = doc.iterRange(otherLine.from, otherLine.to); seen >= goalCol && !iter.next().done;) {
-            const { offset, leftOver } = findColumn(iter.value, seen, goalCol, tabSize);
-            seen = goalCol - leftOver;
-            result += offset;
-        }
-        return EditorSelection.cursor(result, undefined, undefined, goal);
-    }
-
-    // This will also be where dragging info and such goes
-    class InputState {
-        constructor(view) {
-            this.lastKeyCode = 0;
-            this.lastKeyTime = 0;
-            this.lastSelectionOrigin = null;
-            this.lastSelectionTime = 0;
-            this.lastEscPress = 0;
-            this.scrollHandlers = [];
-            this.registeredEvents = [];
-            this.customHandlers = [];
-            // -1 means not in a composition. Otherwise, this counts the number
-            // of changes made during the composition. The count is used to
-            // avoid treating the start state of the composition, before any
-            // changes have been made, as part of the composition.
-            this.composing = -1;
-            this.compositionEndedAt = 0;
-            this.mouseSelection = null;
-            for (let type in handlers) {
-                let handler = handlers[type];
-                view.contentDOM.addEventListener(type, (event) => {
-                    if (!eventBelongsToEditor(view, event) || this.ignoreDuringComposition(event) ||
-                        type == "keydown" && this.screenKeyEvent(view, event))
-                        return;
-                    if (this.mustFlushObserver(event))
-                        view.observer.forceFlush();
-                    if (this.runCustomHandlers(type, view, event))
-                        event.preventDefault();
-                    else
-                        handler(view, event);
-                });
-                this.registeredEvents.push(type);
-            }
-            // Must always run, even if a custom handler handled the event
-            view.contentDOM.addEventListener("keydown", (event) => {
-                view.inputState.lastKeyCode = event.keyCode;
-                view.inputState.lastKeyTime = Date.now();
-            });
-            this.notifiedFocused = view.hasFocus;
-            this.ensureHandlers(view);
-        }
-        setSelectionOrigin(origin) {
-            this.lastSelectionOrigin = origin;
-            this.lastSelectionTime = Date.now();
-        }
-        ensureHandlers(view) {
-            let handlers = this.customHandlers = view.pluginField(domEventHandlers);
-            for (let set of handlers) {
-                for (let type in set.handlers)
-                    if (this.registeredEvents.indexOf(type) < 0 && type != "scroll") {
-                        this.registeredEvents.push(type);
-                        view.contentDOM.addEventListener(type, (event) => {
-                            if (!eventBelongsToEditor(view, event))
-                                return;
-                            if (this.runCustomHandlers(type, view, event))
-                                event.preventDefault();
-                        });
-                    }
-            }
-        }
-        runCustomHandlers(type, view, event) {
-            for (let set of this.customHandlers) {
-                let handler = set.handlers[type], handled = false;
-                if (handler) {
-                    try {
-                        handled = handler.call(set.plugin, event, view);
-                    }
-                    catch (e) {
-                        logException(view.state, e);
-                    }
-                    if (handled || event.defaultPrevented) {
-                        // Chrome for Android often applies a bunch of nonsensical
-                        // DOM changes after an enter press, even when
-                        // preventDefault-ed. This tries to ignore those.
-                        if (browser.android && type == "keydown" && event.keyCode == 13)
-                            view.observer.flushSoon();
-                        return true;
-                    }
-                }
-            }
-            return false;
-        }
-        runScrollHandlers(view, event) {
-            for (let set of this.customHandlers) {
-                let handler = set.handlers.scroll;
-                if (handler) {
-                    try {
-                        handler.call(set.plugin, event, view);
-                    }
-                    catch (e) {
-                        logException(view.state, e);
-                    }
-                }
-            }
-        }
-        ignoreDuringComposition(event) {
-            if (!/^key/.test(event.type))
-                return false;
-            if (this.composing > 0)
-                return true;
-            // See https://www.stum.de/2016/06/24/handling-ime-events-in-javascript/.
-            // On some input method editors (IMEs), the Enter key is used to
-            // confirm character selection. On Safari, when Enter is pressed,
-            // compositionend and keydown events are sometimes emitted in the
-            // wrong order. The key event should still be ignored, even when
-            // it happens after the compositionend event.
-            if (browser.safari && event.timeStamp - this.compositionEndedAt < 500) {
-                this.compositionEndedAt = 0;
-                return true;
-            }
-            return false;
-        }
-        screenKeyEvent(view, event) {
-            let protectedTab = event.keyCode == 9 && Date.now() < this.lastEscPress + 2000;
-            if (event.keyCode == 27)
-                this.lastEscPress = Date.now();
-            else if (modifierCodes.indexOf(event.keyCode) < 0)
-                this.lastEscPress = 0;
-            return protectedTab;
-        }
-        mustFlushObserver(event) {
-            return (event.type == "keydown" && event.keyCode != 229) || event.type == "compositionend";
-        }
-        startMouseSelection(view, event, style) {
-            if (this.mouseSelection)
-                this.mouseSelection.destroy();
-            this.mouseSelection = new MouseSelection(this, view, event, style);
-        }
-        update(update) {
-            if (this.mouseSelection)
-                this.mouseSelection.update(update);
-            this.lastKeyCode = this.lastSelectionTime = 0;
-        }
-        destroy() {
-            if (this.mouseSelection)
-                this.mouseSelection.destroy();
-        }
-    }
-    // Key codes for modifier keys
-    const modifierCodes = [16, 17, 18, 20, 91, 92, 224, 225];
-    class MouseSelection {
-        constructor(inputState, view, startEvent, style) {
-            this.inputState = inputState;
-            this.view = view;
-            this.startEvent = startEvent;
-            this.style = style;
-            let doc = view.contentDOM.ownerDocument;
-            doc.addEventListener("mousemove", this.move = this.move.bind(this));
-            doc.addEventListener("mouseup", this.up = this.up.bind(this));
-            this.extend = startEvent.shiftKey;
-            this.multiple = view.state.facet(EditorState.allowMultipleSelections) && addsSelectionRange(view, startEvent);
-            this.dragMove = dragMovesSelection$1(view, startEvent);
-            this.dragging = isInPrimarySelection(view, startEvent) ? null : false;
-            // When clicking outside of the selection, immediately apply the
-            // effect of starting the selection
-            if (this.dragging === false) {
-                startEvent.preventDefault();
-                this.select(startEvent);
-            }
-        }
-        move(event) {
-            if (event.buttons == 0)
-                return this.destroy();
-            if (this.dragging !== false)
-                return;
-            this.select(event);
-        }
-        up(event) {
-            if (this.dragging == null)
-                this.select(this.startEvent);
-            if (!this.dragging)
-                event.preventDefault();
-            this.destroy();
-        }
-        destroy() {
-            let doc = this.view.contentDOM.ownerDocument;
-            doc.removeEventListener("mousemove", this.move);
-            doc.removeEventListener("mouseup", this.up);
-            this.inputState.mouseSelection = null;
-        }
-        select(event) {
-            let selection = this.style.get(event, this.extend, this.multiple);
-            if (!selection.eq(this.view.state.selection) || selection.main.assoc != this.view.state.selection.main.assoc)
-                this.view.dispatch({
-                    selection,
-                    annotations: Transaction.userEvent.of("pointerselection"),
-                    scrollIntoView: true
-                });
-        }
-        update(update) {
-            if (update.docChanged && this.dragging)
-                this.dragging = this.dragging.map(update.changes);
-            this.style.update(update);
-        }
-    }
-    function addsSelectionRange(view, event) {
-        let facet = view.state.facet(clickAddsSelectionRange);
-        return facet.length ? facet[0](event) : browser.mac ? event.metaKey : event.ctrlKey;
-    }
-    function dragMovesSelection$1(view, event) {
-        let facet = view.state.facet(dragMovesSelection);
-        return facet.length ? facet[0](event) : browser.mac ? !event.altKey : !event.ctrlKey;
-    }
-    function isInPrimarySelection(view, event) {
-        let { main } = view.state.selection;
-        if (main.empty)
-            return false;
-        // On boundary clicks, check whether the coordinates are inside the
-        // selection's client rectangles
-        let sel = getSelection(view.root);
-        if (sel.rangeCount == 0)
-            return true;
-        let rects = sel.getRangeAt(0).getClientRects();
-        for (let i = 0; i < rects.length; i++) {
-            let rect = rects[i];
-            if (rect.left <= event.clientX && rect.right >= event.clientX &&
-                rect.top <= event.clientY && rect.bottom >= event.clientY)
-                return true;
-        }
-        return false;
-    }
-    function eventBelongsToEditor(view, event) {
-        if (!event.bubbles)
-            return true;
-        if (event.defaultPrevented)
-            return false;
-        for (let node = event.target, cView; node != view.contentDOM; node = node.parentNode)
-            if (!node || node.nodeType == 11 || ((cView = ContentView.get(node)) && cView.ignoreEvent(event)))
-                return false;
-        return true;
-    }
-    const handlers = Object.create(null);
-    // This is very crude, but unfortunately both these browsers _pretend_
-    // that they have a clipboard API—all the objects and methods are
-    // there, they just don't work, and they are hard to test.
-    const brokenClipboardAPI = (browser.ie && browser.ie_version < 15) ||
-        (browser.ios && browser.webkit_version < 604);
-    function capturePaste(view) {
-        let parent = view.dom.parentNode;
-        if (!parent)
-            return;
-        let target = parent.appendChild(document.createElement("textarea"));
-        target.style.cssText = "position: fixed; left: -10000px; top: 10px";
-        target.focus();
-        setTimeout(() => {
-            view.focus();
-            target.remove();
-            doPaste(view, target.value);
-        }, 50);
-    }
-    function doPaste(view, input) {
-        let { state } = view, changes, i = 1, text = state.toText(input);
-        let byLine = text.lines == state.selection.ranges.length;
-        let linewise = lastLinewiseCopy && state.selection.ranges.every(r => r.empty) && lastLinewiseCopy == text.toString();
-        if (linewise) {
-            changes = {
-                changes: state.selection.ranges.map(r => state.doc.lineAt(r.from))
-                    .filter((l, i, a) => i == 0 || a[i - 1] != l)
-                    .map(line => ({ from: line.from, insert: (byLine ? text.line(i++).text : input) + state.lineBreak }))
-            };
-        }
-        else if (byLine) {
-            changes = state.changeByRange(range => {
-                let line = text.line(i++);
-                return { changes: { from: range.from, to: range.to, insert: line.text },
-                    range: EditorSelection.cursor(range.from + line.length) };
-            });
-        }
-        else {
-            changes = state.replaceSelection(text);
-        }
-        view.dispatch(changes, {
-            annotations: Transaction.userEvent.of("paste"),
-            scrollIntoView: true
         });
     }
-    function mustCapture(event) {
-        let mods = (event.ctrlKey ? 1 /* Ctrl */ : 0) | (event.metaKey ? 8 /* Meta */ : 0) |
-            (event.altKey ? 2 /* Alt */ : 0) | (event.shiftKey ? 4 /* Shift */ : 0);
-        let code = event.keyCode, macCtrl = browser.mac && mods == 1 /* Ctrl */;
-        return code == 8 || (macCtrl && code == 72) || // Backspace, Ctrl-h on Mac
-            code == 46 || (macCtrl && code == 68) || // Delete, Ctrl-d on Mac
-            code == 27 || // Esc
-            (mods == (browser.mac ? 8 /* Meta */ : 1 /* Ctrl */) && // Ctrl/Cmd-[biyz]
-                (code == 66 || code == 73 || code == 89 || code == 90));
-    }
-    handlers.keydown = (view, event) => {
-        if (mustCapture(event))
-            event.preventDefault();
-        view.inputState.setSelectionOrigin("keyboardselection");
-    };
-    handlers.touchdown = handlers.touchmove = view => {
-        view.inputState.setSelectionOrigin("pointerselection");
-    };
-    handlers.mousedown = (view, event) => {
-        let style = null;
-        for (let makeStyle of view.state.facet(mouseSelectionStyle)) {
-            style = makeStyle(view, event);
-            if (style)
-                break;
-        }
-        if (!style && event.button == 0)
-            style = basicMouseSelection(view, event);
-        if (style) {
-            if (view.root.activeElement != view.contentDOM)
-                view.observer.ignore(() => focusPreventScroll(view.contentDOM));
-            view.inputState.startMouseSelection(view, event, style);
-        }
-    };
-    function rangeForClick(view, pos, bias, type) {
-        if (type == 1) { // Single click
-            return EditorSelection.cursor(pos, bias);
-        }
-        else if (type == 2) { // Double click
-            return groupAt(view.state, pos, bias);
-        }
-        else { // Triple click
-            let line = LineView.find(view.docView, pos);
-            if (line)
-                return EditorSelection.range(line.posAtStart, line.posAtEnd);
-            let { from, to } = view.state.doc.lineAt(pos);
-            return EditorSelection.range(from, to);
-        }
-    }
-    let insideY = (y, rect) => y >= rect.top && y <= rect.bottom;
-    let inside = (x, y, rect) => insideY(y, rect) && x >= rect.left && x <= rect.right;
-    // Try to determine, for the given coordinates, associated with the
-    // given position, whether they are related to the element before or
-    // the element after the position.
-    function findPositionSide(view, pos, x, y) {
-        let line = LineView.find(view.docView, pos);
-        if (!line)
-            return 1;
-        let off = pos - line.posAtStart;
-        // Line boundaries point into the line
-        if (off == 0)
-            return 1;
-        if (off == line.length)
-            return -1;
-        // Positions on top of an element point at that element
-        let before = line.coordsAt(off, -1);
-        if (before && inside(x, y, before))
-            return -1;
-        let after = line.coordsAt(off, 1);
-        if (after && inside(x, y, after))
-            return 1;
-        // This is probably a line wrap point. Pick before if the point is
-        // beside it.
-        return before && insideY(y, before) ? -1 : 1;
-    }
-    function queryPos(view, event) {
-        let pos = view.posAtCoords({ x: event.clientX, y: event.clientY });
-        if (pos == null)
-            return null;
-        return { pos, bias: findPositionSide(view, pos, event.clientX, event.clientY) };
-    }
-    const BadMouseDetail = browser.ie && browser.ie_version <= 11;
-    let lastMouseDown = null, lastMouseDownCount = 0;
-    function getClickType(event) {
-        if (!BadMouseDetail)
-            return event.detail;
-        let last = lastMouseDown;
-        lastMouseDown = event;
-        return lastMouseDownCount = !last || (last.timeStamp > Date.now() - 400 && Math.abs(last.clientX - event.clientX) < 2 &&
-            Math.abs(last.clientY - event.clientY) < 2) ? (lastMouseDownCount + 1) % 3 : 1;
-    }
-    function basicMouseSelection(view, event) {
-        let start = queryPos(view, event), type = getClickType(event);
-        let startSel = view.state.selection;
-        let last = start, lastEvent = event;
-        return {
-            update(update) {
-                if (update.changes) {
-                    if (start)
-                        start.pos = update.changes.mapPos(start.pos);
-                    startSel = startSel.map(update.changes);
-                }
+    const baseTheme$8 = buildTheme("." + baseThemeID, {
+        "&": {
+            position: "relative !important",
+            boxSizing: "border-box",
+            "&.cm-focused": {
+                // FIXME it would be great if we could directly use the browser's
+                // default focus outline, but it appears we can't, so this tries to
+                // approximate that
+                outline_fallback: "1px dotted #212121",
+                outline: "5px auto -webkit-focus-ring-color"
             },
-            get(event, extend, multiple) {
-                let cur;
-                if (event.clientX == lastEvent.clientX && event.clientY == lastEvent.clientY)
-                    cur = last;
-                else {
-                    cur = last = queryPos(view, event);
-                    lastEvent = event;
-                }
-                if (!cur || !start)
-                    return startSel;
-                let range = rangeForClick(view, cur.pos, cur.bias, type);
-                if (start.pos != cur.pos && !extend) {
-                    let startRange = rangeForClick(view, start.pos, start.bias, type);
-                    let from = Math.min(startRange.from, range.from), to = Math.max(startRange.to, range.to);
-                    range = from < range.from ? EditorSelection.range(from, to) : EditorSelection.range(to, from);
-                }
-                if (extend)
-                    return startSel.replaceRange(startSel.main.extend(range.from, range.to));
-                else if (multiple)
-                    return startSel.addRange(range);
-                else
-                    return EditorSelection.create([range]);
+            display: "flex !important",
+            flexDirection: "column"
+        },
+        ".cm-scroller": {
+            display: "flex !important",
+            alignItems: "flex-start !important",
+            fontFamily: "monospace",
+            lineHeight: 1.4,
+            height: "100%",
+            overflowX: "auto",
+            position: "relative",
+            zIndex: 0
+        },
+        ".cm-content": {
+            margin: 0,
+            flexGrow: 2,
+            minHeight: "100%",
+            display: "block",
+            whiteSpace: "pre",
+            boxSizing: "border-box",
+            padding: "4px 0",
+            outline: "none"
+        },
+        ".cm-lineWrapping": {
+            whiteSpace: "pre-wrap",
+            overflowWrap: "anywhere"
+        },
+        "&light .cm-content": { caretColor: "black" },
+        "&dark .cm-content": { caretColor: "white" },
+        ".cm-line": {
+            display: "block",
+            padding: "0 2px 0 4px"
+        },
+        ".cm-selectionLayer": {
+            zIndex: -1,
+            contain: "size style"
+        },
+        ".cm-selectionBackground": {
+            position: "absolute",
+        },
+        "&light .cm-selectionBackground": {
+            background: "#d9d9d9"
+        },
+        "&dark .cm-selectionBackground": {
+            background: "#222"
+        },
+        "&light.cm-focused .cm-selectionBackground": {
+            background: "#d7d4f0"
+        },
+        "&dark.cm-focused .cm-selectionBackground": {
+            background: "#233"
+        },
+        ".cm-cursorLayer": {
+            zIndex: 100,
+            contain: "size style",
+            pointerEvents: "none"
+        },
+        "&.cm-focused .cm-cursorLayer": {
+            animation: "steps(1) cm-blink 1.2s infinite"
+        },
+        // Two animations defined so that we can switch between them to
+        // restart the animation without forcing another style
+        // recomputation.
+        "@keyframes cm-blink": { "0%": {}, "50%": { visibility: "hidden" }, "100%": {} },
+        "@keyframes cm-blink2": { "0%": {}, "50%": { visibility: "hidden" }, "100%": {} },
+        ".cm-cursor": {
+            position: "absolute",
+            borderLeft: "1.2px solid black",
+            marginLeft: "-0.6px",
+            pointerEvents: "none",
+            display: "none"
+        },
+        "&dark .cm-cursor": {
+            borderLeftColor: "#444"
+        },
+        "&.cm-focused .cm-cursor": {
+            display: "block"
+        },
+        "&light .cm-activeLine": { backgroundColor: "#f3f9ff" },
+        "&dark .cm-activeLine": { backgroundColor: "#223039" },
+        "&light .cm-specialChar": { color: "red" },
+        "&dark .cm-specialChar": { color: "#f78" },
+        ".cm-tab": {
+            display: "inline-block",
+            overflow: "hidden",
+            verticalAlign: "bottom"
+        },
+        ".cm-placeholder": {
+            color: "#888",
+            display: "inline-block"
+        },
+        ".cm-button": {
+            verticalAlign: "middle",
+            color: "inherit",
+            fontSize: "70%",
+            padding: ".2em 1em",
+            borderRadius: "3px"
+        },
+        "&light .cm-button": {
+            backgroundImage: "linear-gradient(#eff1f5, #d9d9df)",
+            border: "1px solid #888",
+            "&:active": {
+                backgroundImage: "linear-gradient(#b4b4b4, #d0d3d6)"
             }
-        };
-    }
-    handlers.dragstart = (view, event) => {
-        let { selection: { main } } = view.state;
-        let { mouseSelection } = view.inputState;
-        if (mouseSelection)
-            mouseSelection.dragging = main;
-        if (event.dataTransfer) {
-            event.dataTransfer.setData("Text", view.state.sliceDoc(main.from, main.to));
-            event.dataTransfer.effectAllowed = "copyMove";
-        }
-    };
-    handlers.drop = (view, event) => {
-        if (!event.dataTransfer)
-            return;
-        let dropPos = view.posAtCoords({ x: event.clientX, y: event.clientY });
-        let text = event.dataTransfer.getData("Text");
-        if (dropPos == null || !text)
-            return;
-        event.preventDefault();
-        let { mouseSelection } = view.inputState;
-        let del = mouseSelection && mouseSelection.dragging && mouseSelection.dragMove ?
-            { from: mouseSelection.dragging.from, to: mouseSelection.dragging.to } : null;
-        let ins = { from: dropPos, insert: text };
-        let changes = view.state.changes(del ? [del, ins] : ins);
-        view.focus();
-        view.dispatch({
-            changes,
-            selection: { anchor: changes.mapPos(dropPos, -1), head: changes.mapPos(dropPos, 1) },
-            annotations: Transaction.userEvent.of("drop")
-        });
-    };
-    handlers.paste = (view, event) => {
-        view.observer.flush();
-        let data = brokenClipboardAPI ? null : event.clipboardData;
-        let text = data && data.getData("text/plain");
-        if (text) {
-            doPaste(view, text);
-            event.preventDefault();
-        }
-        else {
-            capturePaste(view);
-        }
-    };
-    function captureCopy(view, text) {
-        // The extra wrapper is somehow necessary on IE/Edge to prevent the
-        // content from being mangled when it is put onto the clipboard
-        let parent = view.dom.parentNode;
-        if (!parent)
-            return;
-        let target = parent.appendChild(document.createElement("textarea"));
-        target.style.cssText = "position: fixed; left: -10000px; top: 10px";
-        target.value = text;
-        target.focus();
-        target.selectionEnd = text.length;
-        target.selectionStart = 0;
-        setTimeout(() => {
-            target.remove();
-            view.focus();
-        }, 50);
-    }
-    function copiedRange(state) {
-        let content = [], ranges = [], linewise = false;
-        for (let range of state.selection.ranges)
-            if (!range.empty) {
-                content.push(state.sliceDoc(range.from, range.to));
-                ranges.push(range);
+        },
+        "&dark .cm-button": {
+            backgroundImage: "linear-gradient(#393939, #111)",
+            border: "1px solid #888",
+            "&:active": {
+                backgroundImage: "linear-gradient(#111, #333)"
             }
-        if (!content.length) {
-            // Nothing selected, do a line-wise copy
-            let upto = -1;
-            for (let { from } of state.selection.ranges) {
-                let line = state.doc.lineAt(from);
-                if (line.number > upto) {
-                    content.push(line.text);
-                    ranges.push({ from: line.from, to: Math.min(state.doc.length, line.to + 1) });
-                }
-                upto = line.number;
-            }
-            linewise = true;
+        },
+        ".cm-textfield": {
+            verticalAlign: "middle",
+            color: "inherit",
+            fontSize: "70%",
+            border: "1px solid silver",
+            padding: ".2em .5em"
+        },
+        "&light .cm-textfield": {
+            backgroundColor: "white"
+        },
+        "&dark .cm-textfield": {
+            border: "1px solid #555",
+            backgroundColor: "inherit"
         }
-        return { text: content.join(state.lineBreak), ranges, linewise };
-    }
-    let lastLinewiseCopy = null;
-    handlers.copy = handlers.cut = (view, event) => {
-        let { text, ranges, linewise } = copiedRange(view.state);
-        if (!text)
-            return;
-        lastLinewiseCopy = linewise ? text : null;
-        let data = brokenClipboardAPI ? null : event.clipboardData;
-        if (data) {
-            event.preventDefault();
-            data.clearData();
-            data.setData("text/plain", text);
-        }
-        else {
-            captureCopy(view, text);
-        }
-        if (event.type == "cut")
-            view.dispatch({
-                changes: ranges,
-                scrollIntoView: true,
-                annotations: Transaction.userEvent.of("cut")
-            });
-    };
-    handlers.focus = handlers.blur = view => {
-        setTimeout(() => {
-            if (view.hasFocus != view.inputState.notifiedFocused)
-                view.update([]);
-        }, 10);
-    };
-    handlers.beforeprint = view => {
-        view.viewState.printing = true;
-        view.requestMeasure();
-        setTimeout(() => {
-            view.viewState.printing = false;
-            view.requestMeasure();
-        }, 2000);
-    };
-    function forceClearComposition(view) {
-        if (view.docView.compositionDeco.size)
-            view.update([]);
-    }
-    handlers.compositionstart = handlers.compositionupdate = view => {
-        if (view.inputState.composing < 0) {
-            if (view.docView.compositionDeco.size) {
-                view.observer.flush();
-                forceClearComposition(view);
-            }
-            // FIXME possibly set a timeout to clear it again on Android
-            view.inputState.composing = 0;
-        }
-    };
-    handlers.compositionend = view => {
-        view.inputState.composing = -1;
-        view.inputState.compositionEndedAt = Date.now();
-        setTimeout(() => {
-            if (view.inputState.composing < 0)
-                forceClearComposition(view);
-        }, 50);
-    };
+    }, lightDarkIDs);
 
     const observeOptions = {
         childList: true,
@@ -7696,8 +7800,14 @@ const cm = (function () {
                     this.queue.push(mut);
                 // IE11 will sometimes (on typing over a selection or
                 // backspacing out a single character text node) call the
-                // observer callback before actually updating the DOM
-                if (browser.ie && browser.ie_version <= 11 &&
+                // observer callback before actually updating the DOM.
+                //
+                // Unrelatedly, iOS Safari will, when ending a composition,
+                // sometimes first clear it, deliver the mutations, and then
+                // reinsert the finished text. CodeMirror's handling of the
+                // deletion will prevent the reinsertion from happening,
+                // breaking composition.
+                if ((browser.ie && browser.ie_version <= 11 || browser.ios && view.composing) &&
                     mutations.some(m => m.type == "childList" && m.removedNodes.length ||
                         m.type == "characterData" && m.oldValue.length > m.target.nodeValue.length))
                     this.flushSoon();
@@ -7711,23 +7821,7 @@ const cm = (function () {
                         oldValue: event.prevValue });
                     this.flushSoon();
                 };
-            this.onSelectionChange = (event) => {
-                if (this.view.root.activeElement != this.dom)
-                    return;
-                let sel = getSelection(this.view.root);
-                let context = sel.anchorNode && this.view.docView.nearest(sel.anchorNode);
-                if (context && context.ignoreEvent(event))
-                    return;
-                // Deletions on IE11 fire their events in the wrong order, giving
-                // us a selection change event before the DOM changes are
-                // reported.
-                // (Selection.isCollapsed isn't reliable on IE)
-                if (browser.ie && browser.ie_version <= 11 && !this.view.state.selection.main.empty &&
-                    sel.focusNode && isEquivalentPosition(sel.focusNode, sel.focusOffset, sel.anchorNode, sel.anchorOffset))
-                    this.flushSoon();
-                else
-                    this.flush();
-            };
+            this.onSelectionChange = this.onSelectionChange.bind(this);
             this.start();
             this.onScroll = this.onScroll.bind(this);
             window.addEventListener("scroll", this.onScroll);
@@ -7749,6 +7843,23 @@ const cm = (function () {
                 this.flush();
                 this.onScrollChanged(e);
             }
+        }
+        onSelectionChange(event) {
+            let { view } = this, sel = getSelection(view.root);
+            if (view.state.facet(editable) ? view.root.activeElement != this.dom : !hasSelection(view.dom, sel))
+                return;
+            let context = sel.anchorNode && view.docView.nearest(sel.anchorNode);
+            if (context && context.ignoreEvent(event))
+                return;
+            // Deletions on IE11 fire their events in the wrong order, giving
+            // us a selection change event before the DOM changes are
+            // reported.
+            // (Selection.isCollapsed isn't reliable on IE)
+            if (browser.ie && browser.ie_version <= 11 && !view.state.selection.main.empty &&
+                sel.focusNode && isEquivalentPosition(sel.focusNode, sel.focusOffset, sel.anchorNode, sel.anchorOffset))
+                this.flushSoon();
+            else
+                this.flush();
         }
         listenForScroll() {
             this.parentCheck = -1;
@@ -7927,7 +8038,7 @@ const cm = (function () {
                 change = { from: from + diff.from, to: from + diff.toA,
                     insert: view.state.toText(reader.text.slice(diff.from, diff.toB)) };
         }
-        else if (view.hasFocus) {
+        else if (view.hasFocus || !view.state.facet(editable)) {
             let domSel = getSelection(view.root);
             let { impreciseHead: iHead, impreciseAnchor: iAnchor } = view.docView;
             let head = iHead && iHead.node == domSel.focusNode && iHead.offset == domSel.focusOffset ? view.state.selection.main.head
@@ -7964,7 +8075,8 @@ const cm = (function () {
             if (view.inputState.composing >= 0)
                 view.inputState.composing++;
             let tr;
-            if (change.from >= sel.from && change.to <= sel.to && change.to - change.from >= (sel.to - sel.from) / 3) {
+            if (change.from >= sel.from && change.to <= sel.to && change.to - change.from >= (sel.to - sel.from) / 3 &&
+                (!newSel || newSel.main.empty && newSel.main.from == change.from + change.insert.length)) {
                 let before = sel.from < change.from ? startState.sliceDoc(sel.from, change.from) : "";
                 let after = sel.to > change.to ? startState.sliceDoc(change.to, sel.to) : "";
                 tr = startState.replaceSelection(view.state.toText(before + change.insert.sliceString(0, undefined, view.state.lineBreak) +
@@ -8153,9 +8265,14 @@ const cm = (function () {
             this.measureRequests = [];
             this.contentDOM = document.createElement("div");
             this.scrollDOM = document.createElement("div");
-            this.scrollDOM.className = themeClass("scroller");
+            this.scrollDOM.tabIndex = -1;
+            this.scrollDOM.className = "cm-scroller";
             this.scrollDOM.appendChild(this.contentDOM);
+            this.announceDOM = document.createElement("div");
+            this.announceDOM.style.cssText = "position: absolute; top: -10000px";
+            this.announceDOM.setAttribute("aria-live", "polite");
             this.dom = document.createElement("div");
+            this.dom.appendChild(this.announceDOM);
             this.dom.appendChild(this.scrollDOM);
             this._dispatch = config.dispatch || ((tr) => this.update([tr]));
             this.dispatch = this.dispatch.bind(this);
@@ -8213,15 +8330,18 @@ const cm = (function () {
             if (this.updateState != 0 /* Idle */)
                 throw new Error("Calls to EditorView.update are not allowed while an update is in progress");
             let redrawn = false, update;
-            this.updateState = 2 /* Updating */;
+            let state = this.state;
+            for (let tr of transactions) {
+                if (tr.startState != state)
+                    throw new RangeError("Trying to update state with a transaction that doesn't start from the previous state.");
+                state = tr.state;
+            }
+            // When the phrases change, redraw the editor
+            if (state.facet(EditorState.phrases) != this.state.facet(EditorState.phrases))
+                return this.setState(state);
+            update = new ViewUpdate(this, state, transactions);
             try {
-                let state = this.state;
-                for (let tr of transactions) {
-                    if (tr.startState != state)
-                        throw new RangeError("Trying to update state with a transaction that doesn't start from the previous state.");
-                    state = tr.state;
-                }
-                update = new ViewUpdate(this, state, transactions);
+                this.updateState = 2 /* Updating */;
                 let scrollTo = transactions.some(tr => tr.scrollIntoView) ? state.selection.main : null;
                 this.viewState.update(update, scrollTo);
                 this.bidiCache = CachedOrder.update(this.bidiCache, update.changes);
@@ -8231,6 +8351,7 @@ const cm = (function () {
                 if (this.state.facet(styleModule) != this.styleModules)
                     this.mountStyles();
                 this.updateAttrs();
+                this.showAnnouncements(transactions);
             }
             finally {
                 this.updateState = 0 /* Idle */;
@@ -8361,19 +8482,19 @@ const cm = (function () {
         /// Get the CSS classes for the currently active editor themes.
         get themeClasses() {
             return baseThemeID + " " +
-                (this.state.facet(darkTheme) ? "cm-dark" : "cm-light") + " " +
+                (this.state.facet(darkTheme) ? baseDarkID : baseLightID) + " " +
                 this.state.facet(theme);
         }
         updateAttrs() {
             let editorAttrs = combineAttrs(this.state.facet(editorAttributes), {
-                class: themeClass("wrap") + (this.hasFocus ? " cm-focused " : " ") + this.themeClasses
+                class: "cm-wrap" + (this.hasFocus ? " cm-focused " : " ") + this.themeClasses
             });
             updateAttrs(this.dom, this.editorAttrs, editorAttrs);
             this.editorAttrs = editorAttrs;
             let contentAttrs = combineAttrs(this.state.facet(contentAttributes), {
                 spellcheck: "false",
                 contenteditable: String(this.state.facet(editable)),
-                class: themeClass("content"),
+                class: "cm-content",
                 style: `${browser.tabSize}: ${this.state.tabSize}`,
                 role: "textbox",
                 "aria-multiline": "true"
@@ -8381,9 +8502,21 @@ const cm = (function () {
             updateAttrs(this.contentDOM, this.contentAttrs, contentAttrs);
             this.contentAttrs = contentAttrs;
         }
+        showAnnouncements(trs) {
+            let first = true;
+            for (let tr of trs)
+                for (let effect of tr.effects)
+                    if (effect.is(EditorView.announce)) {
+                        if (first)
+                            this.announceDOM.textContent = "";
+                        first = false;
+                        let div = this.announceDOM.appendChild(document.createElement("div"));
+                        div.textContent = effect.value;
+                    }
+        }
         mountStyles() {
             this.styleModules = this.state.facet(styleModule);
-            StyleModule.mount(this.root, this.styleModules.concat(baseTheme).reverse());
+            StyleModule.mount(this.root, this.styleModules.concat(baseTheme$8).reverse());
         }
         readMeasured() {
             if (this.updateState == 2 /* Updating */)
@@ -8471,7 +8604,7 @@ const cm = (function () {
         }
         /// The editor's total content height.
         get contentHeight() {
-            return this.viewState.heightMap.height + this.viewState.paddingTop + this.viewState.paddingBottom;
+            return this.viewState.contentHeight;
         }
         /// Move a cursor position by [grapheme
         /// cluster](#text.findClusterBreak). `forward` determines whether
@@ -8630,39 +8763,31 @@ const cm = (function () {
         /// style spec providing the styles for the theme. These will be
         /// prefixed with a generated class for the style.
         ///
-        /// It is highly recommended you use _theme classes_, rather than
-        /// regular CSS classes, in your selectors. These are prefixed with
-        /// a `$` instead of a `.`, and will be expanded (as with
-        /// [`themeClass`](#view.themeClass)) to one or more prefixed class
-        /// names. So for example `$content` targets the editor's [content
-        /// element](#view.EditorView.contentDOM).
-        ///
-        /// Because the selectors will be prefixed with a scope class,
-        /// directly matching the editor's [wrapper
-        /// element](#view.EditorView.dom), which is the element on which
-        /// the scope class will be added, needs to be explicitly
-        /// differentiated by adding an additional `$` to the front of the
-        /// pattern. For example `$$focused $panel` will expand to something
-        /// like `.[scope].cm-focused .cm-panel`.
+        /// Because the selectors will be prefixed with a scope class, rule
+        /// that directly match the editor's [wrapper
+        /// element](#view.EditorView.dom)—to which the scope class will be
+        /// added—need to be explicitly differentiated by adding an `&` to
+        /// the selector for that element—for example
+        /// `&.cm-focused`.
         ///
         /// When `dark` is set to true, the theme will be marked as dark,
-        /// which will add the `$dark` selector to the wrapper element (as
-        /// opposed to `$light` when a light theme is active).
+        /// which will cause the `&dark` rules from [base
+        /// themes](#view.EditorView^baseTheme) to be used (as opposed to
+        /// `&light` when a light theme is active).
         static theme(spec, options) {
             let prefix = StyleModule.newName();
-            let result = [theme.of(prefix), styleModule.of(buildTheme(`.${baseThemeID}.${prefix}`, spec))];
+            let result = [theme.of(prefix), styleModule.of(buildTheme(`.${prefix}`, spec))];
             if (options && options.dark)
                 result.push(darkTheme.of(true));
             return result;
         }
-        /// Create an extension that adds styles to the base theme. The
-        /// given object works much like the one passed to
-        /// [`theme`](#view.EditorView^theme). You'll often want to qualify
-        /// base styles with `$dark` or `$light` so they only apply when
-        /// there is a dark or light theme active. For example `"$$dark
-        /// $myHighlight"`.
+        /// Create an extension that adds styles to the base theme. Like
+        /// with [`theme`](#view.EditorView^theme), use `&` to indicate the
+        /// place of the editor wrapper element when directly targeting
+        /// that. You can also use `&dark` or `&light` instead to only
+        /// target editors with a dark or light theme.
         static baseTheme(spec) {
-            return Prec.fallback(styleModule.of(buildTheme("." + baseThemeID, spec)));
+            return Prec.fallback(styleModule.of(buildTheme("." + baseThemeID, spec, lightDarkIDs)));
         }
     }
     /// Facet to add a [style
@@ -8702,7 +8827,7 @@ const cm = (function () {
     /// should move or copy the selection. The given predicate will be
     /// called with the `mousedown` event, and can return `true` when
     /// the drag should move the content.
-    EditorView.dragMovesSelection = dragMovesSelection;
+    EditorView.dragMovesSelection = dragMovesSelection$1;
     /// Facet used to configure whether a given selecting click adds
     /// a new range to the existing selection or replaces it entirely.
     EditorView.clickAddsSelectionRange = clickAddsSelectionRange;
@@ -8711,15 +8836,22 @@ const cm = (function () {
     /// plugins](#view.EditorView^decorations), which have a separate
     /// mechanism for providing decorations.
     EditorView.decorations = decorations;
-    /// An extension that enables line wrapping in the editor (by
-    /// setting CSS `white-space` to `pre-wrap` in the content).
-    EditorView.lineWrapping = EditorView.theme({ $content: { whiteSpace: "pre-wrap" } });
     /// Facet that provides additional DOM attributes for the editor's
     /// editable DOM element.
     EditorView.contentAttributes = contentAttributes;
     /// Facet that provides DOM attributes for the editor's outer
     /// element.
     EditorView.editorAttributes = editorAttributes;
+    /// An extension that enables line wrapping in the editor (by
+    /// setting CSS `white-space` to `pre-wrap` in the content).
+    EditorView.lineWrapping = EditorView.contentAttributes.of({ "class": "cm-lineWrapping" });
+    /// State effect used to include screen reader announcements in a
+    /// transaction. These will be added to the DOM in a visually hidden
+    /// element with `aria-live="polite"` set, and should be used to
+    /// describe effects that are visually obvious but may not be
+    /// noticed by screen reader users (such as moving to the next
+    /// search match).
+    EditorView.announce = StateEffect.define();
     // Maximum line length for which we compute accurate bidi info
     const MaxBidiLine = 4096;
     function ensureTop(given, dom) {
@@ -8938,9 +9070,9 @@ const cm = (function () {
     });
     /// Returns an extension that hides the browser's native selection and
     /// cursor, replacing the selection with a background behind the text
-    /// (labeled with the `$selectionBackground` theme class), and the
+    /// (with the `cm-selectionBackground` class), and the
     /// cursors with elements overlaid over the code (using
-    /// `$cursor.primary` and `$cursor.secondary`).
+    /// `cm-cursor-primary` and `cm-cursor-secondary`).
     ///
     /// This allows the editor to display secondary selection ranges, and
     /// tends to produce a type of selection more in line with that users
@@ -8992,10 +9124,10 @@ const cm = (function () {
             this.cursors = [];
             this.measureReq = { read: this.readPos.bind(this), write: this.drawSel.bind(this) };
             this.selectionLayer = view.scrollDOM.appendChild(document.createElement("div"));
-            this.selectionLayer.className = themeClass("selectionLayer");
+            this.selectionLayer.className = "cm-selectionLayer";
             this.selectionLayer.setAttribute("aria-hidden", "true");
             this.cursorLayer = view.scrollDOM.appendChild(document.createElement("div"));
-            this.cursorLayer.className = themeClass("cursorLayer");
+            this.cursorLayer.className = "cm-cursorLayer";
             this.cursorLayer.setAttribute("aria-hidden", "true");
             view.requestMeasure(this.measureReq);
             this.setBlinkRate();
@@ -9052,18 +9184,18 @@ const cm = (function () {
         }
     });
     const themeSpec = {
-        $line: {
+        ".cm-line": {
             "& ::selection": { backgroundColor: "transparent !important" },
             "&::selection": { backgroundColor: "transparent !important" }
         }
     };
     if (CanHidePrimary)
-        themeSpec.$line.caretColor = "transparent !important";
+        themeSpec[".cm-line"].caretColor = "transparent !important";
     const hideNativeSelection = Prec.override(EditorView.theme(themeSpec));
-    const selectionClass = themeClass("selectionBackground");
     function getBase(view) {
         let rect = view.scrollDOM.getBoundingClientRect();
-        return { left: rect.left - view.scrollDOM.scrollLeft, top: rect.top - view.scrollDOM.scrollTop };
+        let left = view.textDirection == Direction.LTR ? rect.left : rect.right - view.scrollDOM.clientWidth;
+        return { left: left - view.scrollDOM.scrollLeft, top: rect.top - view.scrollDOM.scrollTop };
     }
     function wrappedLine(view, pos, inside) {
         let range = EditorSelection.cursor(pos);
@@ -9086,11 +9218,11 @@ const cm = (function () {
             visualEnd = wrappedLine(view, to, visualEnd);
         }
         if (visualStart.from == visualEnd.from) {
-            return pieces(drawForLine(range.from, range.to));
+            return pieces(drawForLine(range.from, range.to, visualStart));
         }
         else {
-            let top = drawForLine(range.from, null);
-            let bottom = drawForLine(null, range.to);
+            let top = drawForLine(range.from, null, visualStart);
+            let bottom = drawForLine(null, range.to, visualEnd);
             let between = [];
             if (visualStart.to < visualEnd.from - 1)
                 between.push(piece(leftSide, top.bottom, rightSide, bottom.top));
@@ -9099,7 +9231,7 @@ const cm = (function () {
             return pieces(top).concat(between).concat(pieces(bottom));
         }
         function piece(left, top, right, bottom) {
-            return new Piece(left - base.left, top - base.top, right - left, bottom - top, selectionClass);
+            return new Piece(left - base.left, top - base.top, right - left, bottom - top, "cm-selectionBackground");
         }
         function pieces({ top, bottom, horizontal }) {
             let pieces = [];
@@ -9108,10 +9240,11 @@ const cm = (function () {
             return pieces;
         }
         // Gets passed from/to in line-local positions
-        function drawForLine(from, to) {
+        function drawForLine(from, to, line) {
             let top = 1e9, bottom = -1e9, horizontal = [];
             function addSpan(from, fromOpen, to, toOpen, dir) {
-                let fromCoords = view.coordsAtPos(from, 1), toCoords = view.coordsAtPos(to, -1);
+                let fromCoords = view.coordsAtPos(from, from == line.to ? -1 : 1);
+                let toCoords = view.coordsAtPos(to, to == line.from ? 1 : -1);
                 top = Math.min(fromCoords.top, toCoords.top, top);
                 bottom = Math.max(fromCoords.bottom, toCoords.bottom, bottom);
                 if (dir == Direction.LTR)
@@ -9119,8 +9252,7 @@ const cm = (function () {
                 else
                     horizontal.push(!ltr && toOpen ? leftSide : toCoords.left, !ltr && fromOpen ? rightSide : fromCoords.right);
             }
-            let start = from !== null && from !== void 0 ? from : view.moveToLineBoundary(EditorSelection.cursor(to, 1), false).head;
-            let end = to !== null && to !== void 0 ? to : view.moveToLineBoundary(EditorSelection.cursor(from, -1), true).head;
+            let start = from !== null && from !== void 0 ? from : line.from, end = to !== null && to !== void 0 ? to : line.to;
             // Split the range by visible range and document line
             for (let r of view.visibleRanges)
                 if (r.to > start && r.from < end) {
@@ -9146,14 +9278,12 @@ const cm = (function () {
             return { top, bottom, horizontal };
         }
     }
-    const primaryCursorClass = themeClass("cursor.primary");
-    const cursorClass = themeClass("cursor.secondary");
     function measureCursor(view, cursor, primary) {
         let pos = view.coordsAtPos(cursor.head, cursor.assoc || 1);
         if (!pos)
             return null;
         let base = getBase(view);
-        return new Piece(pos.left - base.left, pos.top - base.top, -1, pos.bottom - pos.top, primary ? primaryCursorClass : cursorClass);
+        return new Piece(pos.left - base.left, pos.top - base.top, -1, pos.bottom - pos.top, primary ? "cm-cursor cm-cursor-primary" : "cm-cursor cm-cursor-secondary");
     }
 
     function iterMatches(doc, re, from, to, f) {
@@ -9242,7 +9372,7 @@ const cm = (function () {
     }
 
     const UnicodeRegexpSupport = /x/.unicode != null ? "gu" : "g";
-    const Specials = new RegExp("[\u0000-\u0008\u000a-\u001f\u007f-\u009f\u00ad\u061c\u200b-\u200c\u200e\u200f\u2028\u2029\ufeff\ufff9-\ufffc]", UnicodeRegexpSupport);
+    const Specials = new RegExp("[\u0000-\u0008\u000a-\u001f\u007f-\u009f\u00ad\u061c\u200b\u200e\u200f\u2028\u2029\ufeff\ufff9-\ufffc]", UnicodeRegexpSupport);
     const Names = {
         0: "null",
         7: "bell",
@@ -9334,7 +9464,7 @@ const cm = (function () {
     const DefaultPlaceholder = "\u2022";
     // Assigns placeholder characters from the Control Pictures block to
     // ASCII control characters
-    function placeholder(code) {
+    function placeholder$1(code) {
         if (code >= 32)
             return DefaultPlaceholder;
         if (code == 10)
@@ -9349,7 +9479,7 @@ const cm = (function () {
         }
         eq(other) { return other.code == this.code; }
         toDOM(view) {
-            let ph = placeholder(this.code);
+            let ph = placeholder$1(this.code);
             let desc = view.state.phrase("Control character ") + (Names[this.code] || "0x" + this.code.toString(16));
             let custom = this.options.render && this.options.render(this.code, desc, ph);
             if (custom)
@@ -9358,7 +9488,7 @@ const cm = (function () {
             span.textContent = ph;
             span.title = desc;
             span.setAttribute("aria-label", desc);
-            span.className = themeClass("specialChar");
+            span.className = "cm-specialChar";
             return span;
         }
         ignoreEvent() { return false; }
@@ -9372,19 +9502,19 @@ const cm = (function () {
         toDOM() {
             let span = document.createElement("span");
             span.textContent = "\t";
-            span.className = themeClass("tab");
+            span.className = "cm-tab";
             span.style.width = this.width + "px";
             return span;
         }
         ignoreEvent() { return false; }
     }
 
-    /// Mark lines that have a cursor on them with the `$activeLine`
-    /// theme class.
+    /// Mark lines that have a cursor on them with the `"cm-activeLine"`
+    /// DOM class.
     function highlightActiveLine() {
         return activeLineHighlighter;
     }
-    const lineDeco = Decoration.line({ attributes: { class: themeClass("activeLine") } });
+    const lineDeco = Decoration.line({ attributes: { class: "cm-activeLine" } });
     const activeLineHighlighter = ViewPlugin.fromClass(class {
         constructor(view) {
             this.decorations = this.getDeco(view);
@@ -9451,7 +9581,7 @@ const cm = (function () {
             if (isolate == "full" || isolate == "before")
                 state = state.isolate();
             if (tr.annotation(Transaction.addToHistory) === false)
-                return tr.changes.length ? state.addMapping(tr.changes.desc) : state;
+                return !tr.changes.empty ? state.addMapping(tr.changes.desc) : state;
             let event = HistEvent.fromTransaction(tr);
             let time = tr.annotation(Transaction.time), userEvent = tr.annotation(Transaction.userEvent);
             if (event)
@@ -9531,7 +9661,7 @@ const cm = (function () {
         // transaction needs to be converted to an item. Returns null when
         // there are no changes or effects in the transaction.
         static fromTransaction(tr) {
-            let effects = none$5;
+            let effects = none$2;
             for (let invert of tr.startState.facet(invertedEffects)) {
                 let result = invert(tr);
                 if (result.length)
@@ -9539,10 +9669,10 @@ const cm = (function () {
             }
             if (!effects.length && tr.changes.empty)
                 return null;
-            return new HistEvent(tr.changes.invert(tr.startState.doc), effects, undefined, tr.startState.selection, none$5);
+            return new HistEvent(tr.changes.invert(tr.startState.doc), effects, undefined, tr.startState.selection, none$2);
         }
         static selection(selections) {
-            return new HistEvent(undefined, none$5, undefined, undefined, selections);
+            return new HistEvent(undefined, none$2, undefined, undefined, selections);
         }
     }
     function updateBranch(branch, to, maxLen, newEvent) {
@@ -9570,7 +9700,7 @@ const cm = (function () {
     function conc(a, b) {
         return !a.length ? b : !b.length ? a : a.concat(b);
     }
-    const none$5 = [];
+    const none$2 = [];
     const MaxSelectionsPerEvent = 200;
     function addSelection(branch, selection) {
         if (!branch.length) {
@@ -9598,7 +9728,7 @@ const cm = (function () {
     function addMappingToBranch(branch, mapping) {
         if (!branch.length)
             return branch;
-        let length = branch.length, selections = none$5;
+        let length = branch.length, selections = none$2;
         while (length) {
             let event = mapEvent(branch[length - 1], mapping, selections);
             if (event.changes && !event.changes.empty || event.effects.length) { // Event survived mapping
@@ -9612,10 +9742,10 @@ const cm = (function () {
                 selections = event.selectionsAfter;
             }
         }
-        return selections.length ? [HistEvent.selection(selections)] : none$5;
+        return selections.length ? [HistEvent.selection(selections)] : none$2;
     }
     function mapEvent(event, mapping, extraSelections) {
-        let selections = conc(event.selectionsAfter.length ? event.selectionsAfter.map(s => s.map(mapping)) : none$5, extraSelections);
+        let selections = conc(event.selectionsAfter.length ? event.selectionsAfter.map(s => s.map(mapping)) : none$2, extraSelections);
         // Change-less events don't store mappings (they are always the last event in a branch)
         if (!event.changes)
             return HistEvent.selection(selections);
@@ -9638,17 +9768,17 @@ const cm = (function () {
             if (lastEvent && lastEvent.changes &&
                 time - this.prevTime < newGroupDelay &&
                 !lastEvent.selectionsAfter.length &&
-                lastEvent.changes.length && event.changes &&
+                !lastEvent.changes.empty && event.changes &&
                 isAdjacent(lastEvent.changes, event.changes)) {
-                done = updateBranch(done, done.length - 1, maxLen, new HistEvent(event.changes.compose(lastEvent.changes), conc(event.effects, lastEvent.effects), lastEvent.mapped, lastEvent.startSelection, none$5));
+                done = updateBranch(done, done.length - 1, maxLen, new HistEvent(event.changes.compose(lastEvent.changes), conc(event.effects, lastEvent.effects), lastEvent.mapped, lastEvent.startSelection, none$2));
             }
             else {
                 done = updateBranch(done, done.length, maxLen, event);
             }
-            return new HistoryState(done, none$5, time, userEvent);
+            return new HistoryState(done, none$2, time, userEvent);
         }
         addSelection(selection, time, userEvent, newGroupDelay) {
-            let last = this.done.length ? this.done[this.done.length - 1].selectionsAfter : none$5;
+            let last = this.done.length ? this.done[this.done.length - 1].selectionsAfter : none$2;
             if (last.length > 0 &&
                 time - this.prevTime < newGroupDelay &&
                 userEvent == "keyboardselection" && this.prevUserEvent == userEvent &&
@@ -9674,7 +9804,7 @@ const cm = (function () {
                 return null;
             }
             else {
-                let rest = branch.length == 1 ? none$5 : branch.slice(0, branch.length - 1);
+                let rest = branch.length == 1 ? none$2 : branch.slice(0, branch.length - 1);
                 if (event.mapped)
                     rest = addMappingToBranch(rest, event.mapped);
                 return state.update({
@@ -9687,7 +9817,7 @@ const cm = (function () {
             }
         }
     }
-    HistoryState.empty = new HistoryState(none$5, none$5);
+    HistoryState.empty = new HistoryState(none$2, none$2);
     /// Default key bindings for the undo history.
     ///
     /// - Mod-z: [`undo`](#history.undo).
@@ -9981,7 +10111,7 @@ const cm = (function () {
         /// Balance the direct children of this tree.
         balance(maxBufferLength = DefaultBufferLength) {
             return this.children.length <= BalanceBranchFactor ? this
-                : balanceRange(this.type, NodeType.none, this.children, this.positions, 0, this.children.length, 0, maxBufferLength, this.length);
+                : balanceRange(this.type, NodeType.none, this.children, this.positions, 0, this.children.length, 0, maxBufferLength, this.length, 0);
         }
         /// Build a tree from a postfix-ordered buffer of node information,
         /// or a cursor over such a buffer.
@@ -9989,6 +10119,14 @@ const cm = (function () {
     }
     /// The empty tree
     Tree.empty = new Tree(NodeType.none, [], [], 0);
+    // For trees that need a context hash attached, we're using this
+    // kludge which assigns an extra property directly after
+    // initialization (creating a single new object shape).
+    function withHash(tree, hash) {
+        if (hash)
+            tree.contextHash = hash;
+        return tree;
+    }
     /// Tree buffers contain (type, start, end, endIndex) quads for each
     /// node. In such a buffer, nodes are stored in prefix order (parents
     /// before children, with the endIndex of the parent indicating which
@@ -10434,16 +10572,18 @@ const cm = (function () {
         let { buffer, nodeSet, topID = 0, maxBufferLength = DefaultBufferLength, reused = [], minRepeatType = nodeSet.types.length } = data;
         let cursor = Array.isArray(buffer) ? new FlatBufferCursor(buffer, buffer.length) : buffer;
         let types = nodeSet.types;
+        let contextHash = 0;
         function takeNode(parentStart, minPos, children, positions, inRepeat) {
             let { id, start, end, size } = cursor;
-            while (id == inRepeat) {
-                cursor.next();
-                ({ id, start, end, size } = cursor);
-            }
             let startPos = start - parentStart;
-            if (size < 0) { // Reused node
-                children.push(reused[id]);
-                positions.push(startPos);
+            if (size < 0) {
+                if (size == -1) { // Reused node
+                    children.push(reused[id]);
+                    positions.push(startPos);
+                }
+                else { // Context change
+                    contextHash = id;
+                }
                 cursor.next();
                 return;
             }
@@ -10462,14 +10602,18 @@ const cm = (function () {
                 cursor.next();
                 let localChildren = [], localPositions = [];
                 let localInRepeat = id >= minRepeatType ? id : -1;
-                while (cursor.pos > endPos)
-                    takeNode(start, endPos, localChildren, localPositions, localInRepeat);
+                while (cursor.pos > endPos) {
+                    if (cursor.id == localInRepeat)
+                        cursor.next();
+                    else
+                        takeNode(start, endPos, localChildren, localPositions, localInRepeat);
+                }
                 localChildren.reverse();
                 localPositions.reverse();
                 if (localInRepeat > -1 && localChildren.length > BalanceBranchFactor)
-                    node = balanceRange(type, type, localChildren, localPositions, 0, localChildren.length, 0, maxBufferLength, end - start);
+                    node = balanceRange(type, type, localChildren, localPositions, 0, localChildren.length, 0, maxBufferLength, end - start, contextHash);
                 else
-                    node = new Tree(type, localChildren, localPositions, end - start);
+                    node = withHash(new Tree(type, localChildren, localPositions, end - start), contextHash);
             }
             children.push(node);
             positions.push(startPos);
@@ -10546,7 +10690,7 @@ const cm = (function () {
         let length = (_a = data.length) !== null && _a !== void 0 ? _a : (children.length ? positions[0] + children[0].length : 0);
         return new Tree(types[topID], children.reverse(), positions.reverse(), length);
     }
-    function balanceRange(outerType, innerType, children, positions, from, to, start, maxBufferLength, length) {
+    function balanceRange(outerType, innerType, children, positions, from, to, start, maxBufferLength, length, contextHash) {
         let localChildren = [], localPositions = [];
         if (length <= maxBufferLength) {
             for (let i = from; i < to; i++) {
@@ -10579,15 +10723,15 @@ const cm = (function () {
                     localChildren.push(children[groupFrom]);
                 }
                 else {
-                    let inner = balanceRange(innerType, innerType, children, positions, groupFrom, i, groupStart, maxBufferLength, positions[i - 1] + children[i - 1].length - groupStart);
+                    let inner = balanceRange(innerType, innerType, children, positions, groupFrom, i, groupStart, maxBufferLength, positions[i - 1] + children[i - 1].length - groupStart, contextHash);
                     if (innerType != NodeType.none && !containsType(inner.children, innerType))
-                        inner = new Tree(NodeType.none, inner.children, inner.positions, inner.length);
+                        inner = withHash(new Tree(NodeType.none, inner.children, inner.positions, inner.length), contextHash);
                     localChildren.push(inner);
                 }
                 localPositions.push(groupStart - start);
             }
         }
-        return new Tree(outerType, localChildren, localPositions, length);
+        return withHash(new Tree(outerType, localChildren, localPositions, length), contextHash);
     }
     function containsType(nodes, type) {
         for (let elt of nodes)
@@ -10720,8 +10864,11 @@ const cm = (function () {
         constructor(
         /// The [language data](#state.EditorState.languageDataAt) data
         /// facet used for this language.
-        data, parser, extraExtensions = []) {
+        data, parser, 
+        /// The node type of the top node of trees produced by this parser.
+        topNode, extraExtensions = []) {
             this.data = data;
+            this.topNode = topNode;
             // Kludge to define EditorState.tree as a debugging helper,
             // without the EditorState package actually knowing about
             // languages and lezer trees.
@@ -10793,7 +10940,7 @@ const cm = (function () {
     /// parsers.
     class LezerLanguage extends Language {
         constructor(data, parser) {
-            super(data, parser);
+            super(data, parser, parser.topNode);
             this.parser = parser;
         }
         /// Define a language from a parser.
@@ -11335,12 +11482,7 @@ const cm = (function () {
                 scanPos = scan.to + 1;
             }
         }
-        for (; tree; tree = tree.parent) {
-            let strategy = indentStrategy(tree);
-            if (strategy)
-                return strategy(new TreeIndentContext(cx, pos, tree));
-        }
-        return null;
+        return indentFrom(tree, pos, cx);
     }
     function ignoreClosed(cx) {
         var _a, _b;
@@ -11357,6 +11499,14 @@ const cm = (function () {
         }
         return tree.parent == null ? topIndent : null;
     }
+    function indentFrom(node, pos, base) {
+        for (; node; node = node.parent) {
+            let strategy = indentStrategy(node);
+            if (strategy)
+                return strategy(new TreeIndentContext(base, pos, node));
+        }
+        return null;
+    }
     function topIndent() { return 0; }
     /// Objects of this type provide context information and helper
     /// methods to indentation functions.
@@ -11369,6 +11519,7 @@ const cm = (function () {
         /// applies.
         node) {
             super(base.state, base.options);
+            this.base = base;
             this.pos = pos;
             this.node = node;
         }
@@ -11394,6 +11545,12 @@ const cm = (function () {
                 line = this.state.doc.lineAt(atBreak.from);
             }
             return this.lineIndent(line);
+        }
+        /// Continue looking for indentations in the node's parent nodes,
+        /// and return the result of that.
+        continue() {
+            let parent = this.node.parent;
+            return parent ? indentFrom(parent, this.pos, this.base) : 0;
         }
     }
     function isParent(parent, of) {
@@ -11511,6 +11668,13 @@ const cm = (function () {
     /// that tree is foldable and return the range that can be collapsed
     /// when it is.
     const foldNodeProp = new NodeProp();
+    /// [Fold](#language.foldNodeProp) function that folds everything but
+    /// the first and the last child of a syntax node. Useful for nodes
+    /// that start and end with delimiters.
+    function foldInside$1(node) {
+        let first = node.firstChild, last = node.lastChild;
+        return first && first.to < last.from ? { from: first.to, to: last.type.isError ? node.to : last.from } : null;
+    }
     function syntaxFolding(state, start, end) {
         let tree = syntaxTree(state);
         if (tree.length == 0)
@@ -11561,8 +11725,8 @@ const cm = (function () {
     }
     GutterMarker.prototype.elementClass = "";
     GutterMarker.prototype.mapMode = MapMode.TrackBefore;
-    const defaults = {
-        style: "",
+    const defaults$1 = {
+        class: "",
         renderEmptyElements: false,
         elementStyle: "",
         markers: () => RangeSet.empty,
@@ -11575,25 +11739,25 @@ const cm = (function () {
     /// Define an editor gutter. The order in which the gutters appear is
     /// determined by their extension priority.
     function gutter(config) {
-        return [gutters(), activeGutters.of(Object.assign(Object.assign({}, defaults), config))];
+        return [gutters(), activeGutters.of(Object.assign(Object.assign({}, defaults$1), config))];
     }
-    const baseTheme$1 = EditorView.baseTheme({
-        $gutters: {
+    const baseTheme$7 = EditorView.baseTheme({
+        ".cm-gutters": {
             display: "flex",
             height: "100%",
             boxSizing: "border-box",
             left: 0
         },
-        "$$light $gutters": {
+        "&light .cm-gutters": {
             backgroundColor: "#f5f5f5",
             color: "#999",
             borderRight: "1px solid #ddd"
         },
-        "$$dark $gutters": {
+        "&dark .cm-gutters": {
             backgroundColor: "#333338",
             color: "#ccc"
         },
-        $gutter: {
+        ".cm-gutter": {
             display: "flex !important",
             flexDirection: "column",
             flexShrink: 0,
@@ -11601,10 +11765,10 @@ const cm = (function () {
             height: "100%",
             overflow: "hidden"
         },
-        $gutterElement: {
+        ".cm-gutterElement": {
             boxSizing: "border-box"
         },
-        "$gutterElement.lineNumber": {
+        ".cm-lineNumbers .cm-gutterElement": {
             padding: "0 3px 0 5px",
             minWidth: "20px",
             textAlign: "right",
@@ -11625,7 +11789,7 @@ const cm = (function () {
     function gutters(config) {
         let result = [
             gutterView,
-            baseTheme$1
+            baseTheme$7
         ];
         if (config && config.fixed === false)
             result.push(unfixGutters.of(true));
@@ -11635,7 +11799,7 @@ const cm = (function () {
         constructor(view) {
             this.view = view;
             this.dom = document.createElement("div");
-            this.dom.className = themeClass("gutters");
+            this.dom.className = "cm-gutters";
             this.dom.setAttribute("aria-hidden", "true");
             this.gutters = view.state.facet(activeGutters).map(conf => new SingleGutterView(view, conf));
             for (let gutter of this.gutters)
@@ -11717,7 +11881,7 @@ const cm = (function () {
             return value.view.textDirection == Direction.LTR ? { left: value.dom.offsetWidth } : { right: value.dom.offsetWidth };
         })
     });
-    function asArray$1(val) { return (Array.isArray(val) ? val : [val]); }
+    function asArray(val) { return (Array.isArray(val) ? val : [val]); }
     class UpdateContext {
         constructor(gutter, viewport) {
             this.gutter = gutter;
@@ -11742,7 +11906,7 @@ const cm = (function () {
                 return;
             let above = line.top - this.height;
             if (this.i == gutter.elements.length) {
-                let newElt = new GutterElement(view, line.height, above, this.localMarkers, gutter.elementClass);
+                let newElt = new GutterElement(view, line.height, above, this.localMarkers);
                 gutter.elements.push(newElt);
                 gutter.dom.appendChild(newElt.dom);
             }
@@ -11752,7 +11916,7 @@ const cm = (function () {
                     markers = elt.markers;
                     this.localMarkers.length = 0;
                 }
-                elt.update(view, line.height, above, markers, gutter.elementClass);
+                elt.update(view, line.height, above, markers);
             }
             this.height = line.bottom;
             this.i++;
@@ -11770,8 +11934,7 @@ const cm = (function () {
             this.elements = [];
             this.spacer = null;
             this.dom = document.createElement("div");
-            this.dom.className = themeClass("gutter" + (this.config.style ? "." + this.config.style : ""));
-            this.elementClass = themeClass("gutterElement" + (this.config.style ? "." + this.config.style : ""));
+            this.dom.className = "cm-gutter" + (this.config.class ? " " + this.config.class : "");
             for (let prop in config.domEventHandlers) {
                 this.dom.addEventListener(prop, (event) => {
                     let line = view.visualLineAtHeight(event.clientY, view.contentDOM.getBoundingClientRect().top);
@@ -11779,32 +11942,32 @@ const cm = (function () {
                         event.preventDefault();
                 });
             }
-            this.markers = asArray$1(config.markers(view));
+            this.markers = asArray(config.markers(view));
             if (config.initialSpacer) {
-                this.spacer = new GutterElement(view, 0, 0, [config.initialSpacer(view)], this.elementClass);
+                this.spacer = new GutterElement(view, 0, 0, [config.initialSpacer(view)]);
                 this.dom.appendChild(this.spacer.dom);
                 this.spacer.dom.style.cssText += "visibility: hidden; pointer-events: none";
             }
         }
         update(update) {
             let prevMarkers = this.markers;
-            this.markers = asArray$1(this.config.markers(update.view));
+            this.markers = asArray(this.config.markers(update.view));
             if (this.spacer && this.config.updateSpacer) {
                 let updated = this.config.updateSpacer(this.spacer.markers[0], update);
                 if (updated != this.spacer.markers[0])
-                    this.spacer.update(update.view, 0, 0, [updated], this.elementClass);
+                    this.spacer.update(update.view, 0, 0, [updated]);
             }
             return this.markers != prevMarkers;
         }
     }
     class GutterElement {
-        constructor(view, height, above, markers, eltClass) {
+        constructor(view, height, above, markers) {
             this.height = -1;
             this.above = 0;
             this.dom = document.createElement("div");
-            this.update(view, height, above, markers, eltClass);
+            this.update(view, height, above, markers);
         }
-        update(view, height, above, markers, cssClass) {
+        update(view, height, above, markers) {
             if (this.height != height)
                 this.dom.style.height = (this.height = height) + "px";
             if (this.above != above)
@@ -11813,7 +11976,7 @@ const cm = (function () {
                 this.markers = markers;
                 for (let ch; ch = this.dom.lastChild;)
                     ch.remove();
-                let cls = cssClass;
+                let cls = "cm-gutterElement";
                 for (let m of markers) {
                     let dom = m.toDOM(view);
                     if (dom)
@@ -11856,24 +12019,26 @@ const cm = (function () {
             this.number = number;
         }
         eq(other) { return this.number == other.number; }
-        toDOM(view) {
-            let config = view.state.facet(lineNumberConfig);
-            return document.createTextNode(config.formatNumber(this.number));
+        toDOM() {
+            return document.createTextNode(this.number);
         }
     }
+    function formatNumber(view, number) {
+        return view.state.facet(lineNumberConfig).formatNumber(number, view.state);
+    }
     const lineNumberGutter = gutter({
-        style: "lineNumber",
+        class: "cm-lineNumbers",
         markers(view) { return view.state.facet(lineNumberMarkers); },
         lineMarker(view, line, others) {
             if (others.length)
                 return null;
-            return new NumberMarker(view.state.doc.lineAt(line.from).number);
+            return new NumberMarker(formatNumber(view, view.state.doc.lineAt(line.from).number));
         },
         initialSpacer(view) {
-            return new NumberMarker(maxLineNumber(view.state.doc.lines));
+            return new NumberMarker(formatNumber(view, maxLineNumber(view.state.doc.lines)));
         },
         updateSpacer(spacer, update) {
-            let max = maxLineNumber(update.view.state.doc.lines);
+            let max = formatNumber(update.view, maxLineNumber(update.view.state.doc.lines));
             return max == spacer.number ? spacer : new NumberMarker(max);
         }
     });
@@ -11941,7 +12106,7 @@ const cm = (function () {
         let found = null;
         (_a = state.field(foldState, false)) === null || _a === void 0 ? void 0 : _a.between(from, to, (from, to) => {
             if (!found || found.from > from)
-                found = ({ from, to });
+                found = { from, to };
         });
         return found;
     }
@@ -11951,16 +12116,15 @@ const cm = (function () {
             found = true; });
         return found;
     }
-    function maybeEnable(state) {
-        return state.field(foldState, false) ? undefined : { append: codeFolding() };
+    function maybeEnable(state, other) {
+        return state.field(foldState, false) ? other : other.concat(StateEffect.appendConfig.of(codeFolding()));
     }
     /// Fold the lines that are selected, if possible.
     const foldCode = view => {
         for (let line of selectedLines(view)) {
             let range = foldable(view.state, line.from, line.to);
             if (range) {
-                view.dispatch({ effects: foldEffect.of(range),
-                    reconfigure: maybeEnable(view.state) });
+                view.dispatch({ effects: maybeEnable(view.state, [foldEffect.of(range), announceFold(view, range)]) });
                 return true;
             }
         }
@@ -11974,12 +12138,16 @@ const cm = (function () {
         for (let line of selectedLines(view)) {
             let folded = foldInside(view.state, line.from, line.to);
             if (folded)
-                effects.push(unfoldEffect.of(folded));
+                effects.push(unfoldEffect.of(folded), announceFold(view, folded, false));
         }
         if (effects.length)
             view.dispatch({ effects });
         return effects.length > 0;
     };
+    function announceFold(view, range, fold = true) {
+        let lineFrom = view.state.doc.lineAt(range.from).number, lineTo = view.state.doc.lineAt(range.to).number;
+        return EditorView.announce.of(`${view.state.phrase(fold ? "Folded lines" : "Unfolded lines")} ${lineFrom} ${view.state.phrase("to")} ${lineTo}.`);
+    }
     /// Fold all top-level foldable ranges.
     const foldAll = view => {
         let { state } = view, effects = [];
@@ -11990,7 +12158,7 @@ const cm = (function () {
             pos = (range ? view.visualLineAt(range.to) : line).to + 1;
         }
         if (effects.length)
-            view.dispatch({ effects, reconfigure: maybeEnable(view.state) });
+            view.dispatch({ effects: maybeEnable(view.state, effects) });
         return !!effects.length;
     };
     /// Unfold all folded code.
@@ -12024,7 +12192,7 @@ const cm = (function () {
     });
     /// Create an extension that configures code folding.
     function codeFolding(config) {
-        let result = [foldState, baseTheme$2];
+        let result = [foldState, baseTheme$6];
         if (config)
             result.push(foldConfig.of(config));
         return result;
@@ -12039,7 +12207,7 @@ const cm = (function () {
                 element.textContent = conf.placeholderText;
                 element.setAttribute("aria-label", state.phrase("folded code"));
                 element.title = state.phrase("unfold");
-                element.className = themeClass("foldPlaceholder");
+                element.className = "cm-foldPlaceholder";
                 element.onclick = event => {
                     let line = view.visualLineAt(view.posAtDOM(event.target));
                     let folded = foldInside(view.state, line.from, line.to);
@@ -12113,7 +12281,7 @@ const cm = (function () {
         return [
             markers,
             gutter({
-                style: "foldGutter",
+                class: "cm-foldGutter",
                 markers(view) { var _a; return ((_a = view.plugin(markers)) === null || _a === void 0 ? void 0 : _a.markers) || RangeSet.empty; },
                 initialSpacer() {
                     return new FoldMarker(fullConfig, false);
@@ -12137,8 +12305,8 @@ const cm = (function () {
             codeFolding()
         ];
     }
-    const baseTheme$2 = EditorView.baseTheme({
-        $foldPlaceholder: {
+    const baseTheme$6 = EditorView.baseTheme({
+        ".cm-foldPlaceholder": {
             backgroundColor: "#eee",
             border: "1px solid #ddd",
             color: "#888",
@@ -12147,15 +12315,15 @@ const cm = (function () {
             padding: "0 1px",
             cursor: "pointer"
         },
-        "$gutterElement.foldGutter": {
+        ".cm-foldGutter .cm-gutterElement": {
             padding: "0 1px",
             cursor: "pointer"
         }
     });
 
-    const baseTheme$3 = EditorView.baseTheme({
-        $matchingBracket: { color: "#0b0" },
-        $nonmatchingBracket: { color: "#a22" }
+    const baseTheme$5 = EditorView.baseTheme({
+        ".cm-matchingBracket": { color: "#0b0" },
+        ".cm-nonmatchingBracket": { color: "#a22" }
     });
     const DefaultScanDist = 10000, DefaultBrackets = "()[]{}";
     const bracketMatchingConfig = Facet.define({
@@ -12167,7 +12335,7 @@ const cm = (function () {
             });
         }
     });
-    const matchingMark = Decoration.mark({ class: themeClass("matchingBracket") }), nonmatchingMark = Decoration.mark({ class: themeClass("nonmatchingBracket") });
+    const matchingMark = Decoration.mark({ class: "cm-matchingBracket" }), nonmatchingMark = Decoration.mark({ class: "cm-nonmatchingBracket" });
     const bracketMatchingState = StateField.define({
         create() { return Decoration.none; },
         update(deco, tr) {
@@ -12196,7 +12364,7 @@ const cm = (function () {
     });
     const bracketMatchingUnique = [
         bracketMatchingState,
-        baseTheme$3
+        baseTheme$5
     ];
     /// Create an extension that enables bracket matching. Whenever the
     /// cursor is next to a bracket, that bracket and the one it matches
@@ -12523,8 +12691,8 @@ const cm = (function () {
         dispatch(setSel(state, selection));
         return true;
     };
-    function deleteBy(view, by) {
-        let { state } = view, changes = state.changeByRange(range => {
+    function deleteBy({ state, dispatch }, by) {
+        let changes = state.changeByRange(range => {
             let { from, to } = range;
             if (from == to) {
                 let towards = by(from);
@@ -12535,11 +12703,11 @@ const cm = (function () {
         });
         if (changes.changes.empty)
             return false;
-        view.dispatch(changes, { scrollIntoView: true, annotations: Transaction.userEvent.of("delete") });
+        dispatch(state.update(changes, { scrollIntoView: true, annotations: Transaction.userEvent.of("delete") }));
         return true;
     }
-    const deleteByChar = (view, forward, codePoint) => deleteBy(view, pos => {
-        let { state } = view, line = state.doc.lineAt(pos), before;
+    const deleteByChar = (target, forward, codePoint) => deleteBy(target, pos => {
+        let { state } = target, line = state.doc.lineAt(pos), before;
         if (!forward && pos > line.from && pos < line.from + 200 &&
             !/[^ \t]/.test(before = line.text.slice(0, pos - line.from))) {
             if (before[before.length - 1] == "\t")
@@ -12549,18 +12717,18 @@ const cm = (function () {
                 pos--;
             return pos;
         }
-        let target;
+        let targetPos;
         if (codePoint) {
             let next = line.text.slice(pos - line.from + (forward ? 0 : -2), pos - line.from + (forward ? 2 : 0));
             let size = next ? codePointSize(codePointAt(next, 0)) : 1;
-            target = forward ? Math.min(state.doc.length, pos + size) : Math.max(0, pos - size);
+            targetPos = forward ? Math.min(state.doc.length, pos + size) : Math.max(0, pos - size);
         }
         else {
-            target = findClusterBreak(line.text, pos - line.from, forward) + line.from;
+            targetPos = findClusterBreak(line.text, pos - line.from, forward) + line.from;
         }
-        if (target == pos && line.number != (forward ? state.doc.lines : 1))
-            target += forward ? 1 : -1;
-        return target;
+        if (targetPos == pos && line.number != (forward ? state.doc.lines : 1))
+            targetPos += forward ? 1 : -1;
+        return targetPos;
     });
     /// Delete the selection, or, for cursor selections, the code point
     /// before the cursor.
@@ -12570,35 +12738,32 @@ const cm = (function () {
     const deleteCharBackward = view => deleteByChar(view, false, false);
     /// Delete the selection or the character after the cursor.
     const deleteCharForward = view => deleteByChar(view, true, false);
-    const deleteByGroup = (view, forward) => deleteBy(view, pos => {
-        let { state } = view, line = state.doc.lineAt(pos), categorize = state.charCategorizer(pos);
+    const deleteByGroup = (target, forward) => deleteBy(target, start => {
+        let pos = start, { state } = target, line = state.doc.lineAt(pos);
+        let categorize = state.charCategorizer(pos);
         for (let cat = null;;) {
-            let next, nextChar;
             if (pos == (forward ? line.to : line.from)) {
-                if (line.number == (forward ? state.doc.lines : 1))
-                    break;
-                line = state.doc.line(line.number + (forward ? 1 : -1));
-                next = forward ? line.from : line.to;
-                nextChar = "\n";
+                if (pos == start && line.number != (forward ? state.doc.lines : 1))
+                    pos += forward ? 1 : -1;
+                break;
             }
-            else {
-                next = findClusterBreak(line.text, pos - line.from, forward) + line.from;
-                nextChar = line.text.slice(Math.min(pos, next) - line.from, Math.max(pos, next) - line.from);
-            }
+            let next = findClusterBreak(line.text, pos - line.from, forward) + line.from;
+            let nextChar = line.text.slice(Math.min(pos, next) - line.from, Math.max(pos, next) - line.from);
             let nextCat = categorize(nextChar);
             if (cat != null && nextCat != cat)
                 break;
-            if (nextCat != CharCategory.Space)
+            if (nextChar != " " || pos != start)
                 cat = nextCat;
             pos = next;
         }
         return pos;
     });
     /// Delete the selection or backward until the end of the next
-    /// [group](#view.EditorView.moveByGroup).
-    const deleteGroupBackward = view => deleteByGroup(view, false);
+    /// [group](#view.EditorView.moveByGroup), only skipping groups of
+    /// whitespace when they consist of a single space.
+    const deleteGroupBackward = target => deleteByGroup(target, false);
     /// Delete the selection or forward until the end of the next group.
-    const deleteGroupForward = view => deleteByGroup(view, true);
+    const deleteGroupForward = target => deleteByGroup(target, true);
     /// Delete the selection, or, if it is a cursor selection, delete to
     /// the end of the line. If the cursor is directly at the end of the
     /// line, delete the line break after it.
@@ -12606,7 +12771,7 @@ const cm = (function () {
         let lineEnd = view.visualLineAt(pos).to;
         if (pos < lineEnd)
             return lineEnd;
-        return Math.max(view.state.doc.length, pos + 1);
+        return Math.min(view.state.doc.length, pos + 1);
     });
     /// Replace each selection range with a line break, leaving the cursor
     /// on the line before the break.
@@ -12700,7 +12865,8 @@ const cm = (function () {
         let context = syntaxTree(state).resolve(pos);
         let before = context.childBefore(pos), after = context.childAfter(pos), closedBy;
         if (before && after && before.to <= pos && after.from >= pos &&
-            (closedBy = before.type.prop(NodeProp.closedBy)) && closedBy.indexOf(after.name) > -1)
+            (closedBy = before.type.prop(NodeProp.closedBy)) && closedBy.indexOf(after.name) > -1 &&
+            state.doc.lineAt(before.to).from == state.doc.lineAt(after.from).from)
             return { from: before.to, to: after.from };
         return null;
     }
@@ -12736,14 +12902,13 @@ const cm = (function () {
         let atLine = -1;
         return state.changeByRange(range => {
             let changes = [];
-            for (let line = state.doc.lineAt(range.from);;) {
-                if (line.number > atLine) {
+            for (let pos = range.from; pos <= range.to;) {
+                let line = state.doc.lineAt(pos);
+                if (line.number > atLine && (range.empty || range.to > line.from)) {
                     f(line, changes, range);
                     atLine = line.number;
                 }
-                if (range.to <= line.to)
-                    break;
-                line = state.doc.lineAt(line.to + 1);
+                pos = line.to + 1;
             }
             let changeSet = state.changes(changes);
             return { changes,
@@ -12905,7 +13070,7 @@ const cm = (function () {
     /// - Shift-Alt-ArrowUp: [`copyLineUp`](#commands.copyLineUp)
     /// - Shift-Alt-ArrowDown: [`copyLineDown`](#commands.copyLineDown)
     /// - Escape: [`simplifySelection`](#commands.simplifySelection)
-    /// - Ctrl-l (Cmd-l on macOS): [`selectLine`](#commands.selectLine)
+    /// - Alt-l: [`selectLine`](#commands.selectLine)
     /// - Ctrl-i (Cmd-i on macOS): [`selectParentSyntax`](#commands.selectParentSyntax)
     /// - Ctrl-[ (Cmd-[ on macOS): [`indentLess`](#commands.indentLess)
     /// - Ctrl-] (Cmd-] on macOS): [`indentMore`](#commands.indentMore)
@@ -12920,7 +13085,7 @@ const cm = (function () {
         { key: "Alt-ArrowDown", run: moveLineDown },
         { key: "Shift-Alt-ArrowDown", run: copyLineDown },
         { key: "Escape", run: simplifySelection },
-        { key: "Mod-l", run: selectLine },
+        { key: "Alt-l", run: selectLine },
         { key: "Mod-i", run: selectParentSyntax },
         { key: "Mod-[", run: indentLess },
         { key: "Mod-]", run: indentMore },
@@ -12929,7 +13094,7 @@ const cm = (function () {
         { key: "Shift-Mod-\\", run: cursorMatchingBracket }
     ].concat(standardKeymap);
 
-    const defaults$1 = {
+    const defaults = {
         brackets: ["(", "[", "{", "'", '"'],
         before: ")]}'\":;>"
     };
@@ -12981,7 +13146,7 @@ const cm = (function () {
         return fromCodePoint(ch < 128 ? ch : ch + 1);
     }
     function config(state, pos) {
-        return state.languageDataAt("closeBrackets", pos)[0] || defaults$1;
+        return state.languageDataAt("closeBrackets", pos)[0] || defaults;
     }
     function handleInput(view, from, to, insert) {
         if (view.composing)
@@ -13000,7 +13165,7 @@ const cm = (function () {
     /// the cursor is between them.
     const deleteBracketPair = ({ state, dispatch }) => {
         let conf = config(state, state.selection.main.head);
-        let tokens = conf.brackets || defaults$1.brackets;
+        let tokens = conf.brackets || defaults.brackets;
         let dont = null, changes = state.changeByRange(range => {
             if (range.empty) {
                 let before = prevChar(state.doc, range.head);
@@ -13033,12 +13198,12 @@ const cm = (function () {
     /// take care of running this for user input.)
     function insertBracket(state, bracket) {
         let conf = config(state, state.selection.main.head);
-        let tokens = conf.brackets || defaults$1.brackets;
+        let tokens = conf.brackets || defaults.brackets;
         for (let tok of tokens) {
             let closed = closing(codePointAt(tok, 0));
             if (bracket == tok)
                 return closed == tok ? handleSame(state, tok, tokens.indexOf(tok + tok + tok) > -1)
-                    : handleOpen(state, tok, closed, conf.before || defaults$1.before);
+                    : handleOpen(state, tok, closed, conf.before || defaults.before);
             if (bracket == closed && closedBracketAt(state, state.selection.main.from))
                 return handleClose(state, tok, closed);
         }
@@ -13100,7 +13265,7 @@ const cm = (function () {
                     range: EditorSelection.range(range.anchor + token.length, range.head + token.length) };
             let pos = range.head, next = nextChar(state.doc, pos);
             if (next == token) {
-                if (nodeStart(state, pos)) {
+                if (nodeStart$1(state, pos)) {
                     return { changes: { insert: token + token, from: pos },
                         effects: closeBracketEffect.of(pos + token.length),
                         range: EditorSelection.cursor(pos + token.length) };
@@ -13112,7 +13277,7 @@ const cm = (function () {
                 }
             }
             else if (allowTriple && state.sliceDoc(pos - 2 * token.length, pos) == token + token &&
-                nodeStart(state, pos - 2 * token.length)) {
+                nodeStart$1(state, pos - 2 * token.length)) {
                 return { changes: { insert: token + token + token + token, from: pos },
                     effects: closeBracketEffect.of(pos + token.length),
                     range: EditorSelection.cursor(pos + token.length) };
@@ -13131,7 +13296,7 @@ const cm = (function () {
             annotations: Transaction.userEvent.of("input")
         });
     }
-    function nodeStart(state, pos) {
+    function nodeStart$1(state, pos) {
         let tree = syntaxTree(state).resolve(pos + 1);
         return tree.parent && tree.from == pos;
     }
@@ -13175,7 +13340,9 @@ const cm = (function () {
             this.top.sync(this.panels.filter(p => p.top));
             this.bottom.sync(this.panels.filter(p => !p.top));
             for (let p of this.panels) {
-                p.dom.className += " " + panelClass(p);
+                p.dom.classList.add("cm-panel");
+                if (p.class)
+                    p.dom.classList.add(p.class);
                 if (p.mount)
                     p.mount();
             }
@@ -13214,7 +13381,9 @@ const cm = (function () {
                 this.top.sync(top);
                 this.bottom.sync(bottom);
                 for (let p of mount) {
-                    p.dom.className += " " + panelClass(p);
+                    p.dom.classList.add("cm-panel");
+                    if (p.class)
+                        p.dom.classList.add(p.class);
                     if (p.mount)
                         p.mount();
                 }
@@ -13232,9 +13401,6 @@ const cm = (function () {
     }, {
         provide: PluginField.scrollMargins.from(value => ({ top: value.top.scrollMargin(), bottom: value.bottom.scrollMargin() }))
     });
-    function panelClass(panel) {
-        return themeClass(panel.style ? `panel.${panel.style}` : "panel");
-    }
     class PanelGroup {
         constructor(view, top, container) {
             this.view = view;
@@ -13259,7 +13425,7 @@ const cm = (function () {
             }
             if (!this.dom) {
                 this.dom = document.createElement("div");
-                this.dom.className = themeClass(this.top ? "panels.top" : "panels.bottom");
+                this.dom.className = this.top ? "cm-panels cm-panels-top" : "cm-panels cm-panels-bottom";
                 this.dom.style[this.top ? "top" : "bottom"] = "0";
                 let parent = this.container || this.view.dom;
                 parent.insertBefore(this.dom, this.top ? parent.firstChild : null);
@@ -13268,7 +13434,7 @@ const cm = (function () {
             for (let panel of this.panels) {
                 if (panel.dom.parentNode == this.dom) {
                     while (curDOM != panel.dom)
-                        curDOM = rm$1(curDOM);
+                        curDOM = rm(curDOM);
                     curDOM = curDOM.nextSibling;
                 }
                 else {
@@ -13276,7 +13442,7 @@ const cm = (function () {
                 }
             }
             while (curDOM)
-                curDOM = rm$1(curDOM);
+                curDOM = rm(curDOM);
         }
         scrollMargin() {
             return !this.dom || this.container ? 0
@@ -13294,29 +13460,29 @@ const cm = (function () {
                     this.container.classList.add(cls);
         }
     }
-    function rm$1(node) {
+    function rm(node) {
         let next = node.nextSibling;
         node.remove();
         return next;
     }
     const baseTheme$4 = EditorView.baseTheme({
-        $panels: {
+        ".cm-panels": {
             boxSizing: "border-box",
             position: "sticky",
             left: 0,
             right: 0
         },
-        "$$light $panels": {
+        "&light .cm-panels": {
             backgroundColor: "#f5f5f5",
             color: "black"
         },
-        "$$light $panels.top": {
+        "&light .cm-panels-top": {
             borderBottom: "1px solid #ddd"
         },
-        "$$light $panels.bottom": {
+        "&light .cm-panels-bottom": {
             borderTop: "1px solid #ddd"
         },
-        "$$dark $panels": {
+        "&dark .cm-panels": {
             backgroundColor: "#333338",
             color: "white"
         }
@@ -13455,10 +13621,21 @@ const cm = (function () {
     }
 
     function createLineDialog(view) {
-        let dom = document.createElement("form");
-        dom.innerHTML = `<label>${view.state.phrase("Go to line:")} <input class=${themeClass("textfield")} name=line></label>
-<button class=${themeClass("button")} type=submit>${view.state.phrase("go")}</button>`;
-        let input = dom.querySelector("input");
+        let input = crelt("input", { class: "cm-textfield", name: "line" });
+        let dom = crelt("form", {
+            onkeydown: (event) => {
+                if (event.keyCode == 27) { // Escape
+                    event.preventDefault();
+                    view.dispatch({ effects: dialogEffect.of(false) });
+                    view.focus();
+                }
+                else if (event.keyCode == 13) { // Enter
+                    event.preventDefault();
+                    go();
+                }
+            },
+            onsubmit: go
+        }, crelt("label", view.state.phrase("Go to line:"), " ", input), " ", crelt("button", { class: "cm-button", type: "submit" }, view.state.phrase("go")));
         function go() {
             let match = /^([+-])?(\d+)?(:\d+)?(%)?$/.exec(input.value);
             if (!match)
@@ -13484,19 +13661,7 @@ const cm = (function () {
             });
             view.focus();
         }
-        dom.addEventListener("keydown", event => {
-            if (event.keyCode == 27) { // Escape
-                event.preventDefault();
-                view.dispatch({ effects: dialogEffect.of(false) });
-                view.focus();
-            }
-            else if (event.keyCode == 13) { // Enter
-                event.preventDefault();
-                go();
-            }
-        });
-        dom.addEventListener("submit", go);
-        return { dom, style: "gotoLine", pos: -10 };
+        return { dom, class: "cm-gotoLine", pos: -10 };
     }
     const dialogEffect = StateEffect.define();
     const dialogField = StateField.define({
@@ -13522,18 +13687,18 @@ const cm = (function () {
     const gotoLine = view => {
         let panel = getPanel(view, createLineDialog);
         if (!panel) {
-            view.dispatch({
-                reconfigure: view.state.field(dialogField, false) == null ? { append: [panels(), dialogField, baseTheme$5] } : undefined,
-                effects: dialogEffect.of(true)
-            });
+            let effects = [dialogEffect.of(true)];
+            if (view.state.field(dialogField, false) == null)
+                effects.push(StateEffect.appendConfig.of([panels(), dialogField, baseTheme$3]));
+            view.dispatch({ effects });
             panel = getPanel(view, createLineDialog);
         }
         if (panel)
             panel.dom.querySelector("input").focus();
         return true;
     };
-    const baseTheme$5 = EditorView.baseTheme({
-        "$panel.gotoLine": {
+    const baseTheme$3 = EditorView.baseTheme({
+        ".cm-panel.cm-gotoLine": {
             padding: "2px 6px 4px",
             "& label": { fontSize: "80%" }
         }
@@ -13554,9 +13719,9 @@ const cm = (function () {
         }
     });
     /// This extension highlights text that matches the selection. It uses
-    /// the `$selectionMatch` theme class for the highlighting. When
+    /// the `"cm-selectionMatch"` class for the highlighting. When
     /// `highlightWordAroundCursor` is enabled, the word at the cursor
-    /// itself will be highlighted with `selectionMatch.main`.
+    /// itself will be highlighted with `"cm-selectionMatch-main"`.
     function highlightSelectionMatches(options) {
         let ext = [defaultTheme, matchHighlighter];
         if (options)
@@ -13580,8 +13745,8 @@ const cm = (function () {
         }
         return from == to ? null : line.text.slice(from, to);
     }
-    const matchDeco = Decoration.mark({ class: themeClass("selectionMatch") });
-    const mainMatchDeco = Decoration.mark({ class: themeClass("selectionMatch.main") });
+    const matchDeco = Decoration.mark({ class: "cm-selectionMatch" });
+    const mainMatchDeco = Decoration.mark({ class: "cm-selectionMatch cm-selectionMatch-main" });
     const matchHighlighter = ViewPlugin.fromClass(class {
         constructor(view) {
             this.decorations = this.getDeco(view);
@@ -13634,8 +13799,8 @@ const cm = (function () {
         decorations: v => v.decorations
     });
     const defaultTheme = EditorView.baseTheme({
-        "$selectionMatch": { backgroundColor: "#99ff7780" },
-        "$searchMatch $selectionMatch": { backgroundColor: "transparent" }
+        ".cm-selectionMatch": { backgroundColor: "#99ff7780" },
+        ".cm-searchMatch .cm-selectionMatch": { backgroundColor: "transparent" }
     });
 
     class Query {
@@ -13653,7 +13818,7 @@ const cm = (function () {
         get valid() { return !!this.search; }
     }
     const setQuery = StateEffect.define();
-    const togglePanel = StateEffect.define();
+    const togglePanel$1 = StateEffect.define();
     const searchState = StateField.define({
         create() {
             return new SearchState(new Query("", "", false), []);
@@ -13662,7 +13827,7 @@ const cm = (function () {
             for (let effect of tr.effects) {
                 if (effect.is(setQuery))
                     value = new SearchState(effect.value, value.panel);
-                else if (effect.is(togglePanel))
+                else if (effect.is(togglePanel$1))
                     value = new SearchState(value.query, effect.value ? [createSearchPanel] : []);
             }
             return value;
@@ -13675,7 +13840,7 @@ const cm = (function () {
             this.panel = panel;
         }
     }
-    const matchMark = Decoration.mark({ class: themeClass("searchMatch") }), selectedMatchMark = Decoration.mark({ class: themeClass("searchMatch.selected") });
+    const matchMark = Decoration.mark({ class: "cm-searchMatch" }), selectedMatchMark = Decoration.mark({ class: "cm-searchMatch cm-searchMatch-selected" });
     const searchHighlighter = ViewPlugin.fromClass(class {
         constructor(view) {
             this.view = view;
@@ -13726,8 +13891,11 @@ const cm = (function () {
         let next = findNextMatch(view.state.doc, view.state.selection.main.from + 1, state.query);
         if (!next || next.from == from && next.to == to)
             return false;
-        view.dispatch({ selection: { anchor: next.from, head: next.to }, scrollIntoView: true });
-        maybeAnnounceMatch(view);
+        view.dispatch({
+            selection: { anchor: next.from, head: next.to },
+            scrollIntoView: true,
+            effects: announceMatch(view, next)
+        });
         return true;
     });
     const FindPrevChunkSize = 10000;
@@ -13755,8 +13923,11 @@ const cm = (function () {
             findPrevInRange(query, state.doc, state.selection.main.from + 1, state.doc.length);
         if (!range)
             return false;
-        view.dispatch({ selection: { anchor: range.from, head: range.to }, scrollIntoView: true });
-        maybeAnnounceMatch(view);
+        view.dispatch({
+            selection: { anchor: range.from, head: range.to },
+            scrollIntoView: true,
+            effects: announceMatch(view, range)
+        });
         return true;
     });
     /// Select all instances of the search query.
@@ -13800,9 +13971,11 @@ const cm = (function () {
             let off = changes.length == 0 || changes[0].from >= next.to ? 0 : next.to - next.from - query.replace.length;
             selection = { anchor: next.from - off, head: next.to - off };
         }
-        view.dispatch({ changes, selection, scrollIntoView: !!selection });
-        if (next)
-            maybeAnnounceMatch(view);
+        view.dispatch({
+            changes, selection,
+            scrollIntoView: !!selection,
+            effects: next ? announceMatch(view, next) : undefined
+        });
         return true;
     });
     /// Replace all instances of the search query with the given
@@ -13835,7 +14008,7 @@ const cm = (function () {
                 this.dom.querySelector("[name=search]").select();
             },
             pos: 80,
-            style: "search"
+            class: "cm-search"
         };
     }
     /// Make sure the search panel is open and focused.
@@ -13848,8 +14021,7 @@ const cm = (function () {
             panel.dom.querySelector("[name=search]").focus();
         }
         else {
-            view.dispatch({ effects: togglePanel.of(true),
-                reconfigure: state ? undefined : { append: searchExtensions } });
+            view.dispatch({ effects: [togglePanel$1.of(true), ...state ? [] : [StateEffect.appendConfig.of(searchExtensions)]] });
         }
         return true;
     };
@@ -13861,7 +14033,7 @@ const cm = (function () {
         let panel = getPanel(view, createSearchPanel);
         if (panel && panel.dom.contains(view.root.activeElement))
             view.focus();
-        view.dispatch({ effects: togglePanel.of(false) });
+        view.dispatch({ effects: togglePanel$1.of(false) });
         return true;
     };
     /// Default search-related key bindings.
@@ -13884,7 +14056,7 @@ const cm = (function () {
             value: conf.query.search,
             placeholder: p("Find"),
             "aria-label": p("Find"),
-            class: themeClass("textfield"),
+            class: "cm-textfield",
             name: "search",
             onchange: update,
             onkeyup: update
@@ -13893,7 +14065,7 @@ const cm = (function () {
             value: conf.query.replace,
             placeholder: p("Replace"),
             "aria-label": p("Replace"),
-            class: themeClass("textfield"),
+            class: "cm-textfield",
             name: "replace",
             onchange: update,
             onkeyup: update
@@ -13921,7 +14093,7 @@ const cm = (function () {
             }
         }
         function button(name, onclick, content) {
-            return crelt("button", { class: themeClass("button"), name, onclick }, content);
+            return crelt("button", { class: "cm-button", name, onclick }, content);
         }
         let panel = crelt("div", { onkeydown: keydown }, [
             searchField,
@@ -13933,16 +14105,15 @@ const cm = (function () {
             replaceField,
             button("replace", () => replaceNext(conf.view), [p("replace")]),
             button("replaceAll", () => replaceAll(conf.view), [p("replace all")]),
-            crelt("button", { name: "close", onclick: () => closeSearchPanel(conf.view), "aria-label": p("close") }, ["×"]),
-            crelt("div", { style: "position: absolute; top: -10000px", "aria-live": "polite" })
+            crelt("button", { name: "close", onclick: () => closeSearchPanel(conf.view), "aria-label": p("close") }, ["×"])
         ]);
         return panel;
     }
     const AnnounceMargin = 30;
     const Break = /[\s\.,:;?!]/;
-    // FIXME this is a kludge
-    function maybeAnnounceMatch(view) {
-        let { from, to } = view.state.selection.main;
+    function announceMatch(view, { from, to }) {
+        if (view.hasFocus)
+            return undefined;
         let lineStart = view.state.doc.lineAt(from).from, lineEnd = view.state.doc.lineAt(to).to;
         let start = Math.max(lineStart, from - AnnounceMargin), end = Math.min(lineEnd, to + AnnounceMargin);
         let text = view.state.sliceDoc(start, end);
@@ -13960,14 +14131,10 @@ const cm = (function () {
                     break;
                 }
         }
-        let panel = getPanel(view, createSearchPanel);
-        if (!panel || !panel.dom.contains(view.root.activeElement))
-            return;
-        let live = panel.dom.querySelector("div[aria-live]");
-        live.textContent = view.state.phrase("current match") + ". " + text;
+        return EditorView.announce.of(`${view.state.phrase("current match")}. ${text} ${view.state.phrase("on line")} ${view.state.doc.lineAt(from).number}`);
     }
     const baseTheme$1$1 = EditorView.baseTheme({
-        "$panel.search": {
+        ".cm-panel.cm-search": {
             padding: "2px 6px 4px",
             position: "relative",
             "& [name=close]": {
@@ -13987,10 +14154,10 @@ const cm = (function () {
                 fontSize: "80%"
             }
         },
-        "$$light $searchMatch": { backgroundColor: "#ffff0054" },
-        "$$dark $searchMatch": { backgroundColor: "#00ffff8a" },
-        "$$light $searchMatch.selected": { backgroundColor: "#ff6a0054" },
-        "$$dark $searchMatch.selected": { backgroundColor: "#ff00ff8a" }
+        "&light .cm-searchMatch": { backgroundColor: "#ffff0054" },
+        "&dark .cm-searchMatch": { backgroundColor: "#00ffff8a" },
+        "&light .cm-searchMatch-selected": { backgroundColor: "#ff6a0054" },
+        "&dark .cm-searchMatch-selected": { backgroundColor: "#ff00ff8a" }
     });
     const searchExtensions = [
         searchState,
@@ -14044,7 +14211,9 @@ const cm = (function () {
         }
         createTooltip(tooltip) {
             let tooltipView = tooltip.create(this.view);
-            tooltipView.dom.className = themeClass("tooltip" + (tooltip.style ? "." + tooltip.style : ""));
+            tooltipView.dom.classList.add("cm-tooltip");
+            if (tooltip.class)
+                tooltipView.dom.classList.add(tooltip.class);
             this.view.dom.appendChild(tooltipView.dom);
             if (tooltipView.mount)
                 tooltipView.mount(this.view);
@@ -14107,8 +14276,8 @@ const cm = (function () {
             scroll() { this.maybeMeasure(); }
         }
     });
-    const baseTheme$6 = EditorView.baseTheme({
-        $tooltip: {
+    const baseTheme$2 = EditorView.baseTheme({
+        ".cm-tooltip": {
             position: "fixed",
             border: "1px solid #ddd",
             backgroundColor: "#f5f5f5",
@@ -14119,11 +14288,11 @@ const cm = (function () {
     /// [`showTooltip`](#tooltip.showTooltip) to be used to create
     /// tooltips.
     function tooltips() {
-        return [tooltipPlugin, baseTheme$6];
+        return [tooltipPlugin, baseTheme$2];
     }
     /// Behavior by which an extension can provide a tooltip to be shown.
     const showTooltip = Facet.define();
-    const HoverTime = 750, HoverMaxDist = 10;
+    const HoverTime = 750, HoverMaxDist = 6;
     class HoverPlugin {
         constructor(view, source, field, setHover) {
             this.view = view;
@@ -14132,9 +14301,18 @@ const cm = (function () {
             this.setHover = setHover;
             this.lastMouseMove = null;
             this.hoverTimeout = -1;
+            this.restartTimeout = -1;
+            this.pending = null;
             this.checkHover = this.checkHover.bind(this);
             view.dom.addEventListener("mouseleave", this.mouseleave = this.mouseleave.bind(this));
             view.dom.addEventListener("mousemove", this.mousemove = this.mousemove.bind(this));
+        }
+        update() {
+            if (this.pending) {
+                this.pending = null;
+                clearTimeout(this.restartTimeout);
+                this.restartTimeout = setTimeout(() => this.startHover(), 20);
+            }
         }
         get active() {
             return this.view.state.field(this.field);
@@ -14144,10 +14322,15 @@ const cm = (function () {
             if (this.active)
                 return;
             let now = Date.now(), lastMove = this.lastMouseMove;
-            if (now - lastMove.timeStamp < HoverTime) {
+            if (now - lastMove.timeStamp < HoverTime)
                 this.hoverTimeout = setTimeout(this.checkHover, HoverTime - (now - lastMove.timeStamp));
-                return;
-            }
+            else
+                this.startHover();
+        }
+        startHover() {
+            var _a;
+            clearTimeout(this.restartTimeout);
+            let lastMove = this.lastMouseMove;
             let coords = { x: lastMove.clientX, y: lastMove.clientY };
             let pos = this.view.contentDOM.contains(lastMove.target)
                 ? this.view.posAtCoords(coords) : null;
@@ -14161,8 +14344,19 @@ const cm = (function () {
             let bidi = this.view.bidiSpans(this.view.state.doc.lineAt(pos)).find(s => s.from <= pos && s.to >= pos);
             let rtl = bidi && bidi.dir == Direction.RTL ? -1 : 1;
             let open = this.source(this.view, pos, (coords.x < posCoords.left ? -rtl : rtl));
-            if (open)
+            if ((_a = open) === null || _a === void 0 ? void 0 : _a.then) {
+                let pending = this.pending = { pos };
+                open.then(result => {
+                    if (this.pending == pending) {
+                        this.pending = null;
+                        if (result)
+                            this.view.dispatch({ effects: this.setHover.of(result) });
+                    }
+                });
+            }
+            else if (open) {
                 this.view.dispatch({ effects: this.setHover.of(open) });
+            }
         }
         mousemove(event) {
             var _a;
@@ -14170,11 +14364,13 @@ const cm = (function () {
             if (this.hoverTimeout < 0)
                 this.hoverTimeout = setTimeout(this.checkHover, HoverTime);
             let tooltip = this.active;
-            if (tooltip && !isInTooltip(event.target)) {
-                let { pos } = tooltip, end = (_a = tooltip.end) !== null && _a !== void 0 ? _a : pos;
+            if (tooltip && !isInTooltip(event.target) || this.pending) {
+                let { pos } = tooltip || this.pending, end = (_a = tooltip === null || tooltip === void 0 ? void 0 : tooltip.end) !== null && _a !== void 0 ? _a : pos;
                 if ((pos == end ? this.view.posAtCoords({ x: event.clientX, y: event.clientY }) != pos
-                    : !isOverRange(this.view, pos, end, event.clientX, event.clientY, HoverMaxDist)))
+                    : !isOverRange(this.view, pos, end, event.clientX, event.clientY, HoverMaxDist))) {
                     this.view.dispatch({ effects: this.setHover.of(null) });
+                    this.pending = null;
+                }
             }
         }
         mouseleave() {
@@ -14211,12 +14407,12 @@ const cm = (function () {
         return false;
     }
     /// Enable a hover tooltip, which shows up when the pointer hovers
-    /// over ranges of text. The callback is called when the mouse overs
+    /// over ranges of text. The callback is called when the mouse hovers
     /// over the document text. It should, if there is a tooltip
-    /// associated with position `pos` return the tooltip description. The
-    /// `side` argument indicates on which side of the position the
-    /// pointer is—it will be -1 if the pointer is before
-    /// the position, 1 if after the position.
+    /// associated with position `pos` return the tooltip description
+    /// (either directly or in a promise). The `side` argument indicates
+    /// on which side of the position the pointer is—it will be -1 if the
+    /// pointer is before the position, 1 if after the position.
     function hoverTooltip(source, options = {}) {
         const setHover = StateEffect.define();
         const hoverState = StateField.define({
@@ -14424,9 +14620,17 @@ const cm = (function () {
                 if (anyTo < len)
                     return null;
             }
+            // This tracks the extent of the precise (non-folded, not
+            // necessarily adjacent) match
             let preciseTo = 0;
+            // Tracks whether there is a match that hits only characters that
+            // appear to be starting words. `byWordFolded` is set to true when
+            // a case folded character is encountered in such a match
             let byWordTo = 0, byWordFolded = false;
+            // If we've found a partial adjacent match, these track its state
             let adjacentTo = 0, adjacentStart = -1, adjacentEnd = -1;
+            let hasLower = /[a-z]/.test(word);
+            // Go over the option's text, scanning for the various kinds of matches
             for (let i = 0, e = Math.min(word.length, 200), prevType = 0 /* NonWord */; i < e && byWordTo < len;) {
                 let next = codePointAt(word, i);
                 if (direct < 0) {
@@ -14447,8 +14651,8 @@ const cm = (function () {
                 let ch, type = next < 0xff
                     ? (next >= 48 && next <= 57 || next >= 97 && next <= 122 ? 2 /* Lower */ : next >= 65 && next <= 90 ? 1 /* Upper */ : 0 /* NonWord */)
                     : ((ch = fromCodePoint(next)) != ch.toLowerCase() ? 1 /* Upper */ : ch != ch.toUpperCase() ? 2 /* Lower */ : 0 /* NonWord */);
-                if (type == 1 /* Upper */ || prevType == 0 /* NonWord */ && type != 0 /* NonWord */ &&
-                    (this.chars[byWordTo] == next || (this.folded[byWordTo] == next && (byWordFolded = true))))
+                if ((type == 1 /* Upper */ && hasLower || prevType == 0 /* NonWord */ && type != 0 /* NonWord */) &&
+                    (chars[byWordTo] == next || (folded[byWordTo] == next && (byWordFolded = true))))
                     byWord[byWordTo++] = i;
                 prevType = type;
                 i += codePointSize(next);
@@ -14494,8 +14698,8 @@ const cm = (function () {
     });
 
     const MaxInfoWidth = 300;
-    const baseTheme$7 = EditorView.baseTheme({
-        "$tooltip.autocomplete": {
+    const baseTheme$1 = EditorView.baseTheme({
+        ".cm-tooltip.cm-tooltip-autocomplete": {
             "& > ul": {
                 fontFamily: "monospace",
                 overflowY: "auto",
@@ -14517,37 +14721,37 @@ const cm = (function () {
                 }
             }
         },
-        "$completionListIncompleteTop:before, $completionListIncompleteBottom:after": {
+        ".cm-completionListIncompleteTop:before, .cm-completionListIncompleteBottom:after": {
             content: '"···"',
             opacity: 0.5,
             display: "block",
             textAlign: "center"
         },
-        "$tooltip.completionInfo": {
+        ".cm-tooltip.cm-completionInfo": {
             position: "absolute",
             padding: "3px 9px",
             width: "max-content",
             maxWidth: MaxInfoWidth + "px",
         },
-        "$tooltip.completionInfo.left": { right: "100%" },
-        "$tooltip.completionInfo.right": { left: "100%" },
-        "$$light $snippetField": { backgroundColor: "#ddd" },
-        "$$dark $snippetField": { backgroundColor: "#333" },
-        "$snippetFieldPosition": {
+        ".cm-completionInfo.cm-completionInfo-left": { right: "100%" },
+        ".cm-completionInfo.cm-completionInfo-right": { left: "100%" },
+        "&light .cm-snippetField": { backgroundColor: "#00000022" },
+        "&dark .cm-snippetField": { backgroundColor: "#ffffff22" },
+        ".cm-snippetFieldPosition": {
             verticalAlign: "text-top",
             width: 0,
             height: "1.15em",
             margin: "0 -0.7px -.7em",
             borderLeft: "1.4px dotted #888"
         },
-        $completionMatchedText: {
+        ".cm-completionMatchedText": {
             textDecoration: "underline"
         },
-        $completionDetail: {
+        ".cm-completionDetail": {
             marginLeft: "0.5em",
             fontStyle: "italic"
         },
-        $completionIcon: {
+        ".cm-completionIcon": {
             fontSize: "90%",
             width: ".8em",
             display: "inline-block",
@@ -14555,37 +14759,37 @@ const cm = (function () {
             paddingRight: ".6em",
             opacity: "0.6"
         },
-        "$completionIcon.function, $completionIcon.method": {
+        ".cm-completionIcon-function, .cm-completionIcon-method": {
             "&:after": { content: "'ƒ'" }
         },
-        "$completionIcon.class": {
+        ".cm-completionIcon-class": {
             "&:after": { content: "'○'" }
         },
-        "$completionIcon.interface": {
+        ".cm-completionIcon-interface": {
             "&:after": { content: "'◌'" }
         },
-        "$completionIcon.variable": {
+        ".cm-completionIcon-variable": {
             "&:after": { content: "'𝑥'" }
         },
-        "$completionIcon.constant": {
+        ".cm-completionIcon-constant": {
             "&:after": { content: "'𝐶'" }
         },
-        "$completionIcon.type": {
+        ".cm-completionIcon-type": {
             "&:after": { content: "'𝑡'" }
         },
-        "$completionIcon.enum": {
+        ".cm-completionIcon-enum": {
             "&:after": { content: "'∪'" }
         },
-        "$completionIcon.property": {
+        ".cm-completionIcon-property": {
             "&:after": { content: "'□'" }
         },
-        "$completionIcon.keyword": {
+        ".cm-completionIcon-keyword": {
             "&:after": { content: "'🔑\uFE0E'" } // Disable emoji rendering
         },
-        "$completionIcon.namespace": {
+        ".cm-completionIcon-namespace": {
             "&:after": { content: "'▢'" }
         },
-        "$completionIcon.text": {
+        ".cm-completionIcon-text": {
             "&:after": { content: "'abc'", fontSize: "50%", verticalAlign: "middle" }
         }
     });
@@ -14600,10 +14804,12 @@ const cm = (function () {
             const li = ul.appendChild(document.createElement("li"));
             li.id = id + "-" + i;
             let icon = li.appendChild(document.createElement("div"));
-            icon.className = themeClass("completionIcon" + (completion.type ? "." + completion.type : ""));
+            icon.classList.add("cm-completionIcon");
+            if (completion.type)
+                icon.classList.add("cm-completionIcon-" + completion.type);
             icon.setAttribute("aria-hidden", "true");
             let labelElt = li.appendChild(document.createElement("span"));
-            labelElt.className = themeClass("completionLabel");
+            labelElt.className = "cm-completionLabel";
             let { label, detail } = completion, off = 0;
             for (let j = 1; j < match.length;) {
                 let from = match[j++], to = match[j++];
@@ -14611,27 +14817,27 @@ const cm = (function () {
                     labelElt.appendChild(document.createTextNode(label.slice(off, from)));
                 let span = labelElt.appendChild(document.createElement("span"));
                 span.appendChild(document.createTextNode(label.slice(from, to)));
-                span.className = themeClass("completionMatchedText");
+                span.className = "cm-completionMatchedText";
                 off = to;
             }
             if (off < label.length)
                 labelElt.appendChild(document.createTextNode(label.slice(off)));
             if (detail) {
                 let detailElt = li.appendChild(document.createElement("span"));
-                detailElt.className = themeClass("completionDetail");
+                detailElt.className = "cm-completionDetail";
                 detailElt.textContent = detail;
             }
             li.setAttribute("role", "option");
         }
         if (range.from)
-            ul.classList.add(themeClass("completionListIncompleteTop"));
+            ul.classList.add("cm-completionListIncompleteTop");
         if (range.to < options.length)
-            ul.classList.add(themeClass("completionListIncompleteBottom"));
+            ul.classList.add("cm-completionListIncompleteBottom");
         return ul;
     }
     function createInfoDialog(option) {
         let dom = document.createElement("div");
-        dom.className = themeClass("tooltip.completionInfo");
+        dom.className = "cm-tooltip cm-completionInfo";
         let { info } = option.completion;
         if (typeof info == "string")
             dom.textContent = info;
@@ -14748,8 +14954,8 @@ const cm = (function () {
         positionInfo(pos) {
             if (this.info && pos) {
                 this.info.style.top = pos.top + "px";
-                this.info.classList.toggle("cm-tooltip-completionInfo-left", pos.left);
-                this.info.classList.toggle("cm-tooltip-completionInfo-right", !pos.left);
+                this.info.classList.toggle("cm-completionInfo-left", pos.left);
+                this.info.classList.toggle("cm-completionInfo-right", !pos.left);
             }
         }
     }
@@ -14816,7 +15022,7 @@ const cm = (function () {
             if (!options.length)
                 return null;
             let selected = 0;
-            if (prev) {
+            if (prev && prev.selected) {
                 let selectedValue = prev.options[prev.selected].completion;
                 for (let i = 0; i < options.length && !selected; i++) {
                     if (options[i].completion == selectedValue)
@@ -14825,7 +15031,7 @@ const cm = (function () {
             }
             return new CompletionDialog(options, makeAttrs(id, selected), [{
                     pos: active.reduce((a, b) => b.hasResult() ? Math.min(a, b.from) : a, 1e8),
-                    style: "autocomplete",
+                    class: "cm-tooltip-autocomplete",
                     create: completionTooltip(completionState)
                 }], prev ? prev.timestamp : Date.now(), selected);
         }
@@ -14840,7 +15046,7 @@ const cm = (function () {
             this.open = open;
         }
         static start() {
-            return new CompletionState(none$6, "cm-ac-" + Math.floor(Math.random() * 2e6).toString(36), null);
+            return new CompletionState(none$1, "cm-ac-" + Math.floor(Math.random() * 2e6).toString(36), null);
         }
         update(tr) {
             let { state } = tr, conf = state.facet(completionConfig);
@@ -14860,7 +15066,7 @@ const cm = (function () {
                     open = open && open.setSelected(effect.value, this.id);
             return active == this.active && open == this.open ? this : new CompletionState(active, this.id, open);
         }
-        get tooltip() { return this.open ? this.open.tooltip : none$6; }
+        get tooltip() { return this.open ? this.open.tooltip : none$1; }
         get attrs() { return this.open ? this.open.attrs : baseAttrs; }
     }
     function sameResults(a, b) {
@@ -14885,7 +15091,7 @@ const cm = (function () {
             "aria-owns": id
         };
     }
-    const baseAttrs = { "aria-autocomplete": "list" }, none$6 = [];
+    const baseAttrs = { "aria-autocomplete": "list" }, none$1 = [];
     function cmpOption(a, b) {
         let dScore = b.match[0] - a.match[0];
         if (dScore)
@@ -15230,12 +15436,12 @@ const cm = (function () {
     let fieldMarker = Decoration.widget({ widget: new class extends WidgetType {
             toDOM() {
                 let span = document.createElement("span");
-                span.className = themeClass("snippetFieldPosition");
+                span.className = "cm-snippetFieldPosition";
                 return span;
             }
             ignoreEvent() { return false; }
         } });
-    let fieldRange = Decoration.mark({ class: themeClass("snippetField") });
+    let fieldRange = Decoration.mark({ class: "cm-snippetField" });
     class ActiveSnippet {
         constructor(ranges, active) {
             this.ranges = ranges;
@@ -15304,9 +15510,9 @@ const cm = (function () {
             if (ranges.length)
                 spec.selection = fieldSelection(ranges, 0);
             if (ranges.length > 1) {
-                spec.effects = setActive.of(new ActiveSnippet(ranges, 0));
+                let effects = spec.effects = [setActive.of(new ActiveSnippet(ranges, 0))];
                 if (editor.state.field(snippetState, false) === undefined)
-                    spec.reconfigure = { append: [snippetState, addSnippetKeymap, baseTheme$7] };
+                    effects.push(StateEffect.appendConfig.of([snippetState, addSnippetKeymap, snippetPointerHandler, baseTheme$1]));
             }
             editor.dispatch(editor.state.update(spec));
         };
@@ -15355,6 +15561,21 @@ const cm = (function () {
     function snippetCompletion(template, completion) {
         return Object.assign(Object.assign({}, completion), { apply: snippet(template) });
     }
+    const snippetPointerHandler = EditorView.domEventHandlers({
+        mousedown(event, view) {
+            let active = view.state.field(snippetState, false), pos;
+            if (!active || (pos = view.posAtCoords({ x: event.clientX, y: event.clientY })) == null)
+                return false;
+            let match = active.ranges.find(r => r.from <= pos && r.to >= pos);
+            if (!match || match.field == active.active)
+                return false;
+            view.dispatch({
+                selection: fieldSelection(active.ranges, match.field),
+                effects: setActive.of(active.ranges.some(r => r.field > match.field) ? new ActiveSnippet(active.ranges, match.field) : null)
+            });
+            return true;
+        }
+    });
 
     /// Returns an extension that enables autocompletion.
     function autocompletion(config = {}) {
@@ -15363,7 +15584,7 @@ const cm = (function () {
             completionConfig.of(config),
             completionPlugin,
             completionKeymapExt,
-            baseTheme$7,
+            baseTheme$1,
             tooltips()
         ];
     }
@@ -15487,68 +15708,54 @@ const cm = (function () {
         }
         return null;
     }
-    function findLineComment(token, lines) {
-        let minCol = 1e9, commented = null, skipped = [];
-        for (let i = 0; i < lines.length; i++) {
-            let line = lines[i], col = /^\s*/.exec(line.text)[0].length;
-            let empty = skipped[line.number] = col == line.length;
-            if (col < minCol && (!empty || minCol == 1e9 && i == lines.length - 1))
-                minCol = col;
-            if (commented != false && (!empty || commented == null && i == lines.length - 1))
-                commented = line.text.slice(col, col + token.length) == token;
-        }
-        return { minCol, commented: commented, skipped };
-    }
     // Performs toggle, comment and uncomment of line comments.
     function changeLineComment(option, ranges, state) {
-        let lines = [], tokens = [], lineRanges = [];
+        let lines = [];
+        let prevLine = -1;
         for (let { from, to } of ranges) {
-            let token = getConfig(state, from).line;
-            if (!token)
-                return null;
-            tokens.push(token);
-            let lns = getLinesInRange(state.doc, from, to);
-            lines.push(lns);
-            lineRanges.push(findLineComment(token, lns));
+            let startI = lines.length, minIndent = 1e9;
+            for (let pos = from; pos <= to;) {
+                let line = state.doc.lineAt(pos);
+                if (line.from > prevLine && (from == to || to > line.from)) {
+                    prevLine = line.from;
+                    let token = getConfig(state, pos).line;
+                    if (!token)
+                        continue;
+                    let indent = /^\s*/.exec(line.text)[0].length;
+                    let comment = line.text.slice(indent, indent + token.length) == token ? indent : -1;
+                    if (indent < line.text.length && indent < minIndent)
+                        minIndent = indent;
+                    lines.push({ line, comment, token, indent, single: false });
+                }
+                pos = line.to + 1;
+            }
+            if (minIndent < 1e9)
+                for (let i = startI; i < lines.length; i++)
+                    if (lines[i].indent < lines[i].line.text.length)
+                        lines[i].indent = minIndent;
+            if (lines.length == startI + 1)
+                lines[startI].single = true;
         }
-        if (option != 2 /* Uncomment */ && lineRanges.some(c => !c.commented)) {
+        if (option != 1 /* Comment */ && lines.some(l => l.comment >= 0)) {
             let changes = [];
-            for (let i = 0, lineRange; i < ranges.length; i++)
-                if (!(lineRange = lineRanges[i]).commented) {
-                    for (let line of lines[i]) {
-                        if (!lineRange.skipped[line.number] || lines[i].length == 1)
-                            changes.push({ from: line.from + lineRange.minCol, insert: tokens[i] + " " });
-                    }
+            for (let { line, comment, token } of lines)
+                if (comment >= 0) {
+                    let from = line.from + comment, to = from + token.length;
+                    if (line.text[to - line.from] == " ")
+                        to++;
+                    changes.push({ from, to });
                 }
             return { changes };
         }
-        else if (option != 1 /* Comment */ && lineRanges.some(c => c.commented)) {
+        else if (option != 2 /* Uncomment */ && lines.some(l => l.comment < 0)) {
             let changes = [];
-            for (let i = 0, lineRange; i < ranges.length; i++)
-                if ((lineRange = lineRanges[i]).commented) {
-                    let token = tokens[i];
-                    for (let line of lines[i]) {
-                        if (lineRange.skipped[line.number] && lines[i].length > 1)
-                            continue;
-                        let pos = line.from + lineRange.minCol;
-                        let posAfter = lineRange.minCol + token.length;
-                        let marginLen = line.text.slice(posAfter, posAfter + 1) == " " ? 1 : 0;
-                        changes.push({ from: pos, to: pos + token.length + marginLen });
-                    }
-                }
-            return { changes };
+            for (let { line, comment, token, indent, single } of lines)
+                if (comment != indent && (single || /\S/.test(line.text)))
+                    changes.push({ from: line.from + indent, insert: token + " " });
+            let changeSet = state.changes(changes);
+            return { changes: changeSet, selection: state.selection.map(changeSet, 1) };
         }
         return null;
-    }
-    function getLinesInRange(doc, from, to) {
-        let line = doc.lineAt(from), lines = [];
-        while (line.to < to || (line.from <= to && to <= line.to)) {
-            lines.push(line);
-            if (line.number == doc.lines)
-                break;
-            line = doc.line(line.number + 1);
-        }
-        return lines;
     }
 
     // Don't compute precise column positions for line offsets above this
@@ -15705,7 +15912,7 @@ const cm = (function () {
         static get(base, mods) {
             if (!mods.length)
                 return base;
-            let exists = mods[0].instances.find(t => t.base == base && sameArray$1(mods, t.modified));
+            let exists = mods[0].instances.find(t => t.base == base && sameArray(mods, t.modified));
             if (exists)
                 return exists;
             let set = [], tag = new Tag(set, base, mods);
@@ -15718,7 +15925,7 @@ const cm = (function () {
             return tag;
         }
     }
-    function sameArray$1(a, b) {
+    function sameArray(a, b) {
         return a.length == b.length && a.every((x, i) => x == b[i]);
     }
     function permute(array) {
@@ -15819,9 +16026,16 @@ const cm = (function () {
         return ruleNodeProp.add(byName);
     }
     const ruleNodeProp = new NodeProp();
-    const highlightStyleProp = Facet.define({
-        combine(stylings) { return stylings.length ? stylings[0] : null; }
+    const highlightStyle = Facet.define({
+        combine(stylings) { return stylings.length ? HighlightStyle.combinedMatch(stylings) : null; }
     });
+    const fallbackHighlightStyle = Facet.define({
+        combine(values) { return values.length ? values[0].match : null; }
+    });
+    function noHighlight() { return null; }
+    function getHighlightStyle(state) {
+        return state.facet(highlightStyle) || state.facet(fallbackHighlightStyle) || noHighlight;
+    }
     class Rule {
         constructor(tags, mode, context, next) {
             this.tags = tags;
@@ -15842,145 +16056,183 @@ const cm = (function () {
     /// A highlight style associates CSS styles with higlighting
     /// [tags](#highlight.Tag).
     class HighlightStyle {
-        constructor(spec) {
+        constructor(spec, options) {
             this.map = Object.create(null);
-            let modSpec = Object.create(null);
-            for (let style of spec) {
+            let modSpec;
+            function def(spec) {
                 let cls = StyleModule.newName();
-                modSpec["." + cls] = Object.assign({}, style, { tag: null });
+                (modSpec || (modSpec = Object.create(null)))["." + cls] = spec;
+                return cls;
+            }
+            this.all = typeof options.all == "string" ? options.all : options.all ? def(options.all) : null;
+            for (let style of spec) {
+                let cls = (style.class || def(Object.assign({}, style, { tag: null }))) +
+                    (this.all ? " " + this.all : "");
                 let tags = style.tag;
                 if (!Array.isArray(tags))
-                    tags = [tags];
-                for (let tag of tags)
-                    this.map[tag.id] = cls;
+                    this.map[tags.id] = cls;
+                else
+                    for (let tag of tags)
+                        this.map[tag.id] = cls;
             }
-            this.module = new StyleModule(modSpec);
+            this.module = modSpec ? new StyleModule(modSpec) : null;
+            this.scope = options.scope || null;
             this.match = this.match.bind(this);
-            this.extension = [
-                treeHighlighter,
-                highlightStyleProp.of(this),
-                EditorView.styleModule.of(this.module)
-            ];
+            let ext = [treeHighlighter];
+            if (this.module)
+                ext.push(EditorView.styleModule.of(this.module));
+            this.extension = ext.concat(highlightStyle.of(this));
+            this.fallback = ext.concat(fallbackHighlightStyle.of(this));
         }
         /// Returns the CSS class associated with the given tag, if any.
         /// This method is bound to the instance by the constructor.
-        match(tag) {
+        match(tag, scope) {
+            if (this.scope && scope != this.scope)
+                return null;
             for (let t of tag.set) {
                 let match = this.map[t.id];
-                if (match) {
+                if (match !== undefined) {
                     if (t != tag)
                         this.map[tag.id] = match;
                     return match;
                 }
             }
-            return this.map[tag.id] = null;
+            return this.map[tag.id] = this.all;
+        }
+        /// Combines an array of highlight styles into a single match
+        /// function that returns all of the classes assigned by the styles
+        /// for a given tag.
+        static combinedMatch(styles) {
+            if (styles.length == 1)
+                return styles[0].match;
+            let cache = styles.some(s => s.scope) ? undefined : Object.create(null);
+            return (tag, scope) => {
+                let cached = cache && cache[tag.id];
+                if (cached !== undefined)
+                    return cached;
+                let result = null;
+                for (let style of styles) {
+                    let value = style.match(tag, scope);
+                    if (value)
+                        result = result ? result + " " + value : value;
+                }
+                if (cache)
+                    cache[tag.id] = result;
+                return result;
+            };
         }
         /// Create a highlighter style that associates the given styles to
         /// the given tags. The spec must be objects that hold a style tag
-        /// or array of tags in their `tag` property, and
+        /// or array of tags in their `tag` property, and either a single
+        /// `class` property providing a static CSS class (for highlighters
+        /// like [`classHighlightStyle`](#highlight.classHighlightStyle)
+        /// that rely on external styling), or a
         /// [`style-mod`](https://github.com/marijnh/style-mod#documentation)-style
-        /// CSS properties in further properties (which define the styling
-        /// for those tags).
+        /// set of CSS properties (which define the styling for those tags).
         ///
         /// The CSS rules created for a highlighter will be emitted in the
         /// order of the spec's properties. That means that for elements that
         /// have multiple tags associated with them, styles defined further
         /// down in the list will have a higher CSS precedence than styles
         /// defined earlier.
-        static define(...specs) {
-            return new HighlightStyle(specs);
+        static define(specs, options) {
+            return new HighlightStyle(specs, options || {});
+        }
+        /// Returns the CSS classes (if any) that the highlight styles
+        /// active in the given state would assign to the given a style
+        /// [tag](#highlight.Tag) and (optional) language
+        /// [scope](#highlight.HighlightStyle^define^options.scope).
+        static get(state, tag, scope) {
+            return getHighlightStyle(state)(tag, scope || NodeType.none);
         }
     }
-    // This extension installs a highlighter that highlights based on the
-    // syntax tree and highlight style.
-    const treeHighlighter = Prec.fallback(ViewPlugin.define(view => new TreeHighlighter(view), {
-        decorations: v => v.decorations
-    }));
     class TreeHighlighter {
         constructor(view) {
             this.markCache = Object.create(null);
             this.tree = syntaxTree(view.state);
-            this.decorations = this.buildDeco(view);
+            this.decorations = this.buildDeco(view, getHighlightStyle(view.state));
         }
         update(update) {
-            let tree = syntaxTree(update.state);
-            if (tree.length < update.view.viewport.to) {
+            let tree = syntaxTree(update.state), style = getHighlightStyle(update.state);
+            let styleChange = style != update.startState.facet(highlightStyle);
+            if (tree.length < update.view.viewport.to && !styleChange) {
                 this.decorations = this.decorations.map(update.changes);
             }
-            else if (tree != this.tree || update.viewportChanged) {
+            else if (tree != this.tree || update.viewportChanged || styleChange) {
                 this.tree = tree;
-                this.decorations = this.buildDeco(update.view);
+                this.decorations = this.buildDeco(update.view, style);
             }
         }
-        buildDeco(view) {
-            const style = view.state.facet(highlightStyleProp);
-            if (!style || !this.tree.length)
+        buildDeco(view, match) {
+            if (match == noHighlight || !this.tree.length)
                 return Decoration.none;
             let builder = new RangeSetBuilder();
             for (let { from, to } of view.visibleRanges) {
-                highlightTreeRange(this.tree, from, to, style.match, (from, to, style) => {
+                highlightTreeRange(this.tree, from, to, match, (from, to, style) => {
                     builder.add(from, to, this.markCache[style] || (this.markCache[style] = Decoration.mark({ class: style })));
                 });
             }
             return builder.finish();
         }
     }
-    // Reused stacks for highlightTreeRange
-    const nodeStack = [""], classStack = [""], inheritStack = [""];
+    // This extension installs a highlighter that highlights based on the
+    // syntax tree and highlight style.
+    const treeHighlighter = Prec.fallback(ViewPlugin.fromClass(TreeHighlighter, {
+        decorations: v => v.decorations
+    }));
+    const nodeStack = [""];
     function highlightTreeRange(tree, from, to, style, span) {
-        let spanStart = from, spanClass = "", depth = 0;
-        tree.iterate({
-            from, to,
-            enter: (type, start) => {
-                depth++;
-                let inheritedClass = inheritStack[depth - 1];
-                let cls = inheritedClass;
-                let rule = type.prop(ruleNodeProp), opaque = false;
-                while (rule) {
-                    if (!rule.context || matchContext(rule.context, nodeStack, depth)) {
-                        for (let tag of rule.tags) {
-                            let st = style(tag);
-                            if (st) {
-                                if (cls)
-                                    cls += " ";
-                                cls += st;
-                                if (rule.mode == 1 /* Inherit */)
-                                    inheritedClass = cls;
-                                else if (rule.mode == 0 /* Opaque */)
-                                    opaque = true;
-                            }
+        let spanStart = from, spanClass = "";
+        let cursor = tree.topNode.cursor;
+        function node(inheritedClass, depth, scope) {
+            let { type, from: start, to: end } = cursor;
+            if (start >= to || end <= from)
+                return;
+            nodeStack[depth] = type.name;
+            if (type.isTop)
+                scope = type;
+            let cls = inheritedClass;
+            let rule = type.prop(ruleNodeProp), opaque = false;
+            while (rule) {
+                if (!rule.context || matchContext(rule.context, nodeStack, depth)) {
+                    for (let tag of rule.tags) {
+                        let st = style(tag, scope);
+                        if (st) {
+                            if (cls)
+                                cls += " ";
+                            cls += st;
+                            if (rule.mode == 1 /* Inherit */)
+                                inheritedClass += (inheritedClass ? " " : "") + st;
+                            else if (rule.mode == 0 /* Opaque */)
+                                opaque = true;
                         }
-                        break;
                     }
-                    rule = rule.next;
+                    break;
                 }
-                if (cls != spanClass) {
-                    if (start > spanStart && spanClass)
-                        span(spanStart, start, spanClass);
-                    spanStart = start;
-                    spanClass = cls;
-                }
-                if (opaque) {
-                    depth--;
-                    return false;
-                }
-                classStack[depth] = cls;
-                inheritStack[depth] = inheritedClass;
-                nodeStack[depth] = type.name;
-                return undefined;
-            },
-            leave: (_t, _s, end) => {
-                depth--;
-                let backTo = classStack[depth];
-                if (backTo != spanClass) {
-                    let pos = Math.min(to, end);
-                    if (pos > spanStart && spanClass)
-                        span(spanStart, pos, spanClass);
-                    spanStart = pos;
-                    spanClass = backTo;
-                }
+                rule = rule.next;
             }
-        });
+            if (cls != spanClass) {
+                if (start > spanStart && spanClass)
+                    span(spanStart, cursor.from, spanClass);
+                spanStart = start;
+                spanClass = cls;
+            }
+            if (!opaque && cursor.firstChild()) {
+                do {
+                    let end = cursor.to;
+                    node(inheritedClass, depth + 1, scope);
+                    if (spanClass != cls) {
+                        let pos = Math.min(to, end);
+                        if (pos > spanStart && spanClass)
+                            span(spanStart, pos, spanClass);
+                        spanStart = pos;
+                        spanClass = cls;
+                    }
+                } while (cursor.nextSibling());
+                cursor.parent();
+            }
+        }
+        node("", 0, tree.type);
     }
     function matchContext(context, stack, depth) {
         if (context.length > depth - 1)
@@ -15993,7 +16245,7 @@ const cm = (function () {
         return true;
     }
     const t = Tag.define;
-    const comment = t(), name = t(), literal = t(), string = t(literal), number = t(literal), content = t(), heading = t(content), keyword = t(), operator = t(), punctuation = t(), bracket = t(punctuation), meta = t();
+    const comment = t(), name = t(), typeName = t(name), literal = t(), string = t(literal), number = t(literal), content = t(), heading = t(content), keyword = t(), operator = t(), punctuation = t(), bracket = t(punctuation), meta = t();
     /// The default set of highlighting [tags](#highlight.Tag^define) used
     /// by regular language packages and themes.
     ///
@@ -16013,7 +16265,7 @@ const cm = (function () {
     /// 
     /// For tags that extend some parent tag, the documentation links to
     /// the parent.
-    const tags = {
+    const tags$1 = {
         /// A comment.
         comment,
         /// A line [comment](#highlight.tags.comment).
@@ -16026,8 +16278,10 @@ const cm = (function () {
         name,
         /// The [name](#highlight.tags.name) of a variable.
         variableName: t(name),
-        /// A type or tag [name](#highlight.tags.name).
-        typeName: t(name),
+        /// A type [name](#highlight.tags.name).
+        typeName: typeName,
+        /// A tag name (subtag of [`typeName`](#highlight.tags.typeName)).
+        tagName: t(typeName),
         /// A property, field, or attribute [name](#highlight.tags.name).
         propertyName: t(name),
         /// The [name](#highlight.tags.name) of a class.
@@ -16200,26 +16454,117 @@ const cm = (function () {
         special: Tag.defineModifier()
     };
     /// A default highlight style (works well with light themes).
-    const defaultHighlightStyle = HighlightStyle.define({ tag: tags.link,
-        textDecoration: "underline" }, { tag: tags.heading,
-        textDecoration: "underline",
-        fontWeight: "bold" }, { tag: tags.emphasis,
-        fontStyle: "italic" }, { tag: tags.strong,
-        fontWeight: "bold" }, { tag: tags.keyword,
-        color: "#708" }, { tag: [tags.atom, tags.bool, tags.url, tags.contentSeparator, tags.labelName],
-        color: "#219" }, { tag: [tags.literal, tags.inserted],
-        color: "#164" }, { tag: [tags.string, tags.deleted],
-        color: "#a11" }, { tag: [tags.regexp, tags.escape, tags.special(tags.string)],
-        color: "#e40" }, { tag: tags.definition(tags.variableName),
-        color: "#00f" }, { tag: tags.local(tags.variableName),
-        color: "#30a" }, { tag: [tags.typeName, tags.namespace],
-        color: "#085" }, { tag: tags.className,
-        color: "#167" }, { tag: [tags.special(tags.variableName), tags.macroName, tags.local(tags.variableName)],
-        color: "#256" }, { tag: tags.definition(tags.propertyName),
-        color: "#00c" }, { tag: tags.comment,
-        color: "#940" }, { tag: tags.meta,
-        color: "#7a757a" }, { tag: tags.invalid,
-        color: "#f00" });
+    const defaultHighlightStyle = HighlightStyle.define([
+        { tag: tags$1.link,
+            textDecoration: "underline" },
+        { tag: tags$1.heading,
+            textDecoration: "underline",
+            fontWeight: "bold" },
+        { tag: tags$1.emphasis,
+            fontStyle: "italic" },
+        { tag: tags$1.strong,
+            fontWeight: "bold" },
+        { tag: tags$1.keyword,
+            color: "#708" },
+        { tag: [tags$1.atom, tags$1.bool, tags$1.url, tags$1.contentSeparator, tags$1.labelName],
+            color: "#219" },
+        { tag: [tags$1.literal, tags$1.inserted],
+            color: "#164" },
+        { tag: [tags$1.string, tags$1.deleted],
+            color: "#a11" },
+        { tag: [tags$1.regexp, tags$1.escape, tags$1.special(tags$1.string)],
+            color: "#e40" },
+        { tag: tags$1.definition(tags$1.variableName),
+            color: "#00f" },
+        { tag: tags$1.local(tags$1.variableName),
+            color: "#30a" },
+        { tag: [tags$1.typeName, tags$1.namespace],
+            color: "#085" },
+        { tag: tags$1.className,
+            color: "#167" },
+        { tag: [tags$1.special(tags$1.variableName), tags$1.macroName],
+            color: "#256" },
+        { tag: tags$1.definition(tags$1.propertyName),
+            color: "#00c" },
+        { tag: tags$1.comment,
+            color: "#940" },
+        { tag: tags$1.meta,
+            color: "#7a757a" },
+        { tag: tags$1.invalid,
+            color: "#f00" }
+    ]);
+    /// This is a highlight style that adds stable, predictable classes to
+    /// tokens, for styling with external CSS.
+    ///
+    /// These tags are mapped to their name prefixed with `"cmt-"` (for
+    /// example `"cmt-comment"`):
+    ///
+    /// * [`link`](#highlight.tags.link)
+    /// * [`heading`](#highlight.tags.heading)
+    /// * [`emphasis`](#highlight.tags.emphasis)
+    /// * [`strong`](#highlight.tags.strong)
+    /// * [`keyword`](#highlight.tags.keyword)
+    /// * [`atom`](#highlight.tags.atom) [`bool`](#highlight.tags.bool)
+    /// * [`url`](#highlight.tags.url)
+    /// * [`labelName`](#highlight.tags.labelName)
+    /// * [`inserted`](#highlight.tags.inserted)
+    /// * [`deleted`](#highlight.tags.deleted)
+    /// * [`literal`](#highlight.tags.literal)
+    /// * [`string`](#highlight.tags.string)
+    /// * [`number`](#highlight.tags.number)
+    /// * [`variableName`](#highlight.tags.variableName)
+    /// * [`typeName`](#highlight.tags.typeName)
+    /// * [`namespace`](#highlight.tags.namespace)
+    /// * [`macroName`](#highlight.tags.macroName)
+    /// * [`propertyName`](#highlight.tags.propertyName)
+    /// * [`operator`](#highlight.tags.operator)
+    /// * [`comment`](#highlight.tags.comment)
+    /// * [`meta`](#highlight.tags.meta)
+    /// * [`punctuation`](#highlight.tags.puncutation)
+    /// * [`invalid`](#highlight.tags.invalid)
+    ///
+    /// In addition, these mappings are provided:
+    ///
+    /// * [`regexp`](#highlight.tags.regexp),
+    ///   [`escape`](#highlight.tags.escape), and
+    ///   [`special`](#highlight.tags.special)[`(string)`](#highlight.tags.string)
+    ///   are mapped to `"cmt-string2"`
+    /// * [`special`](#highlight.tags.special)[`(variableName)`](#highlight.tags.variableName)
+    ///   to `"cmt-variableName2"`
+    /// * [`local`](#highlight.tags.local)[`(variableName)`](#highlight.tags.variableName)
+    ///   to `"cmt-variableName cmt-local"`
+    /// * [`definition`](#highlight.tags.definition)[`(variableName)`](#highlight.tags.variableName)
+    ///   to `"cmt-variableName cmt-definition"`
+    HighlightStyle.define([
+        { tag: tags$1.link, class: "cmt-link" },
+        { tag: tags$1.heading, class: "cmt-heading" },
+        { tag: tags$1.emphasis, class: "cmt-emphasis" },
+        { tag: tags$1.strong, class: "cmt-strong" },
+        { tag: tags$1.keyword, class: "cmt-keyword" },
+        { tag: tags$1.atom, class: "cmt-atom" },
+        { tag: tags$1.bool, class: "cmt-bool" },
+        { tag: tags$1.url, class: "cmt-url" },
+        { tag: tags$1.labelName, class: "cmt-labelName" },
+        { tag: tags$1.inserted, class: "cmt-inserted" },
+        { tag: tags$1.deleted, class: "cmt-deleted" },
+        { tag: tags$1.literal, class: "cmt-literal" },
+        { tag: tags$1.string, class: "cmt-string" },
+        { tag: tags$1.number, class: "cmt-number" },
+        { tag: [tags$1.regexp, tags$1.escape, tags$1.special(tags$1.string)], class: "cmt-string2" },
+        { tag: tags$1.variableName, class: "cmt-variableName" },
+        { tag: tags$1.local(tags$1.variableName), class: "cmt-variableName cmt-local" },
+        { tag: tags$1.definition(tags$1.variableName), class: "cmt-variableName cmt-definition" },
+        { tag: tags$1.special(tags$1.variableName), class: "cmt-variableName2" },
+        { tag: tags$1.typeName, class: "cmt-typeName" },
+        { tag: tags$1.namespace, class: "cmt-namespace" },
+        { tag: tags$1.macroName, class: "cmt-macroName" },
+        { tag: tags$1.propertyName, class: "cmt-propertyName" },
+        { tag: tags$1.operator, class: "cmt-operator" },
+        { tag: tags$1.comment, class: "cmt-comment" },
+        { tag: tags$1.meta, class: "cmt-meta" },
+        { tag: tags$1.invalid, class: "cmt-invalid" },
+        { tag: tags$1.punctuation, class: "cmt-punctuation" }
+    ]);
 
     class SelectedDiagnostic {
         constructor(from, to, diagnostic) {
@@ -16245,22 +16590,22 @@ const cm = (function () {
         });
         return found;
     }
-    function maybeEnableLint(state) {
-        return state.field(lintState, false) ? undefined : { append: [
-                lintState,
-                EditorView.decorations.compute([lintState], state => {
-                    let { selected, panel } = state.field(lintState);
-                    return !selected || !panel || selected.from == selected.to ? Decoration.none : Decoration.set([
-                        activeMark.range(selected.from, selected.to)
-                    ]);
-                }),
-                panels(),
-                hoverTooltip(lintTooltip),
-                baseTheme$8
-            ] };
+    function maybeEnableLint(state, effects) {
+        return state.field(lintState, false) ? effects : effects.concat(StateEffect.appendConfig.of([
+            lintState,
+            EditorView.decorations.compute([lintState], state => {
+                let { selected, panel } = state.field(lintState);
+                return !selected || !panel || selected.from == selected.to ? Decoration.none : Decoration.set([
+                    activeMark.range(selected.from, selected.to)
+                ]);
+            }),
+            panels(),
+            hoverTooltip(lintTooltip),
+            baseTheme
+        ]));
     }
     const setDiagnosticsEffect = StateEffect.define();
-    const togglePanel$1 = StateEffect.define();
+    const togglePanel = StateEffect.define();
     const movePanelSelection = StateEffect.define();
     const lintState = StateField.define({
         create() {
@@ -16280,7 +16625,7 @@ const cm = (function () {
                     let ranges = Decoration.set(effect.value.map((d) => {
                         return d.from < d.to
                             ? Decoration.mark({
-                                attributes: { class: themeClass("lintRange." + d.severity) },
+                                attributes: { class: "cm-lintRange cm-lintRange-" + d.severity },
                                 diagnostic: d
                             }).range(d.from, d.to)
                             : Decoration.widget({
@@ -16290,7 +16635,7 @@ const cm = (function () {
                     }));
                     value = new LintState(ranges, value.panel, findDiagnostic(ranges));
                 }
-                else if (effect.is(togglePanel$1)) {
+                else if (effect.is(togglePanel)) {
                     value = new LintState(value.diagnostics, effect.value ? LintPanel.open : null, value.selected);
                 }
                 else if (effect.is(movePanelSelection)) {
@@ -16302,7 +16647,7 @@ const cm = (function () {
         provide: f => [showPanel.computeN([f], s => { let { panel } = s.field(f); return panel ? [panel] : []; }),
             EditorView.decorations.from(f, s => s.diagnostics)]
     });
-    const activeMark = Decoration.mark({ class: themeClass("lintRange.active") });
+    const activeMark = Decoration.mark({ class: "cm-lintRange cm-lintRange-active" });
     function lintTooltip(view, pos, side) {
         let { diagnostics } = view.state.field(lintState);
         let found = [], stackStart = 2e8, stackEnd = 0;
@@ -16320,7 +16665,7 @@ const cm = (function () {
             pos: stackStart,
             end: stackEnd,
             above: view.state.doc.lineAt(stackStart).to < stackEnd,
-            style: "lint",
+            class: "cm-tooltip-lint",
             create() {
                 return { dom: crelt("ul", found.map(d => renderDiagnostic(view, d, false))) };
             }
@@ -16330,8 +16675,7 @@ const cm = (function () {
     const openLintPanel = (view) => {
         let field = view.state.field(lintState, false);
         if (!field || !field.panel)
-            view.dispatch({ effects: togglePanel$1.of(true),
-                reconfigure: maybeEnableLint(view.state) });
+            view.dispatch({ effects: maybeEnableLint(view.state, [togglePanel.of(true)]) });
         let panel = getPanel(view, LintPanel.open);
         if (panel)
             panel.dom.querySelector(".cm-panel-lint ul").focus();
@@ -16342,7 +16686,7 @@ const cm = (function () {
         let field = view.state.field(lintState, false);
         if (!field || !field.panel)
             return false;
-        view.dispatch({ effects: togglePanel$1.of(false) });
+        view.dispatch({ effects: togglePanel.of(false) });
         return true;
     };
     /// Move the selection to the next diagnostic.
@@ -16385,7 +16729,7 @@ const cm = (function () {
     function renderDiagnostic(view, diagnostic, inPanel) {
         var _a;
         let keys = inPanel ? assignKeys(diagnostic.actions) : [];
-        return crelt("li", { class: themeClass("diagnostic." + diagnostic.severity) }, crelt("span", { class: themeClass("diagnosticText") }, diagnostic.message), (_a = diagnostic.actions) === null || _a === void 0 ? void 0 : _a.map((action, i) => {
+        return crelt("li", { class: "cm-diagnostic cm-diagnostic-" + diagnostic.severity }, crelt("span", { class: "cm-diagnosticText" }, diagnostic.message), (_a = diagnostic.actions) === null || _a === void 0 ? void 0 : _a.map((action, i) => {
             let click = (e) => {
                 e.preventDefault();
                 let found = findDiagnostic(view.state.field(lintState).diagnostics, diagnostic);
@@ -16397,11 +16741,12 @@ const cm = (function () {
                 crelt("u", name.slice(keyIndex, keyIndex + 1)),
                 name.slice(keyIndex + 1)];
             return crelt("button", {
-                class: themeClass("diagnosticAction"),
+                class: "cm-diagnosticAction",
                 onclick: click,
-                onmousedown: click
+                onmousedown: click,
+                "aria-label": ` Action: ${name}${keyIndex < 0 ? "" : ` (access key "${keys[i]})"`}.`
             }, nameElt);
-        }), diagnostic.source && crelt("div", { class: themeClass("diagnosticSource") }, diagnostic.source));
+        }), diagnostic.source && crelt("div", { class: "cm-diagnosticSource" }, diagnostic.source));
     }
     class DiagnosticWidget extends WidgetType {
         constructor(diagnostic) {
@@ -16410,7 +16755,7 @@ const cm = (function () {
         }
         eq(other) { return other.diagnostic == this.diagnostic; }
         toDOM() {
-            return crelt("span", { class: themeClass("lintPoint." + this.diagnostic.severity) });
+            return crelt("span", { class: "cm-lintPoint cm-lintPoint-" + this.diagnostic.severity });
         }
     }
     class PanelItem {
@@ -16418,6 +16763,7 @@ const cm = (function () {
             this.diagnostic = diagnostic;
             this.id = "item_" + Math.floor(Math.random() * 0xffffffff).toString(16);
             this.dom = renderDiagnostic(view, diagnostic, true);
+            this.dom.id = this.id;
             this.dom.setAttribute("role", "option");
         }
     }
@@ -16590,7 +16936,7 @@ const cm = (function () {
                 effects: movePanelSelection.of(selection)
             });
         }
-        get style() { return "lint"; }
+        get class() { return "cm-panel-lint"; }
         static open(view) { return new LintPanel(view); }
     }
     function underline(color) {
@@ -16601,16 +16947,16 @@ const cm = (function () {
   </svg>`;
         return `url('data:image/svg+xml;base64,${btoa(svg)}')`;
     }
-    const baseTheme$8 = EditorView.baseTheme({
-        $diagnostic: {
+    const baseTheme = EditorView.baseTheme({
+        ".cm-diagnostic": {
             padding: "3px 6px 3px 8px",
             marginLeft: "-1px",
             display: "block"
         },
-        "$diagnostic.error": { borderLeft: "5px solid #d11" },
-        "$diagnostic.warning": { borderLeft: "5px solid orange" },
-        "$diagnostic.info": { borderLeft: "5px solid #999" },
-        $diagnosticAction: {
+        ".cm-diagnostic-error": { borderLeft: "5px solid #d11" },
+        ".cm-diagnostic-warning": { borderLeft: "5px solid orange" },
+        ".cm-diagnostic-info": { borderLeft: "5px solid #999" },
+        ".cm-diagnosticAction": {
             font: "inherit",
             border: "none",
             padding: "2px 4px",
@@ -16619,19 +16965,19 @@ const cm = (function () {
             borderRadius: "3px",
             marginLeft: "8px"
         },
-        $diagnosticSource: {
+        ".cm-diagnosticSource": {
             fontSize: "70%",
             opacity: .7
         },
-        $lintRange: {
+        ".cm-lintRange": {
             backgroundPosition: "left bottom",
             backgroundRepeat: "repeat-x"
         },
-        "$lintRange.error": { backgroundImage: underline("#d11") },
-        "$lintRange.warning": { backgroundImage: underline("orange") },
-        "$lintRange.info": { backgroundImage: underline("#999") },
-        "$lintRange.active": { backgroundColor: "#ffdd9980" },
-        $lintPoint: {
+        ".cm-lintRange-error": { backgroundImage: underline("#d11") },
+        ".cm-lintRange-warning": { backgroundImage: underline("orange") },
+        ".cm-lintRange-info": { backgroundImage: underline("#999") },
+        ".cm-lintRange-active": { backgroundColor: "#ffdd9980" },
+        ".cm-lintPoint": {
             position: "relative",
             "&:after": {
                 content: '""',
@@ -16643,13 +16989,13 @@ const cm = (function () {
                 borderBottom: "4px solid #d11"
             }
         },
-        "$lintPoint.warning": {
+        ".cm-lintPoint-warning": {
             "&:after": { borderBottomColor: "orange" }
         },
-        "$lintPoint.info": {
+        ".cm-lintPoint-info": {
             "&:after": { borderBottomColor: "#999" }
         },
-        "$panel.lint": {
+        ".cm-panel.cm-panel-lint": {
             position: "relative",
             "& ul": {
                 maxHeight: "100px",
@@ -16679,7 +17025,7 @@ const cm = (function () {
                 margin: 0
             }
         },
-        "$tooltip.lint": {
+        ".cm-tooltip.cm-tooltip-lint": {
             padding: 0,
             margin: 0
         }
@@ -16700,7 +17046,7 @@ const cm = (function () {
     ///  - [custom selection drawing](#view.drawSelection)
     ///  - [multiple selections](#state.EditorState^allowMultipleSelections)
     ///  - [reindentation on input](#language.indentOnInput)
-    ///  - [the default highlight style](#highlight.defaultHighlightStyle)
+    ///  - [the default highlight style](#highlight.defaultHighlightStyle) (as fallback)
     ///  - [bracket matching](#matchbrackets.bracketMatching)
     ///  - [bracket closing](#closebrackets.closeBrackets)
     ///  - [autocompletion](#autocomplete.autocompletion)
@@ -16727,7 +17073,7 @@ const cm = (function () {
         drawSelection(),
         EditorState.allowMultipleSelections.of(true),
         indentOnInput(),
-        Prec.fallback(defaultHighlightStyle),
+        defaultHighlightStyle.fallback,
         bracketMatching(),
         closeBrackets(),
         autocompletion(),
@@ -16753,10 +17099,8 @@ const cm = (function () {
     class Stack {
         /// @internal
         constructor(
-        /// A group of values that the stack will share with all
-        /// split instances
-        ///@internal
-        cx, 
+        /// A the parse that this stack is part of @internal
+        p, 
         /// Holds state, pos, value stack pos (15 bits array index, 15 bits
         /// buffer index) triplets for all but the top state
         /// @internal
@@ -16787,13 +17131,15 @@ const cm = (function () {
         // starts writing.
         /// @internal
         bufferBase, 
+        /// @internal
+        curContext, 
         // A parent stack from which this was split off, if any. This is
         // set up so that it always points to a stack that has some
         // additional buffer content, never to a stack with an equal
         // `bufferBase`.
         /// @internal
         parent) {
-            this.cx = cx;
+            this.p = p;
             this.stack = stack;
             this.state = state;
             this.reducePos = reducePos;
@@ -16801,6 +17147,7 @@ const cm = (function () {
             this.score = score;
             this.buffer = buffer;
             this.bufferBase = bufferBase;
+            this.curContext = curContext;
             this.parent = parent;
         }
         /// @internal
@@ -16809,9 +17156,15 @@ const cm = (function () {
         }
         // Start an empty stack
         /// @internal
-        static start(cx, state, pos = 0) {
-            return new Stack(cx, [], state, pos, pos, 0, [], 0, null);
+        static start(p, state, pos = 0) {
+            let cx = p.parser.context;
+            return new Stack(p, [], state, pos, pos, 0, [], 0, cx ? new StackContext(cx, cx.start) : null, null);
         }
+        /// The stack's current [context](#lezer.ContextTracker) value, if
+        /// any. Its type will depend on the context tracker's type
+        /// parameter, or it will be `null` if there is no context
+        /// tracker.
+        get context() { return this.curContext ? this.curContext.context : null; }
         // Push a state onto the stack, tracking its start position as well
         // as the buffer base at that point.
         /// @internal
@@ -16823,7 +17176,7 @@ const cm = (function () {
         /// @internal
         reduce(action) {
             let depth = action >> 19 /* ReduceDepthShift */, type = action & 65535 /* ValueMask */;
-            let { parser } = this.cx;
+            let { parser } = this.p;
             let dPrec = parser.dynamicPrecedence(type);
             if (dPrec)
                 this.score += dPrec;
@@ -16833,6 +17186,7 @@ const cm = (function () {
                 if (type < parser.minRepeatTerm)
                     this.storeNode(type, this.reducePos, this.reducePos, 4, true);
                 this.pushState(parser.getGoto(this.state, type, true), this.reducePos);
+                this.reduceContext(type);
                 return;
             }
             // Find the base index into `this.stack`, content after which will
@@ -16857,6 +17211,7 @@ const cm = (function () {
             }
             while (this.stack.length > base)
                 this.stack.pop();
+            this.reduceContext(type);
         }
         // Shift a value into the buffer
         /// @internal
@@ -16905,7 +17260,7 @@ const cm = (function () {
                 this.pushState(action & 65535 /* ValueMask */, this.pos);
             }
             else if ((action & 262144 /* StayFlag */) == 0) { // Regular shift
-                let start = this.pos, nextState = action, { parser } = this.cx;
+                let start = this.pos, nextState = action, { parser } = this.p;
                 if (nextEnd > this.pos || next <= parser.maxNode) {
                     this.pos = nextEnd;
                     if (!parser.stateFlag(nextState, 1 /* Skipped */))
@@ -16914,9 +17269,10 @@ const cm = (function () {
                 this.pushState(nextState, start);
                 if (next <= parser.maxNode)
                     this.buffer.push(next, start, nextEnd, 4);
+                this.shiftContext(next);
             }
             else { // Shift-and-stay, which means this is a skipped token
-                if (next <= this.cx.parser.maxNode)
+                if (next <= this.p.parser.maxNode)
                     this.buffer.push(next, this.pos, nextEnd, 4);
                 this.pos = nextEnd;
             }
@@ -16933,15 +17289,17 @@ const cm = (function () {
         // the result of running a nested parser.
         /// @internal
         useNode(value, next) {
-            let index = this.cx.reused.length - 1;
-            if (index < 0 || this.cx.reused[index] != value) {
-                this.cx.reused.push(value);
+            let index = this.p.reused.length - 1;
+            if (index < 0 || this.p.reused[index] != value) {
+                this.p.reused.push(value);
                 index++;
             }
             let start = this.pos;
             this.reducePos = this.pos = start + value.length;
             this.pushState(next, start);
             this.buffer.push(index, start, this.reducePos, -1 /* size < 0 means this is a reused value */);
+            if (this.curContext)
+                this.updateContext(this.curContext.tracker.reuse(this.curContext.context, value, this.p.input, this));
         }
         // Split the stack. Due to the buffer sharing and the fact
         // that `this.stack` tends to stay quite shallow, this isn't very
@@ -16960,12 +17318,12 @@ const cm = (function () {
             // Make sure parent points to an actual parent with content, if there is such a parent.
             while (parent && base == parent.bufferBase)
                 parent = parent.parent;
-            return new Stack(this.cx, this.stack.slice(), this.state, this.reducePos, this.pos, this.score, buffer, base, parent);
+            return new Stack(this.p, this.stack.slice(), this.state, this.reducePos, this.pos, this.score, buffer, base, this.curContext, parent);
         }
         // Try to recover from an error by 'deleting' (ignoring) one token.
         /// @internal
         recoverByDelete(next, nextEnd) {
-            let isNode = next <= this.cx.parser.maxNode;
+            let isNode = next <= this.p.parser.maxNode;
             if (isNode)
                 this.storeNode(next, this.pos, nextEnd);
             this.storeNode(0 /* Err */, this.pos, nextEnd, isNode ? 8 : 4);
@@ -16978,7 +17336,7 @@ const cm = (function () {
         /// given token when it applies.
         canShift(term) {
             for (let sim = new SimulatedStack(this);;) {
-                let action = this.cx.parser.stateSlot(sim.top, 4 /* DefaultReduce */) || this.cx.parser.hasAction(sim.top, term);
+                let action = this.p.parser.stateSlot(sim.top, 4 /* DefaultReduce */) || this.p.parser.hasAction(sim.top, term);
                 if ((action & 65536 /* ReduceFlag */) == 0)
                     return true;
                 if (action == 0)
@@ -16989,11 +17347,11 @@ const cm = (function () {
         /// Find the start position of the rule that is currently being parsed.
         get ruleStart() {
             for (let state = this.state, base = this.stack.length;;) {
-                let force = this.cx.parser.stateSlot(state, 5 /* ForcedReduce */);
+                let force = this.p.parser.stateSlot(state, 5 /* ForcedReduce */);
                 if (!(force & 65536 /* ReduceFlag */))
                     return 0;
                 base -= 3 * (force >> 19 /* ReduceDepthShift */);
-                if ((force & 65535 /* ValueMask */) < this.cx.parser.minRepeatTerm)
+                if ((force & 65535 /* ValueMask */) < this.p.parser.minRepeatTerm)
                     return this.stack[base + 1];
                 state = this.stack[base];
             }
@@ -17017,8 +17375,12 @@ const cm = (function () {
         ///
         /// When `before` is given, this keeps scanning up the stack until
         /// it finds a match that starts before that position.
+        ///
+        /// Note that you have to be careful when using this in tokenizers,
+        /// since it's relatively easy to introduce data dependencies that
+        /// break incremental parsing by using this method.
         startOf(types, before) {
-            let state = this.state, frame = this.stack.length, { parser } = this.cx;
+            let state = this.state, frame = this.stack.length, { parser } = this.p;
             for (;;) {
                 let force = parser.stateSlot(state, 5 /* ForcedReduce */);
                 let depth = force >> 19 /* ReduceDepthShift */, term = force & 65535 /* ValueMask */;
@@ -17045,22 +17407,30 @@ const cm = (function () {
         recoverByInsert(next) {
             if (this.stack.length >= 300 /* MaxInsertStackDepth */)
                 return [];
-            let nextStates = this.cx.parser.nextStates(this.state);
-            if (nextStates.length > 4 /* MaxNext */ || this.stack.length >= 120 /* DampenInsertStackDepth */) {
-                let best = nextStates.filter(s => s != this.state && this.cx.parser.hasAction(s, next));
+            let nextStates = this.p.parser.nextStates(this.state);
+            if (nextStates.length > 4 /* MaxNext */ << 1 || this.stack.length >= 120 /* DampenInsertStackDepth */) {
+                let best = [];
+                for (let i = 0, s; i < nextStates.length; i += 2) {
+                    if ((s = nextStates[i + 1]) != this.state && this.p.parser.hasAction(s, next))
+                        best.push(nextStates[i], s);
+                }
                 if (this.stack.length < 120 /* DampenInsertStackDepth */)
-                    for (let i = 0; best.length < 4 /* MaxNext */ && i < nextStates.length; i++)
-                        if (best.indexOf(nextStates[i]) < 0)
-                            best.push(nextStates[i]);
+                    for (let i = 0; best.length < 4 /* MaxNext */ << 1 && i < nextStates.length; i += 2) {
+                        let s = nextStates[i + 1];
+                        if (!best.some((v, i) => (i & 1) && v == s))
+                            best.push(nextStates[i], s);
+                    }
                 nextStates = best;
             }
             let result = [];
-            for (let i = 0; i < nextStates.length && result.length < 4 /* MaxNext */; i++) {
-                if (nextStates[i] == this.state)
+            for (let i = 0; i < nextStates.length && result.length < 4 /* MaxNext */; i += 2) {
+                let s = nextStates[i + 1];
+                if (s == this.state)
                     continue;
                 let stack = this.split();
                 stack.storeNode(0 /* Err */, stack.pos, stack.pos, 4, true);
-                stack.pushState(nextStates[i], this.pos);
+                stack.pushState(s, this.pos);
+                stack.shiftContext(nextStates[i]);
                 stack.score -= 200 /* Token */;
                 result.push(stack);
             }
@@ -17070,10 +17440,10 @@ const cm = (function () {
         // be done.
         /// @internal
         forceReduce() {
-            let reduce = this.cx.parser.stateSlot(this.state, 5 /* ForcedReduce */);
+            let reduce = this.p.parser.stateSlot(this.state, 5 /* ForcedReduce */);
             if ((reduce & 65536 /* ReduceFlag */) == 0)
                 return false;
-            if (!this.cx.parser.validAction(this.state, reduce)) {
+            if (!this.p.parser.validAction(this.state, reduce)) {
                 this.storeNode(0 /* Err */, this.reducePos, this.reducePos, 4, true);
                 this.score -= 100 /* Reduce */;
             }
@@ -17082,7 +17452,7 @@ const cm = (function () {
         }
         /// @internal
         forceAll() {
-            while (!this.cx.parser.stateFlag(this.state, 2 /* Accepting */) && this.forceReduce()) { }
+            while (!this.p.parser.stateFlag(this.state, 2 /* Accepting */) && this.forceReduce()) { }
             return this;
         }
         /// Check whether this state has no further actions (assumed to be a direct descendant of the
@@ -17091,7 +17461,7 @@ const cm = (function () {
         get deadEnd() {
             if (this.stack.length != 3)
                 return false;
-            let { parser } = this.cx;
+            let { parser } = this.p;
             return parser.data[parser.stateSlot(this.state, 1 /* Actions */)] == 65535 /* End */ &&
                 !parser.stateSlot(this.state, 4 /* DefaultReduce */);
         }
@@ -17112,10 +17482,42 @@ const cm = (function () {
             return true;
         }
         /// Get the parser used by this stack.
-        get parser() { return this.cx.parser; }
+        get parser() { return this.p.parser; }
         /// Test whether a given dialect (by numeric ID, as exported from
         /// the terms file) is enabled.
-        dialectEnabled(dialectID) { return this.cx.parser.dialect.flags[dialectID]; }
+        dialectEnabled(dialectID) { return this.p.parser.dialect.flags[dialectID]; }
+        shiftContext(term) {
+            if (this.curContext)
+                this.updateContext(this.curContext.tracker.shift(this.curContext.context, term, this.p.input, this));
+        }
+        reduceContext(term) {
+            if (this.curContext)
+                this.updateContext(this.curContext.tracker.reduce(this.curContext.context, term, this.p.input, this));
+        }
+        /// @internal
+        emitContext() {
+            let cx = this.curContext;
+            if (!cx.tracker.strict)
+                return;
+            let last = this.buffer.length - 1;
+            if (last < 0 || this.buffer[last] != -2)
+                this.buffer.push(cx.hash, this.reducePos, this.reducePos, -2);
+        }
+        updateContext(context) {
+            if (context != this.curContext.context) {
+                let newCx = new StackContext(this.curContext.tracker, context);
+                if (newCx.hash != this.curContext.hash)
+                    this.emitContext();
+                this.curContext = newCx;
+            }
+        }
+    }
+    class StackContext {
+        constructor(tracker, context) {
+            this.tracker = tracker;
+            this.context = context;
+            this.hash = tracker.hash(context);
+        }
     }
     var Recover;
     (function (Recover) {
@@ -17145,7 +17547,7 @@ const cm = (function () {
             else {
                 this.offset -= (depth - 1) * 3;
             }
-            let goto = this.stack.cx.parser.getGoto(this.rest[this.offset - 3], term, true);
+            let goto = this.stack.p.parser.getGoto(this.rest[this.offset - 3], term, true);
             this.top = goto;
         }
     }
@@ -17253,7 +17655,7 @@ const cm = (function () {
     // long as new states with the a matching group mask can be reached,
     // and updating `token` when it matches a token.
     function readToken(data, input, token, stack, group) {
-        let state = 0, groupMask = 1 << group, dialect = stack.cx.parser.dialect;
+        let state = 0, groupMask = 1 << group, dialect = stack.p.parser.dialect;
         scan: for (let pos = token.start;;) {
             if ((groupMask & data[state]) == 0)
                 break;
@@ -17265,7 +17667,7 @@ const cm = (function () {
                 if ((data[i + 1] & groupMask) > 0) {
                     let term = data[i];
                     if (dialect.allows(term) &&
-                        (token.value == -1 || token.value == term || stack.cx.parser.overrides(term, token.value))) {
+                        (token.value == -1 || token.value == term || stack.p.parser.overrides(term, token.value))) {
                         token.accept(term, pos);
                         break;
                     }
@@ -17336,7 +17738,7 @@ const cm = (function () {
             if (!(side < 0 ? cursor.childBefore(pos) : cursor.childAfter(pos)))
                 for (;;) {
                     if ((side < 0 ? cursor.to <= pos : cursor.from >= pos) && !cursor.type.isError)
-                        return side < 0 ? cursor.to - 1 : cursor.from + 1;
+                        return side < 0 ? Math.max(0, Math.min(cursor.to - 1, pos - 5)) : Math.min(tree.length, Math.max(cursor.from + 1, pos + 5));
                     if (side < 0 ? cursor.prevSibling() : cursor.nextSibling())
                         break;
                     if (!cursor.parent())
@@ -17344,7 +17746,7 @@ const cm = (function () {
                 }
         }
     }
-    class FragmentCursor {
+    class FragmentCursor$1 {
         constructor(fragments) {
             this.fragments = fragments;
             this.i = 0;
@@ -17425,6 +17827,7 @@ const cm = (function () {
             super(...arguments);
             this.extended = -1;
             this.mask = 0;
+            this.context = 0;
         }
         clear(start) {
             this.start = start;
@@ -17442,17 +17845,19 @@ const cm = (function () {
         getActions(stack, input) {
             let actionIndex = 0;
             let main = null;
-            let { parser } = stack.cx, { tokenizers } = parser;
+            let { parser } = stack.p, { tokenizers } = parser;
             let mask = parser.stateSlot(stack.state, 3 /* TokenizerMask */);
+            let context = stack.curContext ? stack.curContext.hash : 0;
             for (let i = 0; i < tokenizers.length; i++) {
                 if (((1 << i) & mask) == 0)
                     continue;
                 let tokenizer = tokenizers[i], token = this.tokens[i];
                 if (main && !tokenizer.fallback)
                     continue;
-                if (tokenizer.contextual || token.start != stack.pos || token.mask != mask) {
+                if (tokenizer.contextual || token.start != stack.pos || token.mask != mask || token.context != context) {
                     this.updateCachedToken(token, tokenizer, stack, input);
                     token.mask = mask;
+                    token.context = context;
                 }
                 if (token.value != 0 /* Err */) {
                     let startIndex = actionIndex;
@@ -17472,7 +17877,7 @@ const cm = (function () {
                 main = dummyToken;
                 main.start = stack.pos;
                 if (stack.pos == input.length)
-                    main.accept(stack.cx.parser.eofTerm, stack.pos);
+                    main.accept(stack.p.parser.eofTerm, stack.pos);
                 else
                     main.accept(0 /* Err */, stack.pos + 1);
             }
@@ -17483,11 +17888,11 @@ const cm = (function () {
             token.clear(stack.pos);
             tokenizer.token(input, token, stack);
             if (token.value > -1) {
-                let { parser } = stack.cx;
+                let { parser } = stack.p;
                 for (let i = 0; i < parser.specialized.length; i++)
                     if (parser.specialized[i] == token.value) {
                         let result = parser.specializers[i](input.read(token.start, token.end), stack);
-                        if (result >= 0 && stack.cx.parser.dialect.allows(result >> 1)) {
+                        if (result >= 0 && stack.p.parser.dialect.allows(result >> 1)) {
                             if ((result & 1) == 0 /* Specialize */)
                                 token.value = result >> 1;
                             else
@@ -17497,7 +17902,7 @@ const cm = (function () {
                     }
             }
             else if (stack.pos == input.length) {
-                token.accept(stack.cx.parser.eofTerm, stack.pos);
+                token.accept(stack.p.parser.eofTerm, stack.pos);
             }
             else {
                 token.accept(0 /* Err */, stack.pos + 1);
@@ -17514,7 +17919,7 @@ const cm = (function () {
             return index;
         }
         addActions(stack, token, end, index) {
-            let { state } = stack, { parser } = stack.cx, { data } = parser;
+            let { state } = stack, { parser } = stack.p, { data } = parser;
             for (let set = 0; set < 2; set++) {
                 for (let i = parser.stateSlot(state, set ? 2 /* Skip */ : 1 /* Actions */);; i += 3) {
                     if (data[i] == 65535 /* End */) {
@@ -17562,7 +17967,7 @@ const cm = (function () {
             this.topTerm = parser.top[1];
             this.stacks = [Stack.start(this, parser.top[0], this.startPos)];
             let fragments = context === null || context === void 0 ? void 0 : context.fragments;
-            this.fragments = fragments && fragments.length ? new FragmentCursor(fragments) : null;
+            this.fragments = fragments && fragments.length ? new FragmentCursor$1(fragments) : null;
         }
         // Move the parser forward. This will process all parse stacks at
         // `this.pos` and try to advance them to a further position. If no
@@ -17679,9 +18084,10 @@ const cm = (function () {
             let start = stack.pos, { input, parser } = this;
             let base = verbose ? this.stackID(stack) + " -> " : "";
             if (this.fragments) {
+                let strictCx = stack.curContext && stack.curContext.tracker.strict, cxHash = strictCx ? stack.curContext.hash : 0;
                 for (let cached = this.fragments.nodeAt(start); cached;) {
                     let match = this.parser.nodeSet.types[cached.type.id] == cached.type ? parser.getGoto(stack.state, cached.type.id) : -1;
-                    if (match > -1 && cached.length) {
+                    if (match > -1 && cached.length && (!strictCx || (cached.contextHash || 0) == cxHash)) {
                         stack.useNode(cached, match);
                         if (verbose)
                             console.log(base + this.stackID(stack) + ` (via reuse of ${parser.getName(cached.type.id)})`);
@@ -17810,6 +18216,8 @@ const cm = (function () {
         }
         // Convert the stack's buffer to a syntax tree.
         stackToTree(stack, pos = stack.pos) {
+            if (this.parser.context)
+                stack.emitContext();
             return Tree.build({ buffer: StackBufferCursor.create(stack),
                 nodeSet: this.parser.nodeSet,
                 topID: this.topTerm,
@@ -17886,6 +18294,26 @@ const cm = (function () {
         }
         allows(term) { return !this.disabled || this.disabled[term] == 0; }
     }
+    const id = x => x;
+    /// Context trackers are used to track stateful context (such as
+    /// indentation in the Python grammar, or parent elements in the XML
+    /// grammar) needed by external tokenizers. You declare them in a
+    /// grammar file as `@context exportName from "module"`.
+    ///
+    /// Context values should be immutable, and can be updated (replaced)
+    /// on shift or reduce actions.
+    class ContextTracker {
+        /// The export used in a `@context` declaration should be of this
+        /// type.
+        constructor(spec) {
+            this.start = spec.start;
+            this.shift = spec.shift || id;
+            this.reduce = spec.reduce || id;
+            this.reuse = spec.reuse || id;
+            this.hash = spec.hash;
+            this.strict = spec.strict !== false;
+        }
+    }
     /// A parser holds the parse tables for a given grammar, as generated
     /// by `lezer-generator`.
     class Parser {
@@ -17895,13 +18323,13 @@ const cm = (function () {
             this.bufferLength = DefaultBufferLength;
             /// @internal
             this.strict = false;
-            this.nextStateCache = [];
             this.cachedDialect = null;
             if (spec.version != 13 /* Version */)
                 throw new RangeError(`Parser version (${spec.version}) doesn't match runtime version (${13 /* Version */})`);
             let tokenArray = decodeArray(spec.tokenData);
             let nodeNames = spec.nodeNames.split(" ");
             this.minRepeatTerm = nodeNames.length;
+            this.context = spec.context;
             for (let i = 0; i < spec.repeatNodeCount; i++)
                 nodeNames.push("");
             let nodeProps = [];
@@ -17956,8 +18384,6 @@ const cm = (function () {
             this.tokenPrecTable = spec.tokenPrec;
             this.termNames = spec.termNames || null;
             this.maxNode = this.nodeSet.types.length - 1;
-            for (let i = 0, l = this.states.length / 6 /* Size */; i < l; i++)
-                this.nextStateCache[i] = null;
             this.dialect = this.parseDialect();
             this.top = this.topRules[Object.keys(this.topRules)[0]];
         }
@@ -18045,9 +18471,6 @@ const cm = (function () {
         /// Get the states that can follow this one through shift actions or
         /// goto jumps. @internal
         nextStates(state) {
-            let cached = this.nextStateCache[state];
-            if (cached)
-                return cached;
             let result = [];
             for (let i = this.stateSlot(state, 1 /* Actions */);; i += 3) {
                 if (this.data[i] == 65535 /* End */) {
@@ -18056,21 +18479,13 @@ const cm = (function () {
                     else
                         break;
                 }
-                if ((this.data[i + 2] & (65536 /* ReduceFlag */ >> 16)) == 0 && result.indexOf(this.data[i + 1]) < 0)
-                    result.push(this.data[i + 1]);
-            }
-            let table = this.goto, max = table[0];
-            for (let term = 0; term < max; term++) {
-                for (let pos = table[term + 1];;) {
-                    let groupTag = table[pos++], target = table[pos++];
-                    for (let end = pos + (groupTag >> 1); pos < end; pos++)
-                        if (table[pos] == state && result.indexOf(target) < 0)
-                            result.push(target);
-                    if (groupTag & 1)
-                        break;
+                if ((this.data[i + 2] & (65536 /* ReduceFlag */ >> 16)) == 0) {
+                    let value = this.data[i + 1];
+                    if (!result.some((v, i) => (i & 1) && v == value))
+                        result.push(this.data[i], value);
                 }
             }
-            return this.nextStateCache[state] = result;
+            return result;
         }
         /// @internal
         overrides(token, prev) {
@@ -18123,6 +18538,8 @@ const cm = (function () {
         get eofTerm() { return this.maxNode + 1; }
         /// Tells you whether this grammar has any nested grammars.
         get hasNested() { return this.nested.length > 0; }
+        /// The type of top node produced by the parser.
+        get topNode() { return this.nodeSet.types[this.top[1]]; }
         /// @internal
         dynamicPrecedence(term) {
             let prec = this.dynamicPrecedences;
@@ -18162,8 +18579,8 @@ const cm = (function () {
     function findFinished(stacks) {
         let best = null;
         for (let stack of stacks) {
-            if (stack.pos == stack.cx.input.length &&
-                stack.cx.parser.stateFlag(stack.state, 2 /* Accepting */) &&
+            if (stack.pos == stack.p.input.length &&
+                stack.p.parser.stateFlag(stack.state, 2 /* Accepting */) &&
                 (!best || best.score < stack.score))
                 best = stack;
         }
@@ -18171,14 +18588,13 @@ const cm = (function () {
     }
 
     // This file was generated by lezer-generator. You probably shouldn't edit it.
-    const 
-      noSemi = 268,
+    const noSemi = 269,
       incdec = 1,
       incdecPrefix = 2,
-      templateContent = 269,
-      templateDollarBrace = 270,
-      templateEnd = 271,
-      insertSemi = 272,
+      templateContent = 270,
+      templateDollarBrace = 271,
+      templateEnd = 272,
+      insertSemi = 273,
       TSExtends = 3,
       Dialect_ts = 1;
 
@@ -18186,9 +18602,9 @@ const cm = (function () {
        expressed by lezer's built-in tokenizer. */
 
     const newline = [10, 13, 8232, 8233];
-    const space = [9, 11, 12, 32, 133, 160, 5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200, 8201, 8202, 8239, 8287, 12288];
+    const space$2 = [9, 11, 12, 32, 133, 160, 5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200, 8201, 8202, 8239, 8287, 12288];
 
-    const braceR = 125, braceL = 123, semicolon = 59, slash = 47, star = 42,
+    const braceR = 125, braceL = 123, semicolon = 59, slash$1 = 47, star = 42,
           plus = 43, minus = 45, dollar = 36, backtick = 96, backslash = 92;
 
     // FIXME this should technically enter block comments
@@ -18196,7 +18612,7 @@ const cm = (function () {
       for (let i = pos - 1; i >= 0; i--) {
         let prev = input.get(i);
         if (newline.indexOf(prev) > -1) return true
-        if (space.indexOf(prev) < 0) break
+        if (space$2.indexOf(prev) < 0) break
       }
       return false
     }
@@ -18209,10 +18625,10 @@ const cm = (function () {
 
     const noSemicolon = new ExternalTokenizer((input, token, stack) => {
       let pos = token.start, next = input.get(pos++);
-      if (space.indexOf(next) > -1 || newline.indexOf(next) > -1) return
-      if (next == slash) {
+      if (space$2.indexOf(next) > -1 || newline.indexOf(next) > -1) return
+      if (next == slash$1) {
         let after = input.get(pos++);
-        if (after == slash || after == star) return
+        if (after == slash$1 || after == star) return
       }
       if (next != braceR && next != semicolon && next != -1 && !newlineBefore(input, token.start) &&
           stack.canShift(noSemi))
@@ -18258,35 +18674,35 @@ const cm = (function () {
     }
 
     // This file was generated by lezer-generator. You probably shouldn't edit it.
-    const spec_identifier = {__proto__:null,export:16, as:21, from:25, default:30, async:35, function:36, this:46, true:54, false:54, void:58, typeof:62, null:76, super:78, new:112, await:129, yield:131, delete:132, class:142, extends:144, public:181, private:181, protected:181, readonly:183, in:202, instanceof:204, import:236, keyof:285, unique:289, infer:295, is:329, abstract:349, implements:351, type:353, let:356, var:358, const:360, interface:367, enum:371, namespace:377, module:379, declare:383, global:387, for:408, of:417, while:420, with:424, do:428, if:432, else:434, switch:438, case:444, try:450, catch:452, finally:454, return:458, throw:462, break:466, continue:470, debugger:474};
-    const spec_word = {__proto__:null,async:99, get:101, set:103, public:151, private:151, protected:151, static:153, abstract:155, readonly:159, new:333};
+    const spec_identifier$1 = {__proto__:null,export:16, as:21, from:25, default:30, async:35, function:36, this:46, true:54, false:54, void:58, typeof:62, null:76, super:78, new:112, await:129, yield:131, delete:132, class:142, extends:144, public:181, private:181, protected:181, readonly:183, in:202, instanceof:204, import:236, keyof:287, unique:291, infer:297, is:331, abstract:351, implements:353, type:355, let:358, var:360, const:362, interface:369, enum:373, namespace:379, module:381, declare:385, global:389, for:410, of:419, while:422, with:426, do:430, if:434, else:436, switch:440, case:446, try:452, catch:454, finally:456, return:460, throw:464, break:468, continue:472, debugger:476};
+    const spec_word = {__proto__:null,async:99, get:101, set:103, public:151, private:151, protected:151, static:153, abstract:155, readonly:159, new:335};
     const spec_LessThan = {__proto__:null,"<":119};
-    const parser = Parser.deserialize({
+    const parser$3 = Parser.deserialize({
       version: 13,
-      states: "$8YO]QYOOO&zQ!LdO'#CgO'ROSO'#DRO)ZQYO'#DWO)kQYO'#DcO)rQYO'#DmO-iQYO'#DsOOQO'#ET'#ETO-|QWO'#ESO.RQWO'#ESO.ZQ!LdO'#IfO2dQ!LdO'#IgO3QQWO'#EpO3VQpO'#FUOOQ!LS'#Ex'#ExO3_O!bO'#ExO3mQWO'#F]O4wQWO'#F[OOQ!LS'#Ig'#IgOOQ!LS'#If'#IfOOQQ'#JQ'#JQO4|QWO'#HdO5RQ!LYO'#HeOOQQ'#IZ'#IZOOQQ'#Hf'#HfQ]QYOOO)rQYO'#DeO5ZQWO'#GPO5`Q#tO'#ClO5nQWO'#ESO5yQ#tO'#EwO6eQWO'#GPO6jQWO'#GTO6uQWO'#GTO7TQWO'#GXO7TQWO'#GYO7TQWO'#G[O5ZQWO'#G_O7tQWO'#GbO9SQWO'#CcO9dQWO'#GoO9lQWO'#GuO9lQWO'#GwO]QYO'#GyO9lQWO'#G{O9lQWO'#HOO9qQWO'#HUO9vQ!LZO'#HYO)rQYO'#H[O:RQ!LZO'#H^O:^Q!LZO'#H`O5RQ!LYO'#HbO)rQYO'#IiOOOS'#Hg'#HgO:iOSO,59mOOQ!LS,59m,59mO<zQbO'#CgO=UQYO'#HhO=cQWO'#IkO?bQbO'#IkO'^QYO'#IkO?iQWO,59rO@PQ&jO'#D]O@xQWO'#ETOAVQWO'#IuOAbQWO'#ItOAjQWO,5:qOAoQWO'#IsOAvQWO'#DtO5`Q#tO'#ERO5qQWO'#ESOBUQ`O'#EwOOQ!LS,59},59}OB^QYO,59}OD[Q!LdO,5:XODxQWO,5:_OEcQ!LYO'#IrO6jQWO'#IqOEjQWO'#IqOErQWO,5:pOEwQWO'#IqOFVQYO,5:nOHSQWO'#EPOIZQWO,5:nOJgQWO'#DgOJnQYO'#DlOJxQ&jO,5:wO)rQYO,5:wOOQQ'#Eh'#EhOOQQ'#Ej'#EjO)rQYO,5:xO)rQYO,5:xO)rQYO,5:xO)rQYO,5:xO)rQYO,5:xO)rQYO,5:xO)rQYO,5:xO)rQYO,5:xO)rQYO,5:xO)rQYO,5:xO)rQYO,5:xOOQQ'#En'#EnOJ}QYO,5;XOOQ!LS,5;^,5;^OOQ!LS,5;_,5;_OLzQWO,5;_OOQ!LS,5;`,5;`O)rQYO'#HrOMPQ!LYO,5;xOHSQWO,5:xO)rQYO,5;[OM|QpO'#IyOMkQpO'#IyONTQpO'#IyONfQpO,5;gOOQO,5;p,5;pO!!qQYO'#FWOOOO'#Hq'#HqO3_O!bO,5;dO!!xQpO'#FYOOQ!LS,5;d,5;dO!#fQ,UO'#CqOOQ!LS'#Ct'#CtO!#yQWO'#CtO!$aQ#tO,5;uO!$hQWO,5;wO!%qQWO'#FgO!&OQWO'#FhO!&TQWO'#FlO!'VQ&jO'#FpO!'xQ,UO'#IdOOQ!LS'#Id'#IdO!(SQWO'#IcO!(bQWO'#IbOOQ!LS'#Cr'#CrOOQ!LS'#Cx'#CxO!(jQWO'#CzOI`QWO'#F_OI`QWO'#FaO!(oQWO'#FcOIUQWO'#FdO!(tQWO'#FjOI`QWO'#FoO!(yQWO'#EUO!)bQWO,5;vO]QYO,5>OOOQQ'#I^'#I^OOQQ,5>P,5>POOQQ-E;d-E;dO!+^Q!LdO,5:POOQ!LQ'#Co'#CoO!+}Q#tO,5<kOOQO'#Ce'#CeO!,`QWO'#CpO!,hQ!LYO'#I_O4wQWO'#I_O9qQWO,59WO!,vQpO,59WO!-OQ#tO,59WO!-ZQWO,5:nO5`Q#tO,59WO!-cQWO'#GnO!-kQWO'#JUO!-sQYO,5;aOJxQ&jO,5;cO!/pQWO,5=XO!/uQWO,5=XO!/zQWO,5=XO5RQ!LYO,5=XO5ZQWO,5<kO!0YQWO'#EVO!0kQ&jO'#EWOOQ!LQ'#Is'#IsO!0|Q!LYO'#JRO5RQ!LYO,5<oO7TQWO,5<vOOQO'#Cq'#CqO!1XQpO,5<sO!1aQ#tO,5<tO!1lQWO,5<vO!1qQ`O,5<yO9qQWO'#GdO5ZQWO'#GfO!1yQWO'#GfO5`Q#tO'#GiO!2OQWO'#GiOOQQ,5<|,5<|O!2TQWO'#GjO!2]QWO'#ClO!2bQWO,58}O!2lQWO,58}O!4kQYO,58}OOQQ,58},58}O!4xQ!LYO,58}O)rQYO,58}O!5TQYO'#GqOOQQ'#Gr'#GrOOQQ'#Gs'#GsO]QYO,5=ZO!5eQWO,5=ZO)rQYO'#DsO]QYO,5=aO]QYO,5=cO!5jQWO,5=eO]QYO,5=gO!5oQWO,5=jO!5tQYO,5=pOOQQ,5=t,5=tO)rQYO,5=tO5RQ!LYO,5=vOOQQ,5=x,5=xO!9rQWO,5=xOOQQ,5=z,5=zO!9rQWO,5=zOOQQ,5=|,5=|O!9wQ`O,5?TOOOS-E;e-E;eOOQ!LS1G/X1G/XO!9|QbO,5>SO)rQYO,5>SOOQO-E;f-E;fO!:WQWO,5?VO!:`QbO,5?VO!:gQWO,5?`OOQ!LS1G/^1G/^O!:oQpO'#DPOOQO'#Im'#ImO)rQYO'#ImO!;^QpO'#ImO!;{QpO'#D^O!<^Q&jO'#D^O!>fQYO'#D^O!>mQWO'#IlO!>uQWO,59wO!>zQWO'#EXO!?YQWO'#IvO!?bQWO,5:rO!?xQ&jO'#D^O)rQYO,5?aO!@SQWO'#HmO!:gQWO,5?`OOQ!LQ1G0]1G0]O!AYQ&jO'#DwOOQ!LS,5:`,5:`O)rQYO,5:`OHSQWO,5:`O!AaQWO,5:`O9qQWO,5:mO!,vQpO,5:mO!-OQ#tO,5:mOOQ!LS1G/i1G/iOOQ!LS1G/y1G/yOOQ!LQ'#EO'#EOO)rQYO,5?^O!AlQ!LYO,5?^O!A}Q!LYO,5?^O!BUQWO,5?]O!B^QWO'#HoO!BUQWO,5?]OOQ!LQ1G0[1G0[O6jQWO,5?]OOQ!LS1G0Y1G0YO!BxQ!LbO,5:kOOQ!LS'#Ff'#FfO!CfQ!LdO'#IdOFVQYO1G0YO!EeQ#tO'#InO!EoQWO,5:RO!EtQbO'#IoO)rQYO'#IoO!FOQWO,5:WOOQ!LS'#DP'#DPOOQ!LS1G0c1G0cO!FTQWO1G0cO!HfQ!LdO1G0dO!HmQ!LdO1G0dO!KQQ!LdO1G0dO!KXQ!LdO1G0dO!M`Q!LdO1G0dO!MsQ!LdO1G0dO#!dQ!LdO1G0dO#!kQ!LdO1G0dO#%OQ!LdO1G0dO#%VQ!LdO1G0dO#&zQ!LdO1G0dO#)tQ7^O'#CgO#+oQ7^O1G0sO#-mQ7^O'#IgOOQ!LS1G0y1G0yO#-wQ!LdO,5>^OOQ!LS-E;p-E;pO#.hQ!LdO1G0dO#0jQ!LdO1G0vO#1ZQpO,5;iO#1`QpO,5;jO#1eQpO'#FQO#1yQWO'#FPOOQO'#Iz'#IzOOQO'#Hp'#HpO#2OQpO1G1ROOQ!LS1G1R1G1ROOQO1G1Z1G1ZO#2^Q7^O'#IfO#4WQWO,5;rONtQYO,5;rOOOO-E;o-E;oOOQ!LS1G1O1G1OOOQ!LS,5;t,5;tO#4]QpO,5;tOOQ!LS,59`,59`O)rQYO1G1aOJxQ&jO'#HtO#4bQWO,5<YOOQ!LS,5<V,5<VOOQO'#Fz'#FzOI`QWO,5<eOOQO'#F|'#F|OI`QWO,5<gOI`QWO,5<iOOQO1G1c1G1cO#4mQ`O'#CoO#5QQ`O,5<RO#5XQWO'#I}O5ZQWO'#I}O#5gQWO,5<TOI`QWO,5<SO#5lQ`O'#FfO#5yQ`O'#JOO#6TQWO'#JOOHSQWO'#JOO#6YQWO,5<WOOQ!LQ'#Db'#DbO#6_QWO'#FiO#6jQpO'#FqO!'QQ&jO'#FqO!'QQ&jO'#FsO#6{QWO'#FtO!(tQWO'#FwOOQO'#Hv'#HvO#7QQ&jO,5<[OOQ!LS,5<[,5<[O#7XQ&jO'#FqO#7gQ&jO'#FrO#7oQ&jO'#FrOOQ!LS,5<j,5<jOI`QWO,5>}OI`QWO,5>}O#7tQWO'#HwO#8PQWO,5>|OOQ!LS'#Cg'#CgO#8sQ#tO,59fOOQ!LS,59f,59fO#9fQ#tO,5;yO#:XQ#tO,5;{O#:cQWO,5;}OOQ!LS,5<O,5<OO#:hQWO,5<UO#:mQ#tO,5<ZOFVQYO1G1bO#:}QWO1G1bOOQQ1G3j1G3jOOQ!LS1G/k1G/kOLzQWO1G/kOOQQ1G2V1G2VOHSQWO1G2VO)rQYO1G2VOHSQWO1G2VO#;SQWO1G2VO#;bQWO,59[O#<hQWO'#EPOOQ!LQ,5>y,5>yO#<rQ!LYO,5>yOOQQ1G.r1G.rO9qQWO1G.rO!,vQpO1G.rO#=QQWO1G0YO!-OQ#tO1G.rO#=VQWO'#CgO#=bQWO'#JVO#=jQWO,5=YO#=oQWO'#JVO#=tQWO'#IPO#>SQWO,5?pO#@OQbO1G0{OOQ!LS1G0}1G0}O5ZQWO1G2sO#@VQWO1G2sO#@[QWO1G2sO#@aQWO1G2sOOQQ1G2s1G2sO#@fQ#tO1G2VO6jQWO'#ItO6jQWO'#EXO6jQWO'#HyO#@wQ!LYO,5?mOOQQ1G2Z1G2ZO!1lQWO1G2bOHSQWO1G2_O#ASQWO1G2_OOQQ1G2`1G2`OHSQWO1G2`O#AXQWO1G2`O#AaQ&jO'#G^OOQQ1G2b1G2bO!'QQ&jO'#H{O!1qQ`O1G2eOOQQ1G2e1G2eOOQQ,5=O,5=OO#AiQ#tO,5=QO5ZQWO,5=QO#6{QWO,5=TO4wQWO,5=TO!,vQpO,5=TO!-OQ#tO,5=TO5`Q#tO,5=TO#AzQWO'#JTO#BVQWO,5=UOOQQ1G.i1G.iO#B[Q!LYO1G.iO#BgQWO1G.iO!(jQWO1G.iO5RQ!LYO1G.iO#BlQbO,5?rO#BvQWO,5?rO#CRQYO,5=]O#CYQWO,5=]O6jQWO,5?rOOQQ1G2u1G2uO]QYO1G2uOOQQ1G2{1G2{OOQQ1G2}1G2}O9lQWO1G3PO#C_QYO1G3RO#GVQYO'#HQOOQQ1G3U1G3UO9qQWO1G3[O#GdQWO1G3[O5RQ!LYO1G3`OOQQ1G3b1G3bOOQ!LQ'#Fm'#FmO5RQ!LYO1G3dO5RQ!LYO1G3fOOOS1G4o1G4oO#I`Q!LdO,5;xO#IsQbO1G3nO#I}QWO1G4qO#JVQWO1G4zO#J_QWO,5?XONtQYO,5:sO6jQWO,5:sO9qQWO,59xONtQYO,59xO!,vQpO,59xO#LWQ7^O,59xOOQO,5:s,5:sO#LbQ&jO'#HiO#LxQWO,5?WOOQ!LS1G/c1G/cO#MQQ&jO'#HnO#MfQWO,5?bOOQ!LQ1G0^1G0^O!<^Q&jO,59xO#MnQbO1G4{OOQO,5>X,5>XO6jQWO,5>XOOQO-E;k-E;kO#MxQ!LrO'#D|O!'QQ&jO'#DxOOQO'#Hl'#HlO#NdQ&jO,5:cOOQ!LS,5:c,5:cO#NkQ&jO'#DxO#NyQ&jO'#D|O$ _Q&jO'#D|O!'QQ&jO'#D|O$ iQWO1G/zO$ nQ`O1G/zOOQ!LS1G/z1G/zO)rQYO1G/zOHSQWO1G/zOOQ!LS1G0X1G0XO9qQWO1G0XO!,vQpO1G0XO$ uQ!LdO1G4xO)rQYO1G4xO$!VQ!LYO1G4xO$!hQWO1G4wO6jQWO,5>ZOOQO,5>Z,5>ZO$!pQWO,5>ZOOQO-E;m-E;mO$!hQWO1G4wOOQ!LS,5;x,5;xO$#OQ!LdO,59fO$$}Q!LdO,5;yO$'PQ!LdO,5;{O$)RQ!LdO,5<ZOOQ!LS7+%t7+%tO$+ZQWO'#HjO$+eQWO,5?YOOQ!LS1G/m1G/mO$+mQYO'#HkO$+zQWO,5?ZO$,SQbO,5?ZOOQ!LS1G/r1G/rOOQ!LS7+%}7+%}O$,^Q7^O,5:XO)rQYO7+&_O$,hQ7^O,5:POOQO1G1T1G1TOOQO1G1U1G1UO$,oQMhO,5;lONtQYO,5;kOOQO-E;n-E;nOOQ!LS7+&m7+&mOOQO7+&u7+&uOOOO1G1^1G1^O$,zQWO1G1^OOQ!LS1G1`1G1`O$-PQ!LdO7+&{OOQ!LS,5>`,5>`O$-pQWO,5>`OOQ!LS1G1t1G1tP$-uQWO'#HtPOQ!LS-E;r-E;rO$.fQ#tO1G2PO$/XQ#tO1G2RO$/cQ#tO1G2TOOQ!LS1G1m1G1mO$/jQWO'#HsO$/xQWO,5?iO$/xQWO,5?iO$0QQWO,5?iO$0]QWO,5?iOOQO1G1o1G1oO$0kQ#tO1G1nO$0{QWO'#HuO$1]QWO,5?jOHSQWO,5?jO$1eQ`O,5?jOOQ!LS1G1r1G1rO5RQ!LYO,5<]O5RQ!LYO,5<^O$1oQWO,5<^O#6vQWO,5<^O!,vQpO,5<]O$1tQWO,5<_O5RQ!LYO,5<`O$1oQWO,5<cOOQO-E;t-E;tOOQ!LS1G1v1G1vO!'QQ&jO,5<]O$1|QWO,5<^O!'QQ&jO,5<_O!'QQ&jO,5<^O$2XQ#tO1G4iO$2cQ#tO1G4iOOQO,5>c,5>cOOQO-E;u-E;uOJxQ&jO,59hO)rQYO,59hO$2pQWO1G1iOI`QWO1G1pOOQ!LS7+&|7+&|OFVQYO7+&|OOQ!LS7+%V7+%VO$2uQ`O'#JPO$ iQWO7+'qO$3PQWO7+'qO$3XQ`O7+'qOOQQ7+'q7+'qOHSQWO7+'qO)rQYO7+'qOHSQWO7+'qOOQO1G.v1G.vO$3cQ!LbO'#CgO$3sQ!LbO,5<aO$4bQWO,5<aOOQ!LQ1G4e1G4eOOQQ7+$^7+$^O9qQWO7+$^OFVQYO7+%tO!,vQpO7+$^O$4gQWO'#IOO$4rQWO,5?qOOQO1G2t1G2tO5ZQWO,5?qOOQO,5>k,5>kOOQO-E;}-E;}OOQ!LS7+&g7+&gO$4zQWO7+(_O5RQ!LYO7+(_O5ZQWO7+(_O$5PQWO7+(_O$5UQWO7+'qOOQ!LQ,5>e,5>eOOQ!LQ-E;w-E;wOOQQ7+'|7+'|O$5dQ!LbO7+'yOHSQWO7+'yO$5nQ`O7+'zOOQQ7+'z7+'zOHSQWO7+'zO$5uQWO'#JSO$6QQWO,5<xOOQO,5>g,5>gOOQO-E;y-E;yOOQQ7+(P7+(PO$6wQ&jO'#GgOOQQ1G2l1G2lOHSQWO1G2lO)rQYO1G2lOHSQWO1G2lO$7OQWO1G2lO$7^Q#tO1G2lO5RQ!LYO1G2oO#6{QWO1G2oO4wQWO1G2oO!,vQpO1G2oO!-OQ#tO1G2oO$7oQWO'#H}O$7zQWO,5?oO$8SQ&jO,5?oOOQ!LQ1G2p1G2pOOQQ7+$T7+$TO$8XQWO7+$TO5RQ!LYO7+$TO$8^QWO7+$TO)rQYO1G5^O)rQYO1G5_O$8cQYO1G2wO$8jQWO1G2wO$8oQYO1G2wO$8vQ!LYO1G5^OOQQ7+(a7+(aO5RQ!LYO7+(kO]QYO7+(mOOQQ'#JY'#JYOOQQ'#IQ'#IQO$9QQYO,5=lOOQQ,5=l,5=lO)rQYO'#HRO$9_QWO'#HTOOQQ7+(v7+(vO$9dQYO7+(vO6jQWO7+(vOOQQ7+(z7+(zOOQQ7+)O7+)OOOQQ7+)Q7+)QOOQO1G4s1G4sO$=_Q7^O1G0_O$=iQWO1G0_OOQO1G/d1G/dO$=tQ7^O1G/dO9qQWO1G/dONtQYO'#D^OOQO,5>T,5>TOOQO-E;g-E;gOOQO,5>Y,5>YOOQO-E;l-E;lO!,vQpO1G/dOOQO1G3s1G3sO9qQWO,5:dOOQO,5:h,5:hO!-sQYO,5:hO$>OQ!LYO,5:hO$>ZQ!LYO,5:hO!,vQpO,5:dOOQO-E;j-E;jOOQ!LS1G/}1G/}O!'QQ&jO,5:dO$>iQ!LrO,5:hO$?TQ&jO,5:dO!'QQ&jO,5:hO$?cQ&jO,5:hO$?wQ!LYO,5:hOOQ!LS7+%f7+%fO$ iQWO7+%fO$ nQ`O7+%fOOQ!LS7+%s7+%sO9qQWO7+%sO$@]Q!LdO7+*dO)rQYO7+*dOOQO1G3u1G3uO6jQWO1G3uO$@mQWO7+*cO$@uQ!LdO1G2PO$BwQ!LdO1G2RO$DyQ!LdO1G1nO$GRQ#tO,5>UOOQO-E;h-E;hO$G]QbO,5>VO)rQYO,5>VOOQO-E;i-E;iO$GgQWO1G4uO$IiQ7^O1G0dO$KdQ7^O1G0dO$M_Q7^O1G0dO$MfQ7^O1G0dO% TQ7^O1G0dO% hQ7^O1G0dO%#oQ7^O1G0dO%#vQ7^O1G0dO%%qQ7^O1G0dO%%xQ7^O1G0dO%'mQ7^O1G0dO%'zQ!LdO<<IyO%(kQ7^O1G0dO%*ZQ7^O'#IdO%,WQ7^O1G0vOOQO'#I{'#I{ONtQYO'#I{OOQO1G1W1G1WO%,_QWO1G1VO%,dQ7^O,5>^OOOO7+&x7+&xOOQ!LS1G3z1G3zOI`QWO7+'oO%,qQWO,5>_O5ZQWO,5>_OOQO-E;q-E;qO%-PQWO1G5TO%-PQWO1G5TO%-XQWO1G5TO%-dQ`O,5>aO%-nQWO,5>aOHSQWO,5>aOOQO-E;s-E;sO%-sQ`O1G5UO%-}QWO1G5UOOQO1G1w1G1wOOQO1G1x1G1xO5RQ!LYO1G1xO$1oQWO1G1xO5RQ!LYO1G1wO%.VQWO1G1yOHSQWO1G1yOOQO1G1z1G1zO5RQ!LYO1G1}O!,vQpO1G1wO#6vQWO1G1xO%.[QWO1G1yO%.dQWO1G1xOI`QWO7+*TOOQ!LS1G/S1G/SO%.oQWO1G/SOOQ!LS7+'T7+'TO%.tQ#tO7+'[OOQ!LS<<Jh<<JhOHSQWO'#HxO%/UQWO,5?kOOQQ<<K]<<K]OHSQWO<<K]O$ iQWO<<K]O%/^QWO<<K]O%/fQ`O<<K]OHSQWO1G1{OOQQ<<Gx<<GxOOQ!LS<<I`<<I`O9qQWO<<GxOOQO,5>j,5>jO%/pQWO,5>jOOQO-E;|-E;|O%/uQWO1G5]O%/}QWO<<KyOOQQ<<Ky<<KyO%0SQWO<<KyO5RQ!LYO<<KyO)rQYO<<K]OHSQWO<<K]OOQQ<<Ke<<KeO$5dQ!LbO<<KeOOQQ<<Kf<<KfO$5nQ`O<<KfO%0XQ&jO'#HzO%0dQWO,5?nONtQYO,5?nOOQQ1G2d1G2dO#MxQ!LrO'#D|O!'QQ&jO'#GhOOQO'#H|'#H|O%0lQ&jO,5=ROOQQ,5=R,5=RO#7gQ&jO'#D|O%0sQ&jO'#D|O%1XQ&jO'#D|O%1cQ&jO'#GhO%1qQWO7+(WO%1vQWO7+(WO%2OQ`O7+(WOOQQ7+(W7+(WOHSQWO7+(WO)rQYO7+(WOHSQWO7+(WO%2YQWO7+(WOOQQ7+(Z7+(ZO5RQ!LYO7+(ZO#6{QWO7+(ZO4wQWO7+(ZO!,vQpO7+(ZO%2hQWO,5>iOOQO-E;{-E;{OOQO'#Gk'#GkO%2sQWO1G5ZO5RQ!LYO<<GoOOQQ<<Go<<GoO%2{QWO<<GoO%3QQWO7+*xO%3VQWO7+*yOOQQ7+(c7+(cO%3[QWO7+(cO%3aQYO7+(cO%3hQWO7+(cO)rQYO7+*xO)rQYO7+*yOOQQ<<LV<<LVOOQQ<<LX<<LXOOQQ-E<O-E<OOOQQ1G3W1G3WO%3mQWO,5=mOOQQ,5=o,5=oO9qQWO<<LbO%3rQWO<<LbONtQYO7+%yOOQO7+%O7+%OO%3wQ7^O1G4{O9qQWO7+%OOOQO1G0O1G0OO%4RQ!LdO1G0SOOQO1G0S1G0SO!-sQYO1G0SO%4]Q!LYO1G0SO9qQWO1G0OO!,vQpO1G0OO%4hQ!LYO1G0SO!'QQ&jO1G0OO%4vQ!LYO1G0SO%5[Q!LrO1G0SO%5fQ&jO1G0OO!'QQ&jO1G0SOOQ!LS<<IQ<<IQOOQ!LS<<I_<<I_O%5tQ!LdO<<NOOOQO7+)a7+)aO%6UQ!LdO7+'[O%8^QbO1G3qO%8hQ7^O,5;xO%8rQ7^O,59fO%:oQ7^O,5;yO%<lQ7^O,5;{O%>iQ7^O,5<ZO%@XQ7^O7+&{O%@`QWO,5?gOOQO7+&q7+&qO%@eQ#tO<<KZOOQO1G3y1G3yO%@uQWO1G3yO%AQQWO1G3yO%A`QWO7+*oO%A`QWO7+*oOHSQWO1G3{O%AhQ`O1G3{O%ArQWO7+*pOOQO7+'d7+'dO5RQ!LYO7+'dOOQO7+'c7+'cO$1oQWO7+'eO%AzQ`O7+'eOOQO7+'i7+'iO5RQ!LYO7+'cO$1oQWO7+'dO%BRQWO7+'eOHSQWO7+'eO#6vQWO7+'dO%BWQ#tO<<MoOOQ!LS7+$n7+$nO%BbQ`O,5>dOOQO-E;v-E;vO$ iQWOAN@wOOQQAN@wAN@wOHSQWOAN@wO%BlQ!LbO7+'gOOQQAN=dAN=dO5ZQWO1G4UO%ByQWO7+*wO5RQ!LYOANAeO%CRQWOANAeOOQQANAeANAeO%CWQWOAN@wO%C`Q`OAN@wOOQQANAPANAPOOQQANAQANAQO%CjQWO,5>fOOQO-E;x-E;xO%CuQ7^O1G5YO#6{QWO,5=SO4wQWO,5=SO!,vQpO,5=SOOQO-E;z-E;zOOQQ1G2m1G2mO$>iQ!LrO,5:hO!'QQ&jO,5=SO%DPQ&jO,5=SO%D_Q&jO,5:hOOQQ<<Kr<<KrOHSQWO<<KrO%1qQWO<<KrO%DsQWO<<KrO%D{Q`O<<KrO)rQYO<<KrOHSQWO<<KrOOQQ<<Ku<<KuO5RQ!LYO<<KuO#6{QWO<<KuO4wQWO<<KuO%EVQ&jO1G4TO%E[QWO7+*uOOQQAN=ZAN=ZO5RQ!LYOAN=ZOOQQ<<Nd<<NdOOQQ<<Ne<<NeOOQQ<<K}<<K}O%EdQWO<<K}O%EiQYO<<K}O%EpQWO<<NdO%EuQWO<<NeOOQQ1G3X1G3XOOQQANA|ANA|O9qQWOANA|O%EzQ7^O<<IeOOQO<<Hj<<HjOOQO7+%n7+%nO%4RQ!LdO7+%nO!-sQYO7+%nOOQO7+%j7+%jO9qQWO7+%jO%FUQ!LYO7+%nO!,vQpO7+%jO%FaQ!LYO7+%nO!'QQ&jO7+%jO%FoQ!LYO7+%nO%GTQ!LdO<<KZO%I]Q7^O<<IyO%IdQ7^O1G1nO%KSQ7^O1G2PO%MPQ7^O1G2ROOQO1G5R1G5ROOQO7+)e7+)eO%N|QWO7+)eO& XQWO<<NZO& aQ`O7+)gOOQO<<KO<<KOO5RQ!LYO<<KPO$1oQWO<<KPOOQO<<J}<<J}O5RQ!LYO<<KOO& kQ`O<<KPO$1oQWO<<KOOOQQG26cG26cO$ iQWOG26cOOQO7+)p7+)pOOQQG27PG27PO5RQ!LYOG27POHSQWOG26cONtQYO1G4QO& rQWO7+*tO5RQ!LYO1G2nO#6{QWO1G2nO4wQWO1G2nO!,vQpO1G2nO!'QQ&jO1G2nO%5[Q!LrO1G0SO& zQ&jO1G2nO%1qQWOANA^OOQQANA^ANA^OHSQWOANA^O&!YQWOANA^O&!bQ`OANA^OOQQANAaANAaO5RQ!LYOANAaO#6{QWOANAaOOQO'#Gl'#GlOOQO7+)o7+)oOOQQG22uG22uOOQQANAiANAiO&!lQWOANAiOOQQANDOANDOOOQQANDPANDPO&!qQYOG27hOOQO<<IY<<IYO%4RQ!LdO<<IYOOQO<<IU<<IUO!-sQYO<<IYO9qQWO<<IUO&&lQ!LYO<<IYO!,vQpO<<IUO&&wQ!LYO<<IYO&'VQ7^O7+'[OOQO<<MP<<MPOOQOAN@kAN@kO5RQ!LYOAN@kOOQOAN@jAN@jO$1oQWOAN@kO5RQ!LYOAN@jOOQQLD+}LD+}OOQQLD,kLD,kO$ iQWOLD+}O&(uQ7^O7+)lOOQO7+(Y7+(YO5RQ!LYO7+(YO#6{QWO7+(YO4wQWO7+(YO!,vQpO7+(YO!'QQ&jO7+(YOOQQG26xG26xO%1qQWOG26xOHSQWOG26xOOQQG26{G26{O5RQ!LYOG26{OOQQG27TG27TO9qQWOLD-SOOQOAN>tAN>tO%4RQ!LdOAN>tOOQOAN>pAN>pO!-sQYOAN>tO9qQWOAN>pO&)PQ!LYOAN>tO&)[Q7^O<<KZOOQOG26VG26VO5RQ!LYOG26VOOQOG26UG26UOOQQ!$( i!$( iOOQO<<Kt<<KtO5RQ!LYO<<KtO#6{QWO<<KtO4wQWO<<KtO!,vQpO<<KtOOQQLD,dLD,dO%1qQWOLD,dOOQQLD,gLD,gOOQQ!$(!n!$(!nOOQOG24`G24`O%4RQ!LdOG24`OOQOG24[G24[O!-sQYOG24`OOQOLD+qLD+qOOQOANA`ANA`O5RQ!LYOANA`O#6{QWOANA`O4wQWOANA`OOQQ!$(!O!$(!OOOQOLD)zLD)zO%4RQ!LdOLD)zOOQOG26zG26zO5RQ!LYOG26zO#6{QWOG26zOOQO!$'Mf!$'MfOOQOLD,fLD,fO5RQ!LYOLD,fOOQO!$(!Q!$(!QOJ}QYO'#DmO&*zQ!LdO'#IfO&+_Q!LdO'#IfOJ}QYO'#DeO&+fQ!LdO'#CgO&,PQbO'#CgO&,aQYO,5:nOFVQYO,5:nOJ}QYO,5:xOJ}QYO,5:xOJ}QYO,5:xOJ}QYO,5:xOJ}QYO,5:xOJ}QYO,5:xOJ}QYO,5:xOJ}QYO,5:xOJ}QYO,5:xOJ}QYO,5:xOJ}QYO,5:xONtQYO'#HrO&.^QWO,5;xO&.fQWO,5:xOJ}QYO,5;[O!(jQWO'#CzO!(jQWO'#CzOHSQWO'#F_O&.fQWO'#F_OHSQWO'#FaO&.fQWO'#FaOHSQWO'#FoO&.fQWO'#FoONtQYO,5?aO&,aQYO1G0YOFVQYO1G0YO&/mQ7^O'#CgO&/wQ7^O'#IfO&0RQ7^O'#IfOJ}QYO1G1aOHSQWO,5<eO&.fQWO,5<eOHSQWO,5<gO&.fQWO,5<gOHSQWO,5<SO&.fQWO,5<SO&,aQYO1G1bOFVQYO1G1bO&,aQYO1G1bO&,aQYO1G0YOJ}QYO7+&_OHSQWO1G1pO&.fQWO1G1pO&,aQYO7+&|OFVQYO7+&|O&,aQYO7+&|O&,aQYO7+%tOFVQYO7+%tO&,aQYO7+%tOHSQWO7+'oO&.fQWO7+'oO&0YQWO'#ESO&0_QWO'#ESO&0dQWO'#ESO&0lQWO'#ESO&0tQWO'#EpO!-sQYO'#DeO!-sQYO'#DmO&0yQWO'#IuO&1UQWO'#IsO&1aQWO,5:nO&1fQWO,5:nO!-sQYO,5:xO!-sQYO,5:xO!-sQYO,5:xO!-sQYO,5:xO!-sQYO,5:xO!-sQYO,5:xO!-sQYO,5:xO!-sQYO,5:xO!-sQYO,5:xO!-sQYO,5:xO!-sQYO,5:xO!-sQYO,5;[O&1kQ#tO,5;uO&1rQWO'#FhO&1wQWO'#FhO&1|QWO,5;vO&2UQWO,5;vO&2^QWO,5;vO&2fQ!LdO,5:PO&2sQWO,5:nO&2xQWO,5:nO&3QQWO,5:nO&3YQWO,5:nO&5UQ!LdO1G0dO&5cQ!LdO1G0dO&7jQ!LdO1G0dO&7qQ!LdO1G0dO&9rQ!LdO1G0dO&9yQ!LdO1G0dO&;zQ!LdO1G0dO&<RQ!LdO1G0dO&>SQ!LdO1G0dO&>ZQ!LdO1G0dO&>bQ7^O1G0sO&>iQ!LdO1G0vO!-sQYO1G1aO&>vQWO,5<UO&>{QWO,5<UO&?QQWO1G1bO&?VQWO1G1bO&?[QWO1G1bO&?aQWO1G0YO&?fQWO1G0YO&?kQWO1G0YO!-sQYO7+&_O&?pQ!LdO7+&{O&?}Q#tO1G2TO&@UQ#tO1G2TO&@]Q!LdO<<IyO&,aQYO,5:nO&B^Q!LdO'#IgO&BqQWO'#EpO3mQWO'#F]O4wQWO'#F[O4wQWO'#F[O4wQWO'#F[O5qQWO'#ESO5qQWO'#ESO5qQWO'#ESOJ}QYO,5;XO&BvQ#tO,5;uO!(tQWO'#FjO!(tQWO'#FjO&B}Q7^O1G0sOI`QWO,5<iOI`QWO,5<iONtQYO'#DmONtQYO'#DeONtQYO,5:xONtQYO,5:xONtQYO,5:xONtQYO,5:xONtQYO,5:xONtQYO,5:xONtQYO,5:xONtQYO,5:xONtQYO,5:xONtQYO,5:xONtQYO,5:xONtQYO,5;[ONtQYO1G1aONtQYO7+&_O&CUQWO'#ESO&CZQWO'#ESO&CcQWO'#EpO&ChQ#tO,5;uO&CoQ7^O1G0sO3mQWO'#F]OJ}QYO,5;XO&CvQ7^O'#IgO&DWQ7^O,5:PO&DeQ7^O1G0dO&FfQ7^O1G0dO&FmQ7^O1G0dO&HbQ7^O1G0dO&HuQ7^O1G0dO&KSQ7^O1G0dO&KZQ7^O1G0dO&M[Q7^O1G0dO&McQ7^O1G0dO' WQ7^O1G0dO' kQ7^O1G0vO' xQ7^O7+&{O'!VQ7^O<<IyO3mQWO'#F]OJ}QYO,5;X",
-      stateData: "'#V~O&|OSSOSTOS~OPTOQTOWwO]bO^gOamOblOgbOiTOjbOkbOmTOoTOtROvbOwbOxbO!OSO!YjO!_UO!bTO!cTO!dTO!eTO!fTO!ikO#jnO#n]O$toO$vrO$xpO$ypO$zqO$}sO%PtO%SuO%TuO%VvO%dxO%jyO%lzO%n{O%p|O%s}O%y!OO%}!PO&P!QO&R!RO&T!SO&V!TO'OPO'[QO'p`O~OPZXYZX^ZXiZXqZXrZXtZX|ZX![ZX!]ZX!_ZX!eZX!tZX#OcX#RZX#SZX#TZX#UZX#VZX#WZX#XZX#YZX#ZZX#]ZX#_ZX#`ZX#eZX&zZX'[ZX'dZX'kZX'lZX~O!W$aX~P$tO&w!VO&x!UO&y!XO~OPTOQTO]bOa!hOb!gOgbOiTOjbOkbOmTOoTOtROvbOwbOxbO!O!`O!YjO!_UO!bTO!cTO!dTO!eTO!fTO!i!fO#j!iO#n]O'O!YO'[QO'p`O~O{!^O|!ZOy'_Py'hP~P'^O}!jO~P]OPTOQTO]bOa!hOb!gOgbOiTOjbOkbOmTOoTOtROvbOwbOxbO!O!`O!YjO!_UO!bTO!cTO!dTO!eTO!fTO!i!fO#j!iO#n]O'O8UO'[QO'p`O~OPTOQTO]bOa!hOb!gOgbOiTOjbOkbOmTOoTOtROvbOwbOxbO!O!`O!YjO!_UO!bTO!cTO!dTO!eTO!fTO!i!fO#j!iO#n]O'[QO'p`O~O{!oO!|!rO!}!oO'O8VO!^'eP~P+oO#O!sO~O!W!tO#O!sO~OP#ZOY#aOi#OOq!xOr!xOt!yO|#_O![#QO!]!vO!_!wO!e#ZO#R!|O#S!}O#T!}O#U!}O#V#PO#W#QO#X#QO#Y#QO#Z#RO#]#TO#_#VO#`#WO'[QO'd#XO'k!zO'l!{O^'YX&z'YX!^'YXy'YX!O'YX$u'YX!W'YX~O!t#bO#e#bOP'ZXY'ZX^'ZXi'ZXq'ZXr'ZXt'ZX|'ZX!['ZX!]'ZX!_'ZX!e'ZX#R'ZX#S'ZX#T'ZX#U'ZX#V'ZX#W'ZX#Y'ZX#Z'ZX#]'ZX#_'ZX#`'ZX'['ZX'd'ZX'k'ZX'l'ZX~O#X'ZX&z'ZXy'ZX!^'ZX'^'ZX!O'ZX$u'ZX!W'ZX~P0gO!t#bO~O#p#cO#v#gO~O!O#hO#n]O#y#iO#{#kO~O]#nOg#zOi#oOj#nOk#nOm#{Oo#|Ot#tO!O#uO!Y$RO!_#rO!}$SO#j$PO$S#}O$U$OO$X$QO'O#mO'S'UP~O!_$TO~O!W$VO~O^$WO&z$WO~O'O$[O~O!_$TO'O$[O'P$^O'T$_O~Ob$fO!_$TO'O$[O~O]$nOq$jO!O$gO!_$iO$v$mO'O$[O'P$^O['xP~O!i$oO~Ot$pO!O$qO'O$[O~Ot$pO!O$qO%P$uO'O$[O~O'O$vO~O$vrO$xpO$ypO$zqO$}sO%PtO%SuO%TuO~Oa%POb%OO!i$|O$t$}O%X${O~P7YOa%SOblO!O%RO!ikO$toO$xpO$ypO$zqO$}sO%PtO%SuO%TuO%VvO~O_%VO!t%YO$v%TO'P$^O~P8XO!_%ZO!b%_O~O!_%`O~O!OSO~O^$WO&v%hO&z$WO~O^$WO&v%kO&z$WO~O^$WO&v%mO&z$WO~O&w!VO&x!UO&y%qO~OPZXYZXiZXqZXrZXtZX|ZX|cX![ZX!]ZX!_ZX!eZX!tZX!tcX#OcX#RZX#SZX#TZX#UZX#VZX#WZX#XZX#YZX#ZZX#]ZX#_ZX#`ZX#eZX'[ZX'dZX'kZX'lZX~OyZXycX~P:tO{%sOy&[X|&[X~P)rO|!ZOy'_X~OP#ZOY#aOi#OOq!xOr!xOt!yO|!ZO![#QO!]!vO!_!wO!e#ZO#R!|O#S!}O#T!}O#U!}O#V#PO#W#QO#X#QO#Y#QO#Z#RO#]#TO#_#VO#`#WO'[QO'd#XO'k!zO'l!{O~Oy'_X~P=kOy%xO~Ot%{O!R&VO!S&OO!T&OO'P$^O~O]%|Oj%|O{&PO'X%yO}'`P}'jP~P?nOy'gX|'gX!W'gX!^'gX'd'gX~O!t'gX#O!wX}'gX~P@gO!t&WOy'iX|'iX~O|&XOy'hX~Oy&ZO~O!t#bO~P@gOR&_O!O&[O!j&^O'O$[O~Oq$jO!_$iO~O}&dO~P]Oq!xOr!xOt!yO!]!vO!_!wO'[QOP!aaY!aai!aa|!aa![!aa!e!aa#R!aa#S!aa#T!aa#U!aa#V!aa#W!aa#X!aa#Y!aa#Z!aa#]!aa#_!aa#`!aa'd!aa'k!aa'l!aa~O^!aa&z!aay!aa!^!aa'^!aa!O!aa$u!aa!W!aa~PBeO!^&eO~O!W!tO!t&gO'd&fO|'fX^'fX&z'fX~O!^'fX~PD}O|&kO!^'eX~O!^&mO~Ot$pO!O$qO!}&nO'O$[O~OPTOQTO]bOa!hOb!gOgbOiTOjbOkbOmTOoTOtROvbOwbOxbO!OSO!YjO!_UO!bTO!cTO!dTO!eTO!fTO!i!fO#j!iO#n]O'O8UO'[QO'p`O~O]#nOg#zOi#oOj#nOk#nOm#{Oo8iOt#tO!O#uO!Y:yO!_#rO!}8oO#j$PO$S8kO$U8mO$X$QO'O&qO~O#O&sO~O]#nOg#zOi#oOj#nOk#nOm#{Oo#|Ot#tO!O#uO!Y$RO!_#rO!}$SO#j$PO$S#}O$U$OO$X$QO'O&qO~O'S'bP~PI`O{&wO!^'cP~P)rO'X&yO~OP8QOQ8QO]bOa:tOb!gOgbOi8QOjbOkbOm8QOo8QOtROvbOwbOxbO!O!`O!Y8TO!_UO!b8QO!c8QO!d8QO!e8QO!f8QO!i!fO#j!iO#n]O'O'XO'[QO'p:pO~O!_!wO~O|#_O^$Qa&z$Qa!^$Qay$Qa!O$Qa$u$Qa!W$Qa~O!W'aO!O'mX#m'mX#p'mX#v'mX~Oq'bO~PMkOq'bO!O'mX#m'mX#p'mX#v'mX~O!O'dO#m'hO#p'cO#v'iO~OP;OOQ;OO]bOa:vOb!gOgbOi;OOjbOkbOm;OOo;OOtROvbOwbOxbO!O!`O!Y;PO!_UO!b;OO!c;OO!d;OO!e;OO!f;OO!i!fO#j!iO#n]O'O'XO'[QO'p;vO~O{'lO~PNtO#p#cO#v'oO~Oq$YXt$YX!]$YX'd$YX'k$YX'l$YX~OReX|eX!teX'SeX'S$YX~P!#QOj'qO~Oq'sOt'tO'd#XO'k'vO'l'xO~O'S'rO~P!$OO'S'{O~O]#nOg#zOi#oOj#nOk#nOm#{Oo8iOt#tO!O#uO!Y:yO!_#rO!}8oO#j$PO$S8kO$U8mO$X$QO~O{(PO'O'|O!^'qP~P!$mO#O(RO~O{(VO'O(SOy'rP~P!$mO^(`Oi(eOt(]O!R(cO!S([O!T([O!_(YO!q(dO$l(_O'P$^O'X(XO~O}(bO~P!&bO!]!vOq'WXt'WX'd'WX'k'WX'l'WX|'WX!t'WX~O'S'WX#c'WX~P!'^OR(hO!t(gO|'VX'S'VX~O|(iO'S'UX~O'O(kO~O!_(pO~O!_(YO~Ot$pO{!oO!O$qO!|!rO!}!oO'O$[O!^'eP~O!W!tO#O(tO~OP#ZOY#aOi#OOq!xOr!xOt!yO![#QO!]!vO!_!wO!e#ZO#R!|O#S!}O#T!}O#U!}O#V#PO#W#QO#X#QO#Y#QO#Z#RO#]#TO#_#VO#`#WO'[QO'd#XO'k!zO'l!{O~O^!Xa|!Xa&z!Xay!Xa!^!Xa'^!Xa!O!Xa$u!Xa!W!Xa~P!)jOR(|O!O&[O!j({O$u(zO'T$_O~O'O$vO'S'UP~O!W)PO!O'RX^'RX&z'RX~O!_$TO'T$_O~O!_$TO'O$[O'T$_O~O!W!tO#O&sO~O'O)XO}'yP~O|)]O['xX~OP9eOQ9eO]bOa:uOb!gOgbOi9eOjbOkbOm9eOo9eOtROvbOwbOxbO!O!`O!Y9dO!_UO!b9eO!c9eO!d9eO!e9eO!f9eO!i!fO#j!iO#n]O'O8UO'[QO'p;eO~OY)aO~O[)bO~O!O$gO'O$[O'P$^O['xP~Ot$pO{)gO!O$qO'O$[Oy'hP~O]&SOj&SO{)hO'X&yO}'jP~O|)iO^'uX&z'uX~O!t)mO'T$_O~OR)pO!O#uO'T$_O~O!O)rO~Oq)tO!OSO~O!i)yO~Ob*OO~O'O(kO}'wP~Ob$fO~O$vrO'O$vO~P8XOY*UO[*TO~OPTOQTO]bOamOblOgbOiTOjbOkbOmTOoTOtROvbOwbOxbO!YjO!_UO!bTO!cTO!dTO!eTO!fTO!ikO#n]O$toO'[QO'p`O~O!O!`O#j!iO'O8UO~P!2tO[*TO^$WO&z$WO~O^*YO$x*[O$y*[O$z*[O~P)rO!_%ZO~O%j*aO~O!O*cO~O%z*fO%{*eOP%xaQ%xaW%xa]%xa^%xaa%xab%xag%xai%xaj%xak%xam%xao%xat%xav%xaw%xax%xa!O%xa!Y%xa!_%xa!b%xa!c%xa!d%xa!e%xa!f%xa!i%xa#j%xa#n%xa$t%xa$v%xa$x%xa$y%xa$z%xa$}%xa%P%xa%S%xa%T%xa%V%xa%d%xa%j%xa%l%xa%n%xa%p%xa%s%xa%y%xa%}%xa&P%xa&R%xa&T%xa&V%xa&u%xa'O%xa'[%xa'p%xa}%xa%q%xa_%xa%v%xa~O'O*iO~O'^*lO~Oy&[a|&[a~P!)jO|!ZOy'_a~Oy'_a~P=kO|&XOy'ha~O|sX|!UX}sX}!UX!WsX!W!UX!_!UX!tsX'T!UX~O!W*sO!t*rO|!{X|'aX}!{X}'aX!W'aX!_'aX'T'aX~O!W*uO!_$TO'T$_O|!QX}!QX~O]%zOj%zOt%{O'X(XO~OP;OOQ;OO]bOa:vOb!gOgbOi;OOjbOkbOm;OOo;OOtROvbOwbOxbO!O!`O!Y;PO!_UO!b;OO!c;OO!d;OO!e;OO!f;OO!i!fO#j!iO#n]O'[QO'p;vO~O'O8tO~P!<lO|*yO}'`X~O}*{O~O!W*sO!t*rO|!{X}!{X~O|*|O}'jX~O}+OO~O]%zOj%zOt%{O'P$^O'X(XO~O!S+PO!T+PO~P!?gOt$pO{+SO!O$qO'O$[Oy&aX|&aX~O^+WO!R+ZO!S+VO!T+VO!m+]O!n+[O!o+[O!q+^O'P$^O'X(XO~O}+YO~P!@hOR+cO!O&[O!j+bO~O!t+hO|'fa!^'fa^'fa&z'fa~O!W!tO~P!AlO|&kO!^'ea~Ot$pO{+kO!O$qO!|+mO!}+kO'O$[O|&cX!^&cX~O#O!sa|!sa!^!sa!t!sa!O!sa^!sa&z!say!sa~P!$OO#O'WXP'WXY'WX^'WXi'WXr'WX!['WX!_'WX!e'WX#R'WX#S'WX#T'WX#U'WX#V'WX#W'WX#X'WX#Y'WX#Z'WX#]'WX#_'WX#`'WX&z'WX'['WX!^'WXy'WX!O'WX$u'WX'^'WX!W'WX~P!'^O|+vO'S'bX~P!$OO'S+xO~O|+yO!^'cX~P!)jO!^+|O~Oy+}O~OP#ZOq!xOr!xOt!yO!]!vO!_!wO!e#ZO'[QOY#Qi^#Qii#Qi|#Qi![#Qi#S#Qi#T#Qi#U#Qi#V#Qi#W#Qi#X#Qi#Y#Qi#Z#Qi#]#Qi#_#Qi#`#Qi&z#Qi'd#Qi'k#Qi'l#Qiy#Qi!^#Qi'^#Qi!O#Qi$u#Qi!W#Qi~O#R#Qi~P!FYO#R!|O~P!FYOP#ZOq!xOr!xOt!yO!]!vO!_!wO!e#ZO#R!|O#S!}O#T!}O#U!}O'[QOY#Qi^#Qi|#Qi![#Qi#V#Qi#W#Qi#X#Qi#Y#Qi#Z#Qi#]#Qi#_#Qi#`#Qi&z#Qi'd#Qi'k#Qi'l#Qiy#Qi!^#Qi'^#Qi!O#Qi$u#Qi!W#Qi~Oi#Qi~P!HtOi#OO~P!HtOP#ZOi#OOq!xOr!xOt!yO!]!vO!_!wO!e#ZO#R!|O#S!}O#T!}O#U!}O#V#PO'[QO^#Qi|#Qi#Z#Qi#]#Qi#_#Qi#`#Qi&z#Qi'd#Qi'k#Qi'l#Qiy#Qi!^#Qi'^#Qi!O#Qi$u#Qi!W#Qi~OY#Qi![#Qi#W#Qi#X#Qi#Y#Qi~P!K`OY#aO![#QO#W#QO#X#QO#Y#QO~P!K`OP#ZOY#aOi#OOq!xOr!xOt!yO![#QO!]!vO!_!wO!e#ZO#R!|O#S!}O#T!}O#U!}O#V#PO#W#QO#X#QO#Y#QO#Z#RO'[QO^#Qi|#Qi#]#Qi#_#Qi#`#Qi&z#Qi'd#Qi'l#Qiy#Qi!^#Qi'^#Qi!O#Qi$u#Qi!W#Qi~O'k#Qi~P!NWO'k!zO~P!NWOP#ZOY#aOi#OOq!xOr!xOt!yO![#QO!]!vO!_!wO!e#ZO#R!|O#S!}O#T!}O#U!}O#V#PO#W#QO#X#QO#Y#QO#Z#RO#]#TO'[QO'k!zO^#Qi|#Qi#_#Qi#`#Qi&z#Qi'd#Qiy#Qi!^#Qi'^#Qi!O#Qi$u#Qi!W#Qi~O'l#Qi~P#!rO'l!{O~P#!rOP#ZOY#aOi#OOq!xOr!xOt!yO![#QO!]!vO!_!wO!e#ZO#R!|O#S!}O#T!}O#U!}O#V#PO#W#QO#X#QO#Y#QO#Z#RO#]#TO#_#VO'[QO'k!zO'l!{O~O^#Qi|#Qi#`#Qi&z#Qi'd#Qiy#Qi!^#Qi'^#Qi!O#Qi$u#Qi!W#Qi~P#%^OPZXYZXiZXqZXrZXtZX![ZX!]ZX!_ZX!eZX!tZX#OcX#RZX#SZX#TZX#UZX#VZX#WZX#XZX#YZX#ZZX#]ZX#_ZX#`ZX#eZX'[ZX'dZX'kZX'lZX|ZX}ZX~O#cZX~P#'qOP#ZOY8gOi8[Oq!xOr!xOt!yO![8^O!]!vO!_!wO!e#ZO#R8YO#S8ZO#T8ZO#U8ZO#V8]O#W8^O#X8^O#Y8^O#Z8_O#]8aO#_8cO#`8dO'[QO'd#XO'k!zO'l!{O~O#c,PO~P#){OP'ZXY'ZXi'ZXq'ZXr'ZXt'ZX!['ZX!]'ZX!_'ZX!e'ZX#R'ZX#S'ZX#T'ZX#U'ZX#V'ZX#W'ZX#X'ZX#Y'ZX#Z'ZX#]'ZX#_'ZX#`'ZX#c'ZX'['ZX'd'ZX'k'ZX'l'ZX~O!t8hO#e8hO~P#+vO^&fa|&fa&z&fa!^&fa'^&fay&fa!O&fa$u&fa!W&fa~P!)jOP#QiY#Qi^#Qii#Qir#Qi|#Qi![#Qi!]#Qi!_#Qi!e#Qi#R#Qi#S#Qi#T#Qi#U#Qi#V#Qi#W#Qi#X#Qi#Y#Qi#Z#Qi#]#Qi#_#Qi#`#Qi&z#Qi'[#Qiy#Qi!^#Qi'^#Qi!O#Qi$u#Qi!W#Qi~P!$OO^#di|#di&z#diy#di!^#di'^#di!O#di$u#di!W#di~P!)jO#p,RO~O#p,SO~O!W'aO!t,TO!O#tX#m#tX#p#tX#v#tX~O{,UO~O!O'dO#m,WO#p'cO#v,XO~OP#ZOY8gOi;SOq!xOr!xOt!yO|8eO![;UO!]!vO!_!wO!e#ZO#R;QO#S;RO#T;RO#U;RO#V;TO#W;UO#X;UO#Y;UO#Z;VO#];XO#_;ZO#`;[O'[QO'd#XO'k!zO'l!{O}'YX~O},YO~O#v,[O~O],_Oj,_Oy,`O~O|cX!WcX!^cX!^$YX'dcX~P!#QO!^,fO~P!$OO|,gO!W!tO'd&fO!^'qX~O!^,lO~Oy$YX|$YX!W$aX~P!#QO|,nOy'rX~P!$OO!W,pO~Oy,rO~O{(PO'O$[O!^'qP~Oi,vO!W!tO!_$TO'T$_O'd&fO~O!W)PO~O},|O~P!&bO!S,}O!T,}O'P$^O'X(XO~Ot-PO'X(XO~O!q-QO~O'O$vO|&kX'S&kX~O|(iO'S'Ua~Oq-VOr-VOt-WO'dna'kna'lna|na!tna~O'Sna#cna~P#8XOq'sOt'tO'd$Ra'k$Ra'l$Ra|$Ra!t$Ra~O'S$Ra#c$Ra~P#8}Oq'sOt'tO'd$Ta'k$Ta'l$Ta|$Ta!t$Ta~O'S$Ta#c$Ta~P#9pO]-XO~O#O-YO~O'S$ca|$ca#c$ca!t$ca~P!$OO#O-[O~OR-eO!O&[O!j-dO$u-cO~O'S-fO~O]#nOi#oOj#nOk#nOm#{Oo8iOt#tO!O#uO!Y:yO!_#rO!}8oO#j$PO$S8kO$U8mO$X$QO~Og-hO'O-gO~P#;gO!W)PO!O'Ra^'Ra&z'Ra~O#O-mO~OYZX|cX}cX~O|-oO}'yX~O}-qO~OY-rO~O!O$gO'O$[O[&sX|&sX~O|)]O['xa~OP#ZOY#aOi9lOq!xOr!xOt!yO![9nO!]!vO!_!wO!e#ZO#R9jO#S9kO#T9kO#U9kO#V9mO#W9nO#X9nO#Y9nO#Z9oO#]9qO#_9sO#`9tO'[QO'd#XO'k!zO'l!{O~O!^-uO~P#>[O]-wO~OY-xO~O[-yO~OR-eO!O&[O!j-dO$u-cO'T$_O~O|)iO^'ua&z'ua~O!t.PO~OR.SO!O#uO~O'X&yO}'vP~OR.^O!O.YO!j.]O$u.[O'T$_O~OY.hO|.fO}'wX~O}.iO~O[.kO^$WO&z$WO~O].lO~O#X.nO%h.oO~P0gO!t#bO#X.nO%h.oO~O^.pO~P)rO^.rO~O%q.vOP%oiQ%oiW%oi]%oi^%oia%oib%oig%oii%oij%oik%oim%oio%oit%oiv%oiw%oix%oi!O%oi!Y%oi!_%oi!b%oi!c%oi!d%oi!e%oi!f%oi!i%oi#j%oi#n%oi$t%oi$v%oi$x%oi$y%oi$z%oi$}%oi%P%oi%S%oi%T%oi%V%oi%d%oi%j%oi%l%oi%n%oi%p%oi%s%oi%y%oi%}%oi&P%oi&R%oi&T%oi&V%oi&u%oi'O%oi'[%oi'p%oi}%oi_%oi%v%oi~O_.|O}.zO%v.{O~P]O!OSO!_/PO~OP$QaY$Qai$Qaq$Qar$Qat$Qa![$Qa!]$Qa!_$Qa!e$Qa#R$Qa#S$Qa#T$Qa#U$Qa#V$Qa#W$Qa#X$Qa#Y$Qa#Z$Qa#]$Qa#_$Qa#`$Qa'[$Qa'd$Qa'k$Qa'l$Qa~O|#_O'^$Qa!^$Qa^$Qa&z$Qa~P#GlOy&[i|&[i~P!)jO|!ZOy'_i~O|&XOy'hi~Oy/TO~OP#ZOY8gOi;SOq!xOr!xOt!yO![;UO!]!vO!_!wO!e#ZO#R;QO#S;RO#T;RO#U;RO#V;TO#W;UO#X;UO#Y;UO#Z;VO#];XO#_;ZO#`;[O'[QO'd#XO'k!zO'l!{O~O|!Qa}!Qa~P#JdO]%zOj%zO{/ZO'X(XO|&]X}&]X~P?nO|*yO}'`a~O]&SOj&SO{)hO'X&yO|&bX}&bX~O|*|O}'ja~Oy'ii|'ii~P!)jO^$WO!W!tO!_$TO!e/fO!t/dO&z$WO'T$_O'd&fO~O}/iO~P!@hO!S/jO!T/jO'P$^O'X(XO~O!R/lO!S/jO!T/jO!q/mO'P$^O'X(XO~O!n/nO!o/nO~P#NyO!O&[O~O!O&[O~P!$OO|'fi!^'fi^'fi&z'fi~P!)jO!t/vO|'fi!^'fi^'fi&z'fi~O|&kO!^'ei~Ot$pO!O$qO!}/xO'O$[O~O#OnaPnaYna^naina![na!]na!_na!ena#Rna#Sna#Tna#Una#Vna#Wna#Xna#Yna#Zna#]na#_na#`na&zna'[na!^nayna!Ona$una'^na!Wna~P#8XO#O$RaP$RaY$Ra^$Rai$Rar$Ra![$Ra!]$Ra!_$Ra!e$Ra#R$Ra#S$Ra#T$Ra#U$Ra#V$Ra#W$Ra#X$Ra#Y$Ra#Z$Ra#]$Ra#_$Ra#`$Ra&z$Ra'[$Ra!^$Ray$Ra!O$Ra$u$Ra'^$Ra!W$Ra~P#8}O#O$TaP$TaY$Ta^$Tai$Tar$Ta![$Ta!]$Ta!_$Ta!e$Ta#R$Ta#S$Ta#T$Ta#U$Ta#V$Ta#W$Ta#X$Ta#Y$Ta#Z$Ta#]$Ta#_$Ta#`$Ta&z$Ta'[$Ta!^$Tay$Ta!O$Ta$u$Ta'^$Ta!W$Ta~P#9pO#O$caP$caY$ca^$cai$car$ca|$ca![$ca!]$ca!_$ca!e$ca#R$ca#S$ca#T$ca#U$ca#V$ca#W$ca#X$ca#Y$ca#Z$ca#]$ca#_$ca#`$ca&z$ca'[$ca!^$cay$ca!O$ca!t$ca$u$ca'^$ca!W$ca~P!$OO|&^X'S&^X~PI`O|+vO'S'ba~O{0QO|&_X!^&_X~P)rO|+yO!^'ca~O|+yO!^'ca~P!)jO#c!aa}!aa~PBeO#c!Xa~P#){O!O0eO#n]O#u0dO~O}0iO~O^#}q|#}q&z#}qy#}q!^#}q'^#}q!O#}q$u#}q!W#}q~P!)jOy0jO~O],_Oj,_O~Oq'sOt'tO'l'xO'd$mi'k$mi|$mi!t$mi~O'S$mi#c$mi~P$-}Oq'sOt'tO'd$oi'k$oi'l$oi|$oi!t$oi~O'S$oi#c$oi~P$.pO#c0kO~P!$OO{0mO'O$[O|&gX!^&gX~O|,gO!^'qa~O|,gO!W!tO!^'qa~O|,gO!W!tO'd&fO!^'qa~O'S$[i|$[i#c$[i!t$[i~P!$OO{0tO'O(SOy&iX|&iX~P!$mO|,nOy'ra~O|,nOy'ra~P!$OO!W!tO~O!W!tO#X1OO~Oi1SO!W!tO'd&fO~O|'Vi'S'Vi~P!$OO!t1VO|'Vi'S'Vi~P!$OO!^1YO~O|1]O!O'sX~P!$OO!O&[O$u1`O~O!O&[O$u1`O~P!$OO!O$YX$jZX^$YX&z$YX~P!#QO$j1dOqfXtfX!OfX'dfX'kfX'lfX^fX&zfX~O$j1dO~O'O)XO|&rX}&rX~O|-oO}'ya~O[1lO~O]1oO~OR1qO!O&[O!j1pO$u1`O~O^$WO&z$WO~P!$OO!O#uO~P!$OO|1vO!t1xO}'vX~O}1yO~Ot(]O!R2SO!S1{O!T1{O!m2RO!n2QO!o2QO!q2PO'P$^O'X(XO~O}2OO~P$6VOR2ZO!O.YO!j2YO$u2XO~OR2ZO!O.YO!j2YO$u2XO'T$_O~O'O(kO|&qX}&qX~O|.fO}'wa~O'X2dO~O]2fO~O[2hO~O!^2kO~P)rO^2mO~O^2mO~P)rO#X2oO%h2pO~PD}O_.|O}2tO%v.{O~P]O!W2vO~O%{2wOP%xqQ%xqW%xq]%xq^%xqa%xqb%xqg%xqi%xqj%xqk%xqm%xqo%xqt%xqv%xqw%xqx%xq!O%xq!Y%xq!_%xq!b%xq!c%xq!d%xq!e%xq!f%xq!i%xq#j%xq#n%xq$t%xq$v%xq$x%xq$y%xq$z%xq$}%xq%P%xq%S%xq%T%xq%V%xq%d%xq%j%xq%l%xq%n%xq%p%xq%s%xq%y%xq%}%xq&P%xq&R%xq&T%xq&V%xq&u%xq'O%xq'[%xq'p%xq}%xq%q%xq_%xq%v%xq~O|!{i}!{i~P#JdO!t2yO|!{i}!{i~O|!Qi}!Qi~P#JdO^$WO!t3QO&z$WO~O^$WO!W!tO!t3QO&z$WO~O^$WO!W!tO!_$TO!e3UO!t3QO&z$WO'T$_O'd&fO~O!S3VO!T3VO'P$^O'X(XO~O!R3YO!S3VO!T3VO!q3ZO'P$^O'X(XO~O^$WO!W!tO!e3UO!t3QO&z$WO'd&fO~O|'fq!^'fq^'fq&z'fq~P!)jO|&kO!^'eq~O#O$miP$miY$mi^$mii$mir$mi![$mi!]$mi!_$mi!e$mi#R$mi#S$mi#T$mi#U$mi#V$mi#W$mi#X$mi#Y$mi#Z$mi#]$mi#_$mi#`$mi&z$mi'[$mi!^$miy$mi!O$mi$u$mi'^$mi!W$mi~P$-}O#O$oiP$oiY$oi^$oii$oir$oi![$oi!]$oi!_$oi!e$oi#R$oi#S$oi#T$oi#U$oi#V$oi#W$oi#X$oi#Y$oi#Z$oi#]$oi#_$oi#`$oi&z$oi'[$oi!^$oiy$oi!O$oi$u$oi'^$oi!W$oi~P$.pO#O$[iP$[iY$[i^$[ii$[ir$[i|$[i![$[i!]$[i!_$[i!e$[i#R$[i#S$[i#T$[i#U$[i#V$[i#W$[i#X$[i#Y$[i#Z$[i#]$[i#_$[i#`$[i&z$[i'[$[i!^$[iy$[i!O$[i!t$[i$u$[i'^$[i!W$[i~P!$OO|&^a'S&^a~P!$OO|&_a!^&_a~P!)jO|+yO!^'ci~OP#ZOq!xOr!xOt!yO!]!vO!_!wO!e#ZO'[QOY#Qii#Qi![#Qi#S#Qi#T#Qi#U#Qi#V#Qi#W#Qi#X#Qi#Y#Qi#Z#Qi#]#Qi#_#Qi#`#Qi#c#Qi'd#Qi'k#Qi'l#Qi|#Qi}#Qi~O#R#Qi~P$GoOP#ZOq!xOr!xOt!yO!]!vO!_!wO!e#ZO'[QOY#Qii#Qi![#Qi#S#Qi#T#Qi#U#Qi#V#Qi#W#Qi#X#Qi#Y#Qi#Z#Qi#]#Qi#_#Qi#`#Qi#c#Qi'd#Qi'k#Qi'l#Qi~O#R8YO~P$IpOP#ZOq!xOr!xOt!yO!]!vO!_!wO!e#ZO#R8YO#S8ZO#T8ZO#U8ZO'[QOY#Qi![#Qi#V#Qi#W#Qi#X#Qi#Y#Qi#Z#Qi#]#Qi#_#Qi#`#Qi#c#Qi'd#Qi'k#Qi'l#Qi~Oi#Qi~P$KkOi8[O~P$KkOP#ZOi8[Oq!xOr!xOt!yO!]!vO!_!wO!e#ZO#R8YO#S8ZO#T8ZO#U8ZO#V8]O'[QO#Z#Qi#]#Qi#_#Qi#`#Qi#c#Qi'd#Qi'k#Qi'l#Qi~OY#Qi![#Qi#W#Qi#X#Qi#Y#Qi~P$MmOY8gO![8^O#W8^O#X8^O#Y8^O~P$MmOP#ZOY8gOi8[Oq!xOr!xOt!yO![8^O!]!vO!_!wO!e#ZO#R8YO#S8ZO#T8ZO#U8ZO#V8]O#W8^O#X8^O#Y8^O#Z8_O'[QO#]#Qi#_#Qi#`#Qi#c#Qi'd#Qi'l#Qi~O'k#Qi~P% {O'k!zO~P% {OP#ZOY8gOi8[Oq!xOr!xOt!yO![8^O!]!vO!_!wO!e#ZO#R8YO#S8ZO#T8ZO#U8ZO#V8]O#W8^O#X8^O#Y8^O#Z8_O#]8aO'[QO'k!zO#_#Qi#`#Qi#c#Qi'd#Qi~O'l#Qi~P%#}O'l!{O~P%#}OP#ZOY8gOi8[Oq!xOr!xOt!yO![8^O!]!vO!_!wO!e#ZO#R8YO#S8ZO#T8ZO#U8ZO#V8]O#W8^O#X8^O#Y8^O#Z8_O#]8aO#_8cO'[QO'k!zO'l!{O~O#`#Qi#c#Qi'd#Qi~P%&PO^#ay|#ay&z#ayy#ay!^#ay'^#ay!O#ay$u#ay!W#ay~P!)jOP#QiY#Qii#Qir#Qi![#Qi!]#Qi!_#Qi!e#Qi#R#Qi#S#Qi#T#Qi#U#Qi#V#Qi#W#Qi#X#Qi#Y#Qi#Z#Qi#]#Qi#_#Qi#`#Qi#c#Qi'[#Qi|#Qi}#Qi~P!$OO!]!vOP'WXY'WXi'WXq'WXr'WXt'WX!['WX!_'WX!e'WX#R'WX#S'WX#T'WX#U'WX#V'WX#W'WX#X'WX#Y'WX#Z'WX#]'WX#_'WX#`'WX#c'WX'['WX'd'WX'k'WX'l'WX|'WX}'WX~O#c#di~P#){O}3iO~O|&fa}&fa#c&fa~P#JdO!W!tO'd&fO|&ga!^&ga~O|,gO!^'qi~O|,gO!W!tO!^'qi~Oy&ia|&ia~P!$OO!W3pO~O|,nOy'ri~P!$OO|,nOy'ri~Oy3vO~O!W!tO#X3|O~Oi3}O!W!tO'd&fO~Oy4PO~O'S$^q|$^q#c$^q!t$^q~P!$OO|1]O!O'sa~O!O&[O$u4UO~O!O&[O$u4UO~P!$OOY4XO~O|-oO}'yi~O]4ZO~O[4[O~O'X&yO|&nX}&nX~O|1vO}'va~O}4iO~P$6VO!R4lO!S4kO!T4kO!q/mO'P$^O'X(XO~O!n4mO!o4mO~P%0sO!S4kO!T4kO'P$^O'X(XO~O!O.YO~O!O.YO$u4oO~O!O.YO$u4oO~P!$OOR4tO!O.YO!j4sO$u4oO~OY4yO|&qa}&qa~O|.fO}'wi~O]4|O~O!^4}O~O!^5OO~O!^5PO~O!^5PO~P)rO^5RO~O!W5UO~O!^5WO~O|'ii}'ii~P#JdO^$WO&z$WO~P#>[O^$WO!t5]O&z$WO~O^$WO!W!tO!t5]O&z$WO~O^$WO!W!tO!e5bO!t5]O&z$WO'd&fO~O!_$TO'T$_O~P%4vO!S5cO!T5cO'P$^O'X(XO~O|'fy!^'fy^'fy&z'fy~P!)jO#O$^qP$^qY$^q^$^qi$^qr$^q|$^q![$^q!]$^q!_$^q!e$^q#R$^q#S$^q#T$^q#U$^q#V$^q#W$^q#X$^q#Y$^q#Z$^q#]$^q#_$^q#`$^q&z$^q'[$^q!^$^qy$^q!O$^q!t$^q$u$^q'^$^q!W$^q~P!$OO|&_i!^&_i~P!)jO|8eO#c$Qa~P#GlOq-VOr-VOt-WOPnaYnaina![na!]na!_na!ena#Rna#Sna#Tna#Una#Vna#Wna#Xna#Yna#Zna#]na#_na#`na#cna'[na'dna'kna'lna|na}na~Oq'sOt'tOP$RaY$Rai$Rar$Ra![$Ra!]$Ra!_$Ra!e$Ra#R$Ra#S$Ra#T$Ra#U$Ra#V$Ra#W$Ra#X$Ra#Y$Ra#Z$Ra#]$Ra#_$Ra#`$Ra#c$Ra'[$Ra'd$Ra'k$Ra'l$Ra|$Ra}$Ra~Oq'sOt'tOP$TaY$Tai$Tar$Ta![$Ta!]$Ta!_$Ta!e$Ta#R$Ta#S$Ta#T$Ta#U$Ta#V$Ta#W$Ta#X$Ta#Y$Ta#Z$Ta#]$Ta#_$Ta#`$Ta#c$Ta'[$Ta'd$Ta'k$Ta'l$Ta|$Ta}$Ta~OP$caY$cai$car$ca![$ca!]$ca!_$ca!e$ca#R$ca#S$ca#T$ca#U$ca#V$ca#W$ca#X$ca#Y$ca#Z$ca#]$ca#_$ca#`$ca#c$ca'[$ca|$ca}$ca~P!$OO#c#}q~P#){O}5jO~O'S$qy|$qy#c$qy!t$qy~P!$OO!W!tO|&gi!^&gi~O!W!tO'd&fO|&gi!^&gi~O|,gO!^'qq~Oy&ii|&ii~P!$OO|,nOy'rq~Oy5qO~P!$OOy5qO~O|'Vy'S'Vy~P!$OO|&la!O&la~P!$OO!O$iq^$iq&z$iq~P!$OO|-oO}'yq~O]5zO~O!O&[O$u5{O~O!O&[O$u5{O~P!$OO!t5|O|&na}&na~O|1vO}'vi~P#JdO!S6SO!T6SO'P$^O'X(XO~O!R6UO!S6SO!T6SO!q3ZO'P$^O'X(XO~O!O.YO$u6XO~O!O.YO$u6XO~P!$OO'X6_O~O|.fO}'wq~O!^6bO~O!^6bO~P)rO!^6dO~O!^6eO~O|!{y}!{y~P#JdO^$WO!t6jO&z$WO~O^$WO!W!tO!t6jO&z$WO~O^$WO!W!tO!e6nO!t6jO&z$WO'd&fO~O#O$qyP$qyY$qy^$qyi$qyr$qy|$qy![$qy!]$qy!_$qy!e$qy#R$qy#S$qy#T$qy#U$qy#V$qy#W$qy#X$qy#Y$qy#Z$qy#]$qy#_$qy#`$qy&z$qy'[$qy!^$qyy$qy!O$qy!t$qy$u$qy'^$qy!W$qy~P!$OO#c#ay~P#){OP$[iY$[ii$[ir$[i![$[i!]$[i!_$[i!e$[i#R$[i#S$[i#T$[i#U$[i#V$[i#W$[i#X$[i#Y$[i#Z$[i#]$[i#_$[i#`$[i#c$[i'[$[i|$[i}$[i~P!$OOq'sOt'tO'l'xOP$miY$mii$mir$mi![$mi!]$mi!_$mi!e$mi#R$mi#S$mi#T$mi#U$mi#V$mi#W$mi#X$mi#Y$mi#Z$mi#]$mi#_$mi#`$mi#c$mi'[$mi'd$mi'k$mi|$mi}$mi~Oq'sOt'tOP$oiY$oii$oir$oi![$oi!]$oi!_$oi!e$oi#R$oi#S$oi#T$oi#U$oi#V$oi#W$oi#X$oi#Y$oi#Z$oi#]$oi#_$oi#`$oi#c$oi'[$oi'd$oi'k$oi'l$oi|$oi}$oi~O!W!tO|&gq!^&gq~O|,gO!^'qy~Oy&iq|&iq~P!$OOy6tO~P!$OO|1vO}'vq~O!S7PO!T7PO'P$^O'X(XO~O!O.YO$u7SO~O!O.YO$u7SO~P!$OO!^7VO~O%{7WOP%x!ZQ%x!ZW%x!Z]%x!Z^%x!Za%x!Zb%x!Zg%x!Zi%x!Zj%x!Zk%x!Zm%x!Zo%x!Zt%x!Zv%x!Zw%x!Zx%x!Z!O%x!Z!Y%x!Z!_%x!Z!b%x!Z!c%x!Z!d%x!Z!e%x!Z!f%x!Z!i%x!Z#j%x!Z#n%x!Z$t%x!Z$v%x!Z$x%x!Z$y%x!Z$z%x!Z$}%x!Z%P%x!Z%S%x!Z%T%x!Z%V%x!Z%d%x!Z%j%x!Z%l%x!Z%n%x!Z%p%x!Z%s%x!Z%y%x!Z%}%x!Z&P%x!Z&R%x!Z&T%x!Z&V%x!Z&u%x!Z'O%x!Z'[%x!Z'p%x!Z}%x!Z%q%x!Z_%x!Z%v%x!Z~O^$WO!t7[O&z$WO~O^$WO!W!tO!t7[O&z$WO~OP$^qY$^qi$^qr$^q![$^q!]$^q!_$^q!e$^q#R$^q#S$^q#T$^q#U$^q#V$^q#W$^q#X$^q#Y$^q#Z$^q#]$^q#_$^q#`$^q#c$^q'[$^q|$^q}$^q~P!$OO|&nq}&nq~P#JdO^$WO!t7pO&z$WO~OP$qyY$qyi$qyr$qy![$qy!]$qy!_$qy!e$qy#R$qy#S$qy#T$qy#U$qy#V$qy#W$qy#X$qy#Y$qy#Z$qy#]$qy#_$qy#`$qy#c$qy'[$qy|$qy}$qy~P!$OO|#_O'^'YX!^'YX^'YX&z'YX~P!)jO'^'YX~P.ZO'^ZXyZX!^ZX%hZX!OZX$uZX!WZX~P$tO!WcX!^ZX!^cX'dcX~P:tOP;OOQ;OO]bOa:vOb!gOgbOi;OOjbOkbOm;OOo;OOtROvbOwbOxbO!OSO!Y;PO!_UO!b;OO!c;OO!d;OO!e;OO!f;OO!i!fO#j!iO#n]O'O'XO'[QO'p;vO~O|8eO}$Qa~O]#nOg#zOi#oOj#nOk#nOm#{Oo8jOt#tO!O#uO!Y:zO!_#rO!}8pO#j$PO$S8lO$U8nO$X$QO'O&qO~O}ZX}cX~P:tO|8eO#c'YX~P#JdO#c'YX~P#2^O#O8WO~O#O8XO~O!W!tO#O8WO~O!W!tO#O8XO~O!t8hO~O!t8qO|'iX}'iX~O!t;]O|'gX}'gX~O#O8rO~O#O8sO~O'S8wO~P!$OO#O8|O~O#O8}O~O!W!tO#O9OO~O!W!tO#O9PO~O!W!tO#O9QO~O!^!Xa^!Xa&z!Xa~P#>[O#O9RO~O!W!tO#O8rO~O!W!tO#O8sO~O!W!tO#O9RO~OP#ZOq!xOr!xOt!yO!]!vO!_!wO!e#ZO#R9jO'[QOY#Qii#Qi![#Qi!^#Qi#V#Qi#W#Qi#X#Qi#Y#Qi#Z#Qi#]#Qi#_#Qi#`#Qi'd#Qi'k#Qi'l#Qi^#Qi&z#Qi~O#S#Qi#T#Qi#U#Qi~P&3bO#S9kO#T9kO#U9kO~P&3bOP#ZOi9lOq!xOr!xOt!yO!]!vO!_!wO!e#ZO#R9jO#S9kO#T9kO#U9kO'[QOY#Qi![#Qi!^#Qi#W#Qi#X#Qi#Y#Qi#Z#Qi#]#Qi#_#Qi#`#Qi'd#Qi'k#Qi'l#Qi^#Qi&z#Qi~O#V#Qi~P&5pO#V9mO~P&5pOP#ZOY#aOi9lOq!xOr!xOt!yO![9nO!]!vO!_!wO!e#ZO#R9jO#S9kO#T9kO#U9kO#V9mO#W9nO#X9nO#Y9nO'[QO!^#Qi#]#Qi#_#Qi#`#Qi'd#Qi'k#Qi'l#Qi^#Qi&z#Qi~O#Z#Qi~P&7xO#Z9oO~P&7xOP#ZOY#aOi9lOq!xOr!xOt!yO![9nO!]!vO!_!wO!e#ZO#R9jO#S9kO#T9kO#U9kO#V9mO#W9nO#X9nO#Y9nO#Z9oO'[QO'k!zO!^#Qi#_#Qi#`#Qi'd#Qi'l#Qi^#Qi&z#Qi~O#]#Qi~P&:QO#]9qO~P&:QOP#ZOY#aOi9lOq!xOr!xOt!yO![9nO!]!vO!_!wO!e#ZO#R9jO#S9kO#T9kO#U9kO#V9mO#W9nO#X9nO#Y9nO#Z9oO#]9qO'[QO'k!zO'l!{O!^#Qi#`#Qi'd#Qi^#Qi&z#Qi~O#_#Qi~P&<YO#_9sO~P&<YO#c9SO~P#){O!^#di^#di&z#di~P#>[O#O9TO~O#O9UO~O#O9VO~O#O9WO~O#O9XO~O#O9YO~O#O9ZO~O#O9[O~O!^#}q^#}q&z#}q~P#>[O#c9]O~P!$OO#c9^O~P!$OO!^#ay^#ay&z#ay~P#>[OP'ZXY'ZXi'ZXq'ZXr'ZXt'ZX!['ZX!]'ZX!_'ZX!e'ZX#R'ZX#S'ZX#T'ZX#U'ZX#V'ZX#W'ZX#X'ZX#Y'ZX#Z'ZX#]'ZX#_'ZX#`'ZX'['ZX'd'ZX'k'ZX'l'ZX~O!t9uO#e9uO!^'ZX^'ZX&z'ZX~P&@jO!t9uO~O'S:_O~P!$OO#c:hO~P#){O#O:mO~O!W!tO#O:mO~O!t;]O~O'S;^O~P!$OO#c;_O~P#){O!t;]O#e;]O|'ZX}'ZX~P#+vO|!Xa}!Xa#c!Xa~P#JdO#R;QO~P$GoOP#ZOq!xOr!xOt!yO!]!vO!_!wO!e#ZO#R;QO#S;RO#T;RO#U;RO'[QOY#Qi|#Qi}#Qi![#Qi#V#Qi#W#Qi#X#Qi#Y#Qi#Z#Qi#]#Qi#_#Qi#`#Qi'd#Qi'k#Qi'l#Qi#c#Qi~Oi#Qi~P&DlOi;SO~P&DlOP#ZOi;SOq!xOr!xOt!yO!]!vO!_!wO!e#ZO#R;QO#S;RO#T;RO#U;RO#V;TO'[QO|#Qi}#Qi#Z#Qi#]#Qi#_#Qi#`#Qi'd#Qi'k#Qi'l#Qi#c#Qi~OY#Qi![#Qi#W#Qi#X#Qi#Y#Qi~P&FtOY8gO![;UO#W;UO#X;UO#Y;UO~P&FtOP#ZOY8gOi;SOq!xOr!xOt!yO![;UO!]!vO!_!wO!e#ZO#R;QO#S;RO#T;RO#U;RO#V;TO#W;UO#X;UO#Y;UO#Z;VO'[QO|#Qi}#Qi#]#Qi#_#Qi#`#Qi'd#Qi'l#Qi#c#Qi~O'k#Qi~P&IYO'k!zO~P&IYOP#ZOY8gOi;SOq!xOr!xOt!yO![;UO!]!vO!_!wO!e#ZO#R;QO#S;RO#T;RO#U;RO#V;TO#W;UO#X;UO#Y;UO#Z;VO#];XO'[QO'k!zO|#Qi}#Qi#_#Qi#`#Qi'd#Qi#c#Qi~O'l#Qi~P&KbO'l!{O~P&KbOP#ZOY8gOi;SOq!xOr!xOt!yO![;UO!]!vO!_!wO!e#ZO#R;QO#S;RO#T;RO#U;RO#V;TO#W;UO#X;UO#Y;UO#Z;VO#];XO#_;ZO'[QO'k!zO'l!{O~O|#Qi}#Qi#`#Qi'd#Qi#c#Qi~P&MjO|#di}#di#c#di~P#JdO|#}q}#}q#c#}q~P#JdO|#ay}#ay#c#ay~P#JdO#n~!]!m!o!|!}'p$S$U$X$j$t$u$v$}%P%S%T%V%X~TS#n'p#p'X'O&|#Sx~",
-      goto: "$!b'}PPPPPPP(OP(`P)xPPPP.ZPP.p4p6`6uP6uPPP6uP6uP8dPP8iP9QPPPP>vPPPP>vBdPPPBjDmP>vPGXPPPPIh>vPPPPPKx>vPP! u!!rPPP!!vP!#O!$PP>v>v!'j!+k!1f!1f!5uPPP!5|>vPPPPPPPPP!9rP!;dPP>v!<|P>vP>v>v>v>vP>v!?iPP!C^P!F}!GV!GZ!GZPP!G_!G_P!KOP!KS>v>v!KY!N|6uP6uP6u6uP#!e6u6u#$Z6u6u6u#&^6u6u#&z#(u#(u#(y#(u#)RP#(uP6u#)}6u#+Y6u6u.ZPPP#,hPPP#-Q#-QP#-QP#-g#-QPP#-mP#-dP#-d#.P!!z#-d#.n#.t#.w(O#.z(OP#/R#/R#/RP(OP(OP(OP(OPP(OP#/X#/[P#/[(OPPP(OP(OP(OP(OP(OP(O(O#/`#/j#/p#0O#0U#0[#0f#0l#0v#0|#1[#1b#1h#2O#2e#3x#4W#4^#4d#4j#4p#4z#5Q#5W#5b#5l#5rPPPPPPPP#5xPP#6l#:jPP#;x#<R#<]P#@l#CoP#KgP#Kk#Kn#Kq#K|#LPP#LS#LW#Lu#Mj#Mn#NQPP#NU#N[#N`P#Nc#Ng#Nj$ Y$ p$ u$ x$ {$!R$!U$!Y$!^mgOSi{!k$V%^%a%b%d*^*c.v.yQ$dlQ$knQ%UwS&O!`*yQ&c!gS([#u(aQ)W$fQ)c$mQ)}%OQ+P&VS+V&[+XQ,}(cQ.e*OU/j+Z+[+]S1{.Y1}S3V/l/nU4k2Q2R2SQ5c3YS6S4l4mR7P6U$hZORSTUij{!Q!U!Z!^!k!s!w!y!|!}#O#P#Q#R#S#T#U#V#W#_#b$V%V%Y%^%`%a%b%d%h%s%{&W&^&g&s&w'r(t({*Y*^*c+b+h+y,P-W-[-d-m.].n.o.p.r.v.y.{/v0Q1p2Y2m2o2p4s5R8X8s9P9W9Zx'Z#Y8Q8T8Y8Z8[8]8^8_8`8a8b8c8d8h8w9S:w;f;wQ(l#|Q)[$gQ*P%RQ*W%ZQ+q8iQ-i)PQ.m*UQ1i-oQ2b.fQ3c8j!O:n$i/d3Q5]6j7[7p9d9e9j9k9l9m9n9o9p9q9r9s9t9u:_:h!q;g#h&P'l*r*u,U/Z0e1x2y5|8W8e8q8r9O9Q9R9V9X9Y9[:m;O;P;Q;R;S;T;U;V;W;X;Y;Z;[;];^;_pdOSiw{!k$V%T%^%a%b%d*^*c.v.yR*R%V(WVOSTijm{!Q!U!Z!h!k!s!w!y!|!}#O#P#Q#R#S#T#U#V#W#Y#_#b#h$V$i%V%Y%Z%^%`%a%b%d%h%s%{&W&^&g&s&w'l'r(t({*Y*^*c*r*u+b+h+y,P,U-W-[-d-m.].n.o.p.r.v.y.{/Z/d/v0Q0e1p1x2Y2m2o2p2y3Q4s5R5]5|6j7[7p8Q8T8W8X8Y8Z8[8]8^8_8`8a8b8c8d8e8h8q8r8s8w9O9P9Q9R9S9V9W9X9Y9Z9[9d9e9j9k9l9m9n9o9p9q9r9s9t9u:_:h:m:t:u:v:w;O;P;Q;R;S;T;U;V;W;X;Y;Z;[;];^;_;f;wW!aRU!^&PQ$]kQ$clS$hn$mv$rpq!o!r$T$p&X&k&n)g)h)i*[*s+S+k+m/P/xQ$zuQ&`!fQ&b!gS(O#r(YS)U$d$fQ)Y$gQ)f$oQ)x$|Q)|%OQ+f&cQ,k(PQ-n)WQ-s)]Q-v)aQ.`)yS.d)}*OQ0l,gQ1h-oQ1k-rQ1n-xQ2a.eQ3m0mR5x4X!Q$al!g$c$d$f%}&b&c(Z)U)W*v+U+f,w-n/`/g/k1R3T3X5a6mQ(}$]Q)n$wQ)q$xQ){%OQ-z)fQ._)xU.c)|)}*OQ2[.`S2`.d.eQ4f1zQ4x2aS6Q4g4jS6}6R6TQ7g7OR7u7h[#x`$_(i:p;e;vS$wr%TQ$xsQ$ytR)l$u$X#w`!t!v#a#r#t#}$O$S&_'w'y'z(R(V(g(h(z(|)P)m)p+c+v,n,p-Y-c-e.P.S.[.^0k0t1O1V1]1`1d1q2X2Z3p3|4U4o4t5{6X7S8g8k8l8m8n8o8p8x8y8z8{8|8}9T9U9]9^:p:|:};e;vV(m#|8i8jU&S!`$q*|Q&z!xQ)`$jQ,^'sQ.T)rQ1W-VR4b1v(UbORSTUij{!Q!U!Z!^!k!s!w!y!|!}#O#P#Q#R#S#T#U#V#W#Y#_#b#h$V$i%V%Y%Z%^%`%a%b%d%h%s%{&P&W&^&g&s&w'l'r(t({*Y*^*c*r*u+b+h+y,P,U-W-[-d-m.].n.o.p.r.v.y.{/Z/d/v0Q0e1p1x2Y2m2o2p2y3Q4s5R5]5|6j7[7p8Q8T8W8X8Y8Z8[8]8^8_8`8a8b8c8d8e8h8q8r8s8w9O9P9Q9R9S9V9W9X9Y9Z9[9d9e9j9k9l9m9n9o9p9q9r9s9t9u:_:h:m:w;O;P;Q;R;S;T;U;V;W;X;Y;Z;[;];^;_;f;w%]#^Y!]!l$Z%r%v&v&|&}'O'P'Q'R'S'T'U'V'W'Y']'`'j)_*n*w+Q+g+{,O,Q,]/U/X/u0P0T0U0V0W0X0Y0Z0[0]0^0_0`0c0h2{3O3^3a3g4d5X5[5f6h6y7Y7n7x8R8S8u8v9|:R:S:T:U:V:W:X:Y:Z:[:]:^:i:l:{;d;h;i;j;k;l;m;n;o;p;q;r;s;t;u(VbORSTUij{!Q!U!Z!^!k!s!w!y!|!}#O#P#Q#R#S#T#U#V#W#Y#_#b#h$V$i%V%Y%Z%^%`%a%b%d%h%s%{&P&W&^&g&s&w'l'r(t({*Y*^*c*r*u+b+h+y,P,U-W-[-d-m.].n.o.p.r.v.y.{/Z/d/v0Q0e1p1x2Y2m2o2p2y3Q4s5R5]5|6j7[7p8Q8T8W8X8Y8Z8[8]8^8_8`8a8b8c8d8e8h8q8r8s8w9O9P9Q9R9S9V9W9X9Y9Z9[9d9e9j9k9l9m9n9o9p9q9r9s9t9u:_:h:m:w;O;P;Q;R;S;T;U;V;W;X;Y;Z;[;];^;_;f;wQ&Q!`R/[*yY%z!`&O&V*y+PS(Z#u(aS+U&[+XS,w([(cQ,x(]Q-O(dQ.V)tS/g+V+ZS/k+[+]S/o+^2PQ1R,}Q1T-PQ1U-QS1z.Y1}S3T/j/lQ3W/mQ3X/nS4g1{2SS4j2Q2RS5a3V3YQ5d3ZS6R4k4lQ6T4mQ6m5cS7O6S6UR7h7PlgOSi{!k$V%^%a%b%d*^*c.v.yQ%f!OW&o!s8W8X:mQ)S$bQ)v$zQ)w${Q+d&aW+u&s8r8s9RW-Z(t9O9P9QQ-k)TQ.X)uQ.}*eQ/O*fQ/W*tQ/s+eW1[-[9V9W9XQ1e-lW1f-m9Y9Z9[Q2z/YQ2}/bQ3]/tQ4W1gQ5V2wQ5Y2|Q5^3SQ6f5WQ6i5_Q7Z6kQ7l7WR7o7]%S#]Y!]!l%r%v&v&|&}'O'P'Q'R'S'T'U'V'W'Y']'`'j)_*n*w+Q+g+{,O,]/U/X/u0P0T0U0V0W0X0Y0Z0[0]0^0_0`0c0h2{3O3^3a3g4d5X5[5f6h6y7Y7n7x8R8S8u8v:R:S:T:U:V:W:X:Y:Z:[:]:^:i:l:{;d;i;j;k;l;m;n;o;p;q;r;s;t;uU(f#v&r0bX(x$Z,Q9|;h%S#[Y!]!l%r%v&v&|&}'O'P'Q'R'S'T'U'V'W'Y']'`'j)_*n*w+Q+g+{,O,]/U/X/u0P0T0U0V0W0X0Y0Z0[0]0^0_0`0c0h2{3O3^3a3g4d5X5[5f6h6y7Y7n7x8R8S8u8v:R:S:T:U:V:W:X:Y:Z:[:]:^:i:l:{;d;i;j;k;l;m;n;o;p;q;r;s;t;uQ'[#]W(w$Z,Q9|;hR-](x(UbORSTUij{!Q!U!Z!^!k!s!w!y!|!}#O#P#Q#R#S#T#U#V#W#Y#_#b#h$V$i%V%Y%Z%^%`%a%b%d%h%s%{&P&W&^&g&s&w'l'r(t({*Y*^*c*r*u+b+h+y,P,U-W-[-d-m.].n.o.p.r.v.y.{/Z/d/v0Q0e1p1x2Y2m2o2p2y3Q4s5R5]5|6j7[7p8Q8T8W8X8Y8Z8[8]8^8_8`8a8b8c8d8e8h8q8r8s8w9O9P9Q9R9S9V9W9X9Y9Z9[9d9e9j9k9l9m9n9o9p9q9r9s9t9u:_:h:m:w;O;P;Q;R;S;T;U;V;W;X;Y;Z;[;];^;_;f;wQ%ayQ%bzQ%d|Q%e}R.u*aQ&]!fQ(y$]Q+a&`S-b(})fS/p+_+`W1_-_-`-a-zS3[/q/rU4T1a1b1cU5v4S4^4_Q6v5wR7c6xT+W&[+XS+W&[+XT1|.Y1}S&i!n.sQ,j(OQ,u(ZS/f+U1zQ0q,kS0{,v-OU3U/k/o4jQ3l0lS3z1S1UU5b3W3X6TQ5l3mQ5u3}R6n5dQ!uXS&h!n.sQ(u$UQ)Q$`Q)V$eQ+i&iQ,i(OQ,t(ZQ,y(^Q-j)RQ.a)zS/e+U1zS0p,j,kS0z,u-OQ0},xQ1Q,zQ2^.bW3R/f/k/o4jQ3k0lQ3o0qS3t0{1UQ3{1TQ4v2_W5`3U3W3X6TS5k3l3mQ5p3vQ5s3zQ6O4eQ6]4wS6l5b5dQ6p5lQ6r5qQ6u5uQ6{6PQ7U6^Q7^6nQ7a6tQ7e6|Q7s7fQ7z7tQ8O7{Q9h9aQ9i9bQ9};aQ:b9yQ:c9zQ:d9{Q:e:OQ:f:PR:g:Q$jWORSTUij{!Q!U!Z!^!k!s!w!y!|!}#O#P#Q#R#S#T#U#V#W#_#b$V%V%Y%Z%^%`%a%b%d%h%s%{&W&^&g&s&w'r(t({*Y*^*c+b+h+y,P-W-[-d-m.].n.o.p.r.v.y.{/v0Q1p2Y2m2o2p4s5R8X8s9P9W9ZS!um!hx9_#Y8Q8T8Y8Z8[8]8^8_8`8a8b8c8d8h8w9S:w;f;w!O9`$i/d3Q5]6j7[7p9d9e9j9k9l9m9n9o9p9q9r9s9t9u:_:hQ9h:tQ9i:uQ9}:v!q;`#h&P'l*r*u,U/Z0e1x2y5|8W8e8q8r9O9Q9R9V9X9Y9[:m;O;P;Q;R;S;T;U;V;W;X;Y;Z;[;];^;_$jXORSTUij{!Q!U!Z!^!k!s!w!y!|!}#O#P#Q#R#S#T#U#V#W#_#b$V%V%Y%Z%^%`%a%b%d%h%s%{&W&^&g&s&w'r(t({*Y*^*c+b+h+y,P-W-[-d-m.].n.o.p.r.v.y.{/v0Q1p2Y2m2o2p4s5R8X8s9P9W9ZQ$Ua!Q$`l!g$c$d$f%}&b&c(Z)U)W*v+U+f,w-n/`/g/k1R3T3X5a6mS$em!hQ)R$aQ)z%OW.b){)|)}*OU2_.c.d.eQ4e1zS4w2`2aU6P4f4g4jQ6^4xU6|6Q6R6TS7f6}7OS7t7g7hQ7{7ux9a#Y8Q8T8Y8Z8[8]8^8_8`8a8b8c8d8h8w9S:w;f;w!O9b$i/d3Q5]6j7[7p9d9e9j9k9l9m9n9o9p9q9r9s9t9u:_:hQ9y:qQ9z:rQ9{:sQ:O:tQ:P:uQ:Q:v!q;a#h&P'l*r*u,U/Z0e1x2y5|8W8e8q8r9O9Q9R9V9X9Y9[:m;O;P;Q;R;S;T;U;V;W;X;Y;Z;[;];^;_$b[OSTij{!Q!U!Z!k!s!w!y!|!}#O#P#Q#R#S#T#U#V#W#_#b$V%V%Y%^%`%a%b%d%h%s%{&W&^&g&s&w'r(t({*Y*^*c+b+h+y,P-W-[-d-m.].n.o.p.r.v.y.{/v0Q1p2Y2m2o2p4s5R8X8s9P9W9ZU!eRU!^v$rpq!o!r$T$p&X&k&n)g)h)i*[*s+S+k+m/P/xQ*X%Zx9c#Y8Q8T8Y8Z8[8]8^8_8`8a8b8c8d8h8w9S:w;f;wQ9g&P!O:o$i/d3Q5]6j7[7p9d9e9j9k9l9m9n9o9p9q9r9s9t9u:_:h!o;b#h'l*r*u,U/Z0e1x2y5|8W8e8q8r9O9Q9R9V9X9Y9[:m;O;P;Q;R;S;T;U;V;W;X;Y;Z;[;];^;_S&T!`$qR/^*|$hZORSTUij{!Q!U!Z!^!k!s!w!y!|!}#O#P#Q#R#S#T#U#V#W#_#b$V%V%Y%^%`%a%b%d%h%s%{&W&^&g&s&w'r(t({*Y*^*c+b+h+y,P-W-[-d-m.].n.o.p.r.v.y.{/v0Q1p2Y2m2o2p4s5R8X8s9P9W9Zx'Z#Y8Q8T8Y8Z8[8]8^8_8`8a8b8c8d8h8w9S:w;f;wQ*W%Z!O:n$i/d3Q5]6j7[7p9d9e9j9k9l9m9n9o9p9q9r9s9t9u:_:h!q;g#h&P'l*r*u,U/Z0e1x2y5|8W8e8q8r9O9Q9R9V9X9Y9[:m;O;P;Q;R;S;T;U;V;W;X;Y;Z;[;];^;_!Q#SY!]$Z%r%v&v'T'U'V'W']'`*n+Q+g+{,]/u0P0`3^3a8R8Sh8`'Y,Q0[0]0^0_0c3g5f:]:{;dn9p)_3O5[6h7Y7n7x9|:X:Y:Z:[:^:i:lw;W'j*w/U/X0h2{4d5X6y8u8v;h;o;p;q;r;s;t;u|#UY!]$Z%r%v&v'V'W']'`*n+Q+g+{,]/u0P0`3^3a8R8Sd8b'Y,Q0^0_0c3g5f:]:{;dj9r)_3O5[6h7Y7n7x9|:Z:[:^:i:ls;Y'j*w/U/X0h2{4d5X6y8u8v;h;q;r;s;t;ux#YY!]$Z%r%v&v']'`*n+Q+g+{,]/u0P0`3^3a8R8Sp'z#p&t(s,e,m-R-S/}1Z3j4O9v:j:k:x;c`:w'Y,Q0c3g5f:]:{;d!^:|&p'_'}(T+`+t,q-^-a.O.Q/r/|0r0v1c1s1u2V3`3q3w4Q4V4_4r5e5n5t6ZY:}0a3f5g6o7_f;f)_3O5[6h7Y7n7x9|:^:i:lo;w'j*w/U/X0h2{4d5X6y8u8v;h;s;t;u(UbORSTUij{!Q!U!Z!^!k!s!w!y!|!}#O#P#Q#R#S#T#U#V#W#Y#_#b#h$V$i%V%Y%Z%^%`%a%b%d%h%s%{&P&W&^&g&s&w'l'r(t({*Y*^*c*r*u+b+h+y,P,U-W-[-d-m.].n.o.p.r.v.y.{/Z/d/v0Q0e1p1x2Y2m2o2p2y3Q4s5R5]5|6j7[7p8Q8T8W8X8Y8Z8[8]8^8_8`8a8b8c8d8e8h8q8r8s8w9O9P9Q9R9S9V9W9X9Y9Z9[9d9e9j9k9l9m9n9o9p9q9r9s9t9u:_:h:m:w;O;P;Q;R;S;T;U;V;W;X;Y;Z;[;];^;_;f;wS#i_#jR0d,T(]^ORSTU_ij{!Q!U!Z!^!k!s!w!y!|!}#O#P#Q#R#S#T#U#V#W#Y#_#b#h#j$V$i%V%Y%Z%^%`%a%b%d%h%s%{&P&W&^&g&s&w'l'r(t({*Y*^*c*r*u+b+h+y,P,T,U-W-[-d-m.].n.o.p.r.v.y.{/Z/d/v0Q0e1p1x2Y2m2o2p2y3Q4s5R5]5|6j7[7p8Q8T8W8X8Y8Z8[8]8^8_8`8a8b8c8d8e8h8q8r8s8w9O9P9Q9R9S9V9W9X9Y9Z9[9d9e9j9k9l9m9n9o9p9q9r9s9t9u:_:h:m:w;O;P;Q;R;S;T;U;V;W;X;Y;Z;[;];^;_;f;wS#d]#kT'c#f'gT#e]#kT'e#f'g(]_ORSTU_ij{!Q!U!Z!^!k!s!w!y!|!}#O#P#Q#R#S#T#U#V#W#Y#_#b#h#j$V$i%V%Y%Z%^%`%a%b%d%h%s%{&P&W&^&g&s&w'l'r(t({*Y*^*c*r*u+b+h+y,P,T,U-W-[-d-m.].n.o.p.r.v.y.{/Z/d/v0Q0e1p1x2Y2m2o2p2y3Q4s5R5]5|6j7[7p8Q8T8W8X8Y8Z8[8]8^8_8`8a8b8c8d8e8h8q8r8s8w9O9P9Q9R9S9V9W9X9Y9Z9[9d9e9j9k9l9m9n9o9p9q9r9s9t9u:_:h:m:w;O;P;Q;R;S;T;U;V;W;X;Y;Z;[;];^;_;f;wT#i_#jQ#l_R'n#j$jaORSTUij{!Q!U!Z!^!k!s!w!y!|!}#O#P#Q#R#S#T#U#V#W#_#b$V%V%Y%Z%^%`%a%b%d%h%s%{&W&^&g&s&w'r(t({*Y*^*c+b+h+y,P-W-[-d-m.].n.o.p.r.v.y.{/v0Q1p2Y2m2o2p4s5R8X8s9P9W9Zx:q#Y8Q8T8Y8Z8[8]8^8_8`8a8b8c8d8h8w9S:w;f;w!O:r$i/d3Q5]6j7[7p9d9e9j9k9l9m9n9o9p9q9r9s9t9u:_:h!q:s#h&P'l*r*u,U/Z0e1x2y5|8W8e8q8r9O9Q9R9V9X9Y9[:m;O;P;Q;R;S;T;U;V;W;X;Y;Z;[;];^;_#{cOSUi{!Q!U!k!s!y#h$V%V%Y%Z%^%`%a%b%d%h%{&^&s'l(t({*Y*^*c+b,U-W-[-d-m.].n.o.p.r.v.y.{0e1p2Y2m2o2p4s5R8W8X8r8s9O9P9Q9R9V9W9X9Y9Z9[:mx#v`!v#}$O$S'w'y'z(R(g(h+v-Y0k1V:p:|:};e;v!z&r!t#a#r#t&_(V(z(|)P)m)p+c,n,p-c-e.P.S.[.^0t1O1]1`1d1q2X2Z3p3|4U4o4t5{6X7S8k8m8o8x8z8|9T9]Q(q$Qc0b8g8l8n8p8y8{8}9U9^x#s`!v#}$O$S'w'y'z(R(g(h+v-Y0k1V:p:|:};e;vS(^#u(aQ(r$RQ,z(_!z9w!t#a#r#t&_(V(z(|)P)m)p+c,n,p-c-e.P.S.[.^0t1O1]1`1d1q2X2Z3p3|4U4o4t5{6X7S8k8m8o8x8z8|9T9]b9x8g8l8n8p8y8{8}9U9^Q:`:yR:a:zleOSi{!k$V%^%a%b%d*^*c.v.yQ(U#tQ*j%kQ*k%mR0s,n$W#w`!t!v#a#r#t#}$O$S&_'w'y'z(R(V(g(h(z(|)P)m)p+c+v,n,p-Y-c-e.P.S.[.^0k0t1O1V1]1`1d1q2X2Z3p3|4U4o4t5{6X7S8g8k8l8m8n8o8p8x8y8z8{8|8}9T9U9]9^:p:|:};e;vQ)o$xQ.R)qQ1t.QR4a1uT(`#u(aS(`#u(aT1|.Y1}Q)Q$`Q,y(^Q-j)RQ.a)zQ2^.bQ4v2_Q6O4eQ6]4wQ6{6PQ7U6^Q7e6|Q7s7fQ7z7tR8O7{p'w#p&t(s,e,m-R-S/}1Z3j4O9v:j:k:x;c!^8x&p'_'}(T+`+t,q-^-a.O.Q/r/|0r0v1c1s1u2V3`3q3w4Q4V4_4r5e5n5t6ZZ8y0a3f5g6o7_r'y#p&t(s,c,e,m-R-S/}1Z3j4O9v:j:k:x;c!`8z&p'_'}(T+`+t,q-^-a.O.Q/r/z/|0r0v1c1s1u2V3`3q3w4Q4V4_4r5e5n5t6Z]8{0a3f5g5h6o7_pdOSiw{!k$V%T%^%a%b%d*^*c.v.yQ%QvR*Y%ZpdOSiw{!k$V%T%^%a%b%d*^*c.v.yR%QvQ)s$yR-})lqdOSiw{!k$V%T%^%a%b%d*^*c.v.yQ.Z)xS2W._.`W4n2T2U2V2[U6W4p4q4rU7Q6V6Y6ZQ7i7RR7v7jQ%XwR*S%TR2e.hR6`4yS$hn$mR-s)]Q%^xR*^%_R*d%eT.w*c.yQiOQ!kST$Yi!kQ!WQR%p!WQ![RU%t![%u*oQ%u!]R*o%vQ*z&QR/]*zQ+w&tR0O+wQ+z&vS0R+z0SR0S+{Q+X&[R/h+XQ&Y!cQ*p%wT+T&Y*pQ*}&TR/_*}Q&l!pQ+j&jU+n&l+j/yR/y+oQ'g#fR,V'gQ#j_R'm#jQ#`YW'^#`*m3b8fQ*m8RS+p8S8vQ3b8uR8f'jQ,h(OW0n,h0o3n5mU0o,i,j,kS3n0p0qR5m3o#s'u#p&p&t'_'}(T(n(o(s+`+r+s+t,c,d,e,m,q-R-S-^-a.O.Q/r/z/{/|/}0a0r0v1Z1c1s1u2V3`3d3e3f3j3q3w4O4Q4V4_4r5e5g5h5i5n5t6Z6o7_9v:j:k:x;cQ,o(TU0u,o0w3rQ0w,qR3r0vQ(a#uR,{(aQ(j#yR-U(jQ1^-^R4R1^Q)j$sR-|)jQ1w.TS4c1w5}R5}4dQ)u$zR.W)uQ1}.YR4h1}Q.g*PS2c.g4zR4z2eQ-p)YS1j-p4YR4Y1kQ)^$hR-t)^Q.y*cR2s.yWhOSi!kQ%c{Q(v$VQ*]%^Q*_%aQ*`%bQ*b%dQ.t*^S.w*c.yR2r.vQ$XfQ%g!PQ%j!RQ%l!SQ%n!TQ)e$nQ)k$tQ*R%XQ*h%iS.j*S*VQ/Q*gQ/R*jQ/S*kS/c+U1zQ0x,sQ0y,tQ1P,yQ1m-wQ1r.OQ2].aQ2g.lQ2q.uY3P/e/f/k/o4jQ3s0zQ3u0|Q3x1QQ4]1oQ4`1sQ4u2^Q4{2f[5Z3O3R3U3W3X6TQ5o3tQ5r3yQ5y4ZQ6[4vQ6a4|W6g5[5`5b5dQ6q5pQ6s5sQ6w5zQ6z6OQ7T6]U7X6h6l6nQ7`6rQ7b6uQ7d6{Q7k7US7m7Y7^Q7q7aQ7r7eQ7w7nQ7y7sQ7|7xQ7}7zR8P8OQ$blQ&a!gU)T$c$d$fQ*t%}S+e&b&cQ,s(ZS-l)U)WQ/Y*vQ/b+UQ/t+fQ0|,wQ1g-nQ2|/`S3S/g/kQ3y1RS5_3T3XQ6k5aR7]6mW#q`:p;e;vR)O$_Y#y`$_:p;e;vR-T(iQ#p`S&p!t)PQ&t!vQ'_#aQ'}#rQ(T#tQ(n#}Q(o$OQ(s$SQ+`&_Q+r8kQ+s8mQ+t8oQ,c'wQ,d'yQ,e'zQ,m(RQ,q(VQ-R(gQ-S(hd-^(z-c.[1`2X4U4o5{6X7SQ-a(|Q.O)mQ.Q)pQ/r+cQ/z8xQ/{8zQ/|8|Q/}+vQ0a8gQ0r,nQ0v,pQ1Z-YQ1c-eQ1s.PQ1u.SQ2V.^Q3`9TQ3d8lQ3e8nQ3f8pQ3j0kQ3q0tQ3w1OQ4O1VQ4Q1]Q4V1dQ4_1qQ4r2ZQ5e9]Q5g8}Q5h8yQ5i8{Q5n3pQ5t3|Q6Z4tQ6o9UQ7_9^Q9v:pQ:j:|Q:k:}Q:x;eR;c;vlfOSi{!k$V%^%a%b%d*^*c.v.yS!mU%`Q%i!QQ%o!UW&o!s8W8X:mQ&{!yQ'k#hS*V%V%YQ*Z%ZQ*g%hQ*q%{Q+_&^W+u&s8r8s9RQ,Z'lW-Z(t9O9P9QQ-`({Q.q*YQ/q+bQ0g,UQ1X-WW1[-[9V9W9XQ1b-dW1f-m9Y9Z9[Q2U.]Q2i.nQ2j.oQ2l.pQ2n.rQ2u.{Q3h0eQ4^1pQ4q2YQ5Q2mQ5S2oQ5T2pQ6Y4sR6c5R!vYOSUi{!Q!k!y$V%V%Y%Z%^%`%a%b%d%h%{&^({*Y*^*c+b-W-d.].n.o.p.r.v.y.{1p2Y2m2o2p4s5RQ!]RS!lT9eQ$ZjQ%r!ZQ%v!^Q&v!wS&|!|9jQ&}!}Q'O#OQ'P#PQ'Q#QQ'R#RQ'S#SQ'T#TQ'U#UQ'V#VQ'W#WQ'Y#YQ']#_Q'`#bW'j#h'l,U0eQ)_$iQ*n%sS*w&P/ZQ+Q&WQ+g&gQ+{&wS,O8Q;OQ,Q8TQ,]'rQ/U*rQ/X*uQ/u+hQ0P+yS0T8Y;QQ0U8ZQ0V8[Q0W8]Q0X8^Q0Y8_Q0Z8`Q0[8aQ0]8bQ0^8cQ0_8dQ0`,PQ0c8hQ0h8eQ2{8qQ3O/dQ3^/vQ3a0QQ3g8wQ4d1xQ5X2yQ5[3QQ5f9SQ6h5]Q6y5|Q7Y6jQ7n7[Q7x7p[8R!U8X8s9P9W9ZY8S!s&s(t-[-mY8u8W8r9O9V9YY8v9Q9R9X9[:mQ9|9dQ:R9kQ:S9lQ:T9mQ:U9nQ:V9oQ:W9pQ:X9qQ:Y9rQ:Z9sQ:[9tQ:]:wQ:^9uQ:i:_Q:l:hQ:{;fQ;d;wQ;h;PQ;i;RQ;j;SQ;k;TQ;l;UQ;m;VQ;n;WQ;o;XQ;p;YQ;q;ZQ;r;[Q;s;]Q;t;^R;u;_T!VQ!WR!_RR&R!`S%}!`*yS*v&O&VR/`+PR&u!vR&x!wT!qU$TS!pU$TU$spq*[S&j!o!rQ+l&kQ+o&nQ-{)iS/w+k+mR3_/x[!bR!^$p&X)g+Sh!nUpq!o!r$T&k&n)i+k+m/xQ.s*[Q/V*sQ2x/PT9f&P)hT!dR$pS!cR$pS%w!^)gS*x&P)hQ+R&XR/a+ST&U!`$qQ#f]R'p#kT'f#f'gR0f,TT(Q#r(YR(W#tQ-_(zQ1a-cQ2T.[Q4S1`Q4p2XQ5w4UQ6V4oQ6x5{Q7R6XR7j7SlgOSi{!k$V%^%a%b%d*^*c.v.yQ%WwR*R%TV$tpq*[R.U)rR*Q%RQ$lnR)d$mR)Z$gT%[x%_T%]x%_T.x*c.y",
-      nodeNames: "⚠ ArithOp ArithOp extends LineComment BlockComment Script ExportDeclaration export Star as VariableName from String ; default FunctionDeclaration async function VariableDefinition TypeParamList TypeDefinition ThisType this LiteralType ArithOp Number BooleanLiteral VoidType void TypeofType typeof MemberExpression . ?. PropertyName [ TemplateString null super RegExp ] ArrayExpression Spread , } { ObjectExpression Property async get set PropertyNameDefinition Block : NewExpression new TypeArgList CompareOp < ) ( ArgList UnaryExpression await yield delete LogicOp BitOp ParenthesizedExpression ClassExpression class extends ClassBody MethodDeclaration Privacy static abstract PropertyDeclaration readonly Optional TypeAnnotation Equals FunctionExpression ArrowFunction ParamList ParamList ArrayPattern ObjectPattern PatternProperty Privacy readonly Arrow MemberExpression BinaryExpression ArithOp ArithOp ArithOp ArithOp BitOp CompareOp in instanceof CompareOp BitOp BitOp BitOp LogicOp LogicOp ConditionalExpression LogicOp LogicOp AssignmentExpression UpdateOp PostfixExpression CallExpression TaggedTemplatExpression DynamicImport import ImportMeta JSXElement JSXSelfCloseEndTag JSXStartTag JSXSelfClosingTag JSXIdentifier JSXNamespacedName JSXMemberExpression JSXSpreadAttribute JSXAttribute JSXAttributeValue JSXEndTag JSXOpenTag JSXFragmentTag JSXText JSXEscape JSXStartCloseTag JSXCloseTag PrefixCast ArrowFunction TypeParamList SequenceExpression KeyofType keyof UniqueType unique ImportType InferredType infer TypeName ParenthesizedType FunctionSignature ParamList NewSignature IndexedType TupleType Label ArrayType ReadonlyType ObjectType MethodType PropertyType IndexSignature CallSignature TypePredicate is NewSignature new UnionType LogicOp IntersectionType LogicOp ConditionalType ParameterizedType ClassDeclaration abstract implements type VariableDeclaration let var const TypeAliasDeclaration InterfaceDeclaration interface EnumDeclaration enum EnumBody NamespaceDeclaration namespace module AmbientDeclaration declare GlobalDeclaration global ClassDeclaration ClassBody MethodDeclaration AmbientFunctionDeclaration ExportGroup VariableName VariableName ImportDeclaration ImportGroup ForStatement for ForSpec ForInSpec ForOfSpec of WhileStatement while WithStatement with DoStatement do IfStatement if else SwitchStatement switch SwitchBody CaseLabel case DefaultLabel TryStatement try catch finally ReturnStatement return ThrowStatement throw BreakStatement break ContinueStatement continue DebuggerStatement debugger LabeledStatement ExpressionStatement",
-      maxTerm: 320,
+      states: "$8xO]QYOOO&zQ!LdO'#CgO'ROSO'#DRO)ZQYO'#DWO)kQYO'#DcO)rQYO'#DmO-iQYO'#DsOOQO'#ET'#ETO-|QWO'#ESO.RQWO'#ESO.ZQ!LdO'#IgO2dQ!LdO'#IhO3QQWO'#EpO3VQpO'#FVOOQ!LS'#Ex'#ExO3_O!bO'#ExO3mQWO'#F^O4wQWO'#F]OOQ!LS'#Ih'#IhOOQ!LS'#Ig'#IgOOQQ'#JR'#JRO4|QWO'#HeO5RQ!LYO'#HfOOQQ'#I['#I[OOQQ'#Hg'#HgQ]QYOOO)rQYO'#DeO5ZQWO'#GQO5`Q#tO'#ClO5nQWO'#ERO5yQ#tO'#EwO6eQWO'#GQO6jQWO'#GUO6uQWO'#GUO7TQWO'#GYO7TQWO'#GZO7TQWO'#G]O5ZQWO'#G`O7tQWO'#GcO9SQWO'#CcO9dQWO'#GpO9lQWO'#GvO9lQWO'#GxO]QYO'#GzO9lQWO'#G|O9lQWO'#HPO9qQWO'#HVO9vQ!LZO'#HZO)rQYO'#H]O:RQ!LZO'#H_O:^Q!LZO'#HaO5RQ!LYO'#HcO)rQYO'#IjOOOS'#Hh'#HhO:iOSO,59mOOQ!LS,59m,59mO<zQbO'#CgO=UQYO'#HiO=cQWO'#IlO?bQbO'#IlO'^QYO'#IlO?iQWO,59rO@PQ&jO'#D]O@xQWO'#ETOAVQWO'#IvOAbQWO'#IuOAjQWO,5:qOAoQWO'#ItOAvQWO'#DtO5`Q#tO'#EROBUQWO'#EROBaQ`O'#EwOOQ!LS,59},59}OBiQYO,59}ODgQ!LdO,5:XOETQWO,5:_OEnQ!LYO'#IsO6jQWO'#IrOEuQWO'#IrOE}QWO,5:pOFSQWO'#IrOFbQYO,5:nOH_QWO'#EPOIfQWO,5:nOJrQWO'#DgOJyQYO'#DlOKTQ&jO,5:wO)rQYO,5:wOOQQ'#Eh'#EhOOQQ'#Ej'#EjO)rQYO,5:xO)rQYO,5:xO)rQYO,5:xO)rQYO,5:xO)rQYO,5:xO)rQYO,5:xO)rQYO,5:xO)rQYO,5:xO)rQYO,5:xO)rQYO,5:xO)rQYO,5:xOOQQ'#En'#EnOKYQYO,5;XOOQ!LS,5;^,5;^OOQ!LS,5;_,5;_OMVQWO,5;_OOQ!LS,5;`,5;`O)rQYO'#HsOM[Q!LYO,5;yOH_QWO,5:xO)rQYO,5;[ONXQpO'#IzOMvQpO'#IzON`QpO'#IzONqQpO,5;gOOQO,5;q,5;qO!!|QYO'#FXOOOO'#Hr'#HrO3_O!bO,5;dO!#TQpO'#FZOOQ!LS,5;d,5;dO!#qQ,UO'#CqOOQ!LS'#Ct'#CtO!$UQWO'#CtO!$lQ#tO,5;vO!$sQWO,5;xO!%|QWO'#FhO!&ZQWO'#FiO!&`QWO'#FmO!'bQ&jO'#FqO!(TQ,UO'#IeOOQ!LS'#Ie'#IeO!(_QWO'#IdO!(mQWO'#IcOOQ!LS'#Cr'#CrOOQ!LS'#Cx'#CxO!(uQWO'#CzOIkQWO'#F`OIkQWO'#FbO!(zQWO'#FdOIaQWO'#FeO!)PQWO'#FkOIkQWO'#FpO!)UQWO'#EUO!)mQWO,5;wO]QYO,5>POOQQ'#I_'#I_OOQQ,5>Q,5>QOOQQ-E;e-E;eO!+iQ!LdO,5:POOQ!LQ'#Co'#CoO!,YQ#tO,5<lOOQO'#Ce'#CeO!,kQWO'#CpO!,sQ!LYO'#I`O4wQWO'#I`O9qQWO,59WO!-RQpO,59WO!-ZQ#tO,59WO5`Q#tO,59WO!-fQWO,5:nO!-nQWO'#GoO!-vQWO'#JVO!.OQYO,5;aOKTQ&jO,5;cO!/{QWO,5=YO!0QQWO,5=YO!0VQWO,5=YO5RQ!LYO,5=YO5ZQWO,5<lO!0eQWO'#EVO!0vQ&jO'#EWOOQ!LQ'#It'#ItO!1XQ!LYO'#JSO5RQ!LYO,5<pO7TQWO,5<wOOQO'#Cq'#CqO!1dQpO,5<tO!1lQ#tO,5<uO!1wQWO,5<wO!1|Q`O,5<zO9qQWO'#GeO5ZQWO'#GgO!2UQWO'#GgO5`Q#tO'#GjO!2ZQWO'#GjOOQQ,5<},5<}O!2`QWO'#GkO!2hQWO'#ClO!2mQWO,58}O!2wQWO,58}O!4vQYO,58}OOQQ,58},58}O!5TQ!LYO,58}O)rQYO,58}O!5`QYO'#GrOOQQ'#Gs'#GsOOQQ'#Gt'#GtO]QYO,5=[O!5pQWO,5=[O)rQYO'#DsO]QYO,5=bO]QYO,5=dO!5uQWO,5=fO]QYO,5=hO!5zQWO,5=kO!6PQYO,5=qOOQQ,5=u,5=uO)rQYO,5=uO5RQ!LYO,5=wOOQQ,5=y,5=yO!9}QWO,5=yOOQQ,5={,5={O!9}QWO,5={OOQQ,5=},5=}O!:SQ`O,5?UOOOS-E;f-E;fOOQ!LS1G/X1G/XO!:XQbO,5>TO)rQYO,5>TOOQO-E;g-E;gO!:cQWO,5?WO!:kQbO,5?WO!:rQWO,5?aOOQ!LS1G/^1G/^O!:zQpO'#DPOOQO'#In'#InO)rQYO'#InO!;iQpO'#InO!<WQpO'#D^O!<iQ&jO'#D^O!>qQYO'#D^O!>xQWO'#ImO!?QQWO,59wO!?VQWO'#EXO!?eQWO'#IwO!?mQWO,5:rO!@TQ&jO'#D^O)rQYO,5?bO!@_QWO'#HnO!:rQWO,5?aOOQ!LQ1G0]1G0]O!AeQ&jO'#DwOOQ!LS,5:`,5:`O)rQYO,5:`OH_QWO,5:`O!AlQWO,5:`O9qQWO,5:mO!-RQpO,5:mO!-ZQ#tO,5:mO5`Q#tO,5:mOOQ!LS1G/i1G/iOOQ!LS1G/y1G/yOOQ!LQ'#EO'#EOO)rQYO,5?_O!AwQ!LYO,5?_O!BYQ!LYO,5?_O!BaQWO,5?^O!BiQWO'#HpO!BaQWO,5?^OOQ!LQ1G0[1G0[O6jQWO,5?^OOQ!LS1G0Y1G0YO!CTQ!LbO,5:kOOQ!LS'#Fg'#FgO!CqQ!LdO'#IeOFbQYO1G0YO!EpQ#tO'#IoO!EzQWO,5:RO!FPQbO'#IpO)rQYO'#IpO!FZQWO,5:WOOQ!LS'#DP'#DPOOQ!LS1G0c1G0cO!F`QWO1G0cO!HqQ!LdO1G0dO!HxQ!LdO1G0dO!K]Q!LdO1G0dO!KdQ!LdO1G0dO!MkQ!LdO1G0dO!NOQ!LdO1G0dO#!oQ!LdO1G0dO#!vQ!LdO1G0dO#%ZQ!LdO1G0dO#%bQ!LdO1G0dO#'VQ!LdO1G0dO#*PQ7^O'#CgO#+zQ7^O1G0sO#-xQ7^O'#IhOOQ!LS1G0y1G0yO#.SQ!LdO,5>_OOQ!LS-E;q-E;qO#.sQ!LdO1G0dO#0uQ!LdO1G0vO#1fQpO,5;iO#1kQpO,5;jO#1pQpO'#FQO#2UQWO'#FPOOQO'#I{'#I{OOQO'#Hq'#HqO#2ZQpO1G1ROOQ!LS1G1R1G1ROOQO1G1[1G1[O#2iQ7^O'#IgO#4cQWO,5;sO! PQYO,5;sOOOO-E;p-E;pOOQ!LS1G1O1G1OOOQ!LS,5;u,5;uO#4hQpO,5;uOOQ!LS,59`,59`O)rQYO1G1bOKTQ&jO'#HuO#4mQWO,5<ZOOQ!LS,5<W,5<WOOQO'#F{'#F{OIkQWO,5<fOOQO'#F}'#F}OIkQWO,5<hOIkQWO,5<jOOQO1G1d1G1dO#4xQ`O'#CoO#5]Q`O,5<SO#5dQWO'#JOO5ZQWO'#JOO#5rQWO,5<UOIkQWO,5<TO#5wQ`O'#FgO#6UQ`O'#JPO#6`QWO'#JPOH_QWO'#JPO#6eQWO,5<XOOQ!LQ'#Db'#DbO#6jQWO'#FjO#6uQpO'#FrO!']Q&jO'#FrO!']Q&jO'#FtO#7WQWO'#FuO!)PQWO'#FxOOQO'#Hw'#HwO#7]Q&jO,5<]OOQ!LS,5<],5<]O#7dQ&jO'#FrO#7rQ&jO'#FsO#7zQ&jO'#FsOOQ!LS,5<k,5<kOIkQWO,5?OOIkQWO,5?OO#8PQWO'#HxO#8[QWO,5>}OOQ!LS'#Cg'#CgO#9OQ#tO,59fOOQ!LS,59f,59fO#9qQ#tO,5;zO#:dQ#tO,5;|O#:nQWO,5<OOOQ!LS,5<P,5<PO#:sQWO,5<VO#:xQ#tO,5<[OFbQYO1G1cO#;YQWO1G1cOOQQ1G3k1G3kOOQ!LS1G/k1G/kOMVQWO1G/kOOQQ1G2W1G2WOH_QWO1G2WO)rQYO1G2WOH_QWO1G2WO#;_QWO1G2WO#;mQWO,59[O#<sQWO'#EPOOQ!LQ,5>z,5>zO#<}Q!LYO,5>zOOQQ1G.r1G.rO9qQWO1G.rO!-RQpO1G.rO!-ZQ#tO1G.rO#=]QWO1G0YO#=bQWO'#CgO#=mQWO'#JWO#=uQWO,5=ZO#=zQWO'#JWO#>PQWO'#IQO#>_QWO,5?qO#@ZQbO1G0{OOQ!LS1G0}1G0}O5ZQWO1G2tO#@bQWO1G2tO#@gQWO1G2tO#@lQWO1G2tOOQQ1G2t1G2tO#@qQ#tO1G2WO6jQWO'#IuO6jQWO'#EXO6jQWO'#HzO#ASQ!LYO,5?nOOQQ1G2[1G2[O!1wQWO1G2cOH_QWO1G2`O#A_QWO1G2`OOQQ1G2a1G2aOH_QWO1G2aO#AdQWO1G2aO#AlQ&jO'#G_OOQQ1G2c1G2cO!']Q&jO'#H|O!1|Q`O1G2fOOQQ1G2f1G2fOOQQ,5=P,5=PO#AtQ#tO,5=RO5ZQWO,5=RO#7WQWO,5=UO4wQWO,5=UO!-RQpO,5=UO!-ZQ#tO,5=UO5`Q#tO,5=UO#BVQWO'#JUO#BbQWO,5=VOOQQ1G.i1G.iO#BgQ!LYO1G.iO#BrQWO1G.iO!(uQWO1G.iO5RQ!LYO1G.iO#BwQbO,5?sO#CRQWO,5?sO#C^QYO,5=^O#CeQWO,5=^O6jQWO,5?sOOQQ1G2v1G2vO]QYO1G2vOOQQ1G2|1G2|OOQQ1G3O1G3OO9lQWO1G3QO#CjQYO1G3SO#GbQYO'#HROOQQ1G3V1G3VO9qQWO1G3]O#GoQWO1G3]O5RQ!LYO1G3aOOQQ1G3c1G3cOOQ!LQ'#Fn'#FnO5RQ!LYO1G3eO5RQ!LYO1G3gOOOS1G4p1G4pO#IkQ!LdO,5;yO#JOQbO1G3oO#JYQWO1G4rO#JbQWO1G4{O#JjQWO,5?YO! PQYO,5:sO6jQWO,5:sO9qQWO,59xO! PQYO,59xO!-RQpO,59xO#LcQ7^O,59xOOQO,5:s,5:sO#LmQ&jO'#HjO#MTQWO,5?XOOQ!LS1G/c1G/cO#M]Q&jO'#HoO#MqQWO,5?cOOQ!LQ1G0^1G0^O!<iQ&jO,59xO#MyQbO1G4|OOQO,5>Y,5>YO6jQWO,5>YOOQO-E;l-E;lO#NTQ!LrO'#D|O!']Q&jO'#DxOOQO'#Hm'#HmO#NoQ&jO,5:cOOQ!LS,5:c,5:cO#NvQ&jO'#DxO$ UQ&jO'#D|O$ jQ&jO'#D|O!']Q&jO'#D|O$ tQWO1G/zO$ yQ`O1G/zOOQ!LS1G/z1G/zO)rQYO1G/zOH_QWO1G/zOOQ!LS1G0X1G0XO9qQWO1G0XO!-RQpO1G0XO!-ZQ#tO1G0XO$!QQ!LdO1G4yO)rQYO1G4yO$!bQ!LYO1G4yO$!sQWO1G4xO6jQWO,5>[OOQO,5>[,5>[O$!{QWO,5>[OOQO-E;n-E;nO$!sQWO1G4xOOQ!LS,5;y,5;yO$#ZQ!LdO,59fO$%YQ!LdO,5;zO$'[Q!LdO,5;|O$)^Q!LdO,5<[OOQ!LS7+%t7+%tO$+fQWO'#HkO$+pQWO,5?ZOOQ!LS1G/m1G/mO$+xQYO'#HlO$,VQWO,5?[O$,_QbO,5?[OOQ!LS1G/r1G/rOOQ!LS7+%}7+%}O$,iQ7^O,5:XO)rQYO7+&_O$,sQ7^O,5:POOQO1G1T1G1TOOQO1G1U1G1UO$,zQMhO,5;lO! PQYO,5;kOOQO-E;o-E;oOOQ!LS7+&m7+&mOOQO7+&v7+&vOOOO1G1_1G1_O$-VQWO1G1_OOQ!LS1G1a1G1aO$-[Q!LdO7+&|OOQ!LS,5>a,5>aO$-{QWO,5>aOOQ!LS1G1u1G1uP$.QQWO'#HuPOQ!LS-E;s-E;sO$.qQ#tO1G2QO$/dQ#tO1G2SO$/nQ#tO1G2UOOQ!LS1G1n1G1nO$/uQWO'#HtO$0TQWO,5?jO$0TQWO,5?jO$0]QWO,5?jO$0hQWO,5?jOOQO1G1p1G1pO$0vQ#tO1G1oO$1WQWO'#HvO$1hQWO,5?kOH_QWO,5?kO$1pQ`O,5?kOOQ!LS1G1s1G1sO5RQ!LYO,5<^O5RQ!LYO,5<_O$1zQWO,5<_O#7RQWO,5<_O!-RQpO,5<^O$2PQWO,5<`O5RQ!LYO,5<aO$1zQWO,5<dOOQO-E;u-E;uOOQ!LS1G1w1G1wO!']Q&jO,5<^O$2XQWO,5<_O!']Q&jO,5<`O!']Q&jO,5<_O$2dQ#tO1G4jO$2nQ#tO1G4jOOQO,5>d,5>dOOQO-E;v-E;vOKTQ&jO,59hO)rQYO,59hO$2{QWO1G1jOIkQWO1G1qOOQ!LS7+&}7+&}OFbQYO7+&}OOQ!LS7+%V7+%VO$3QQ`O'#JQO$ tQWO7+'rO$3[QWO7+'rO$3dQ`O7+'rOOQQ7+'r7+'rOH_QWO7+'rO)rQYO7+'rOH_QWO7+'rOOQO1G.v1G.vO$3nQ!LbO'#CgO$4OQ!LbO,5<bO$4mQWO,5<bOOQ!LQ1G4f1G4fOOQQ7+$^7+$^O9qQWO7+$^O!-RQpO7+$^OFbQYO7+%tO$4rQWO'#IPO$4}QWO,5?rOOQO1G2u1G2uO5ZQWO,5?rOOQO,5>l,5>lOOQO-E<O-E<OOOQ!LS7+&g7+&gO$5VQWO7+(`O5RQ!LYO7+(`O5ZQWO7+(`O$5[QWO7+(`O$5aQWO7+'rOOQ!LQ,5>f,5>fOOQ!LQ-E;x-E;xOOQQ7+'}7+'}O$5oQ!LbO7+'zOH_QWO7+'zO$5yQ`O7+'{OOQQ7+'{7+'{OH_QWO7+'{O$6QQWO'#JTO$6]QWO,5<yOOQO,5>h,5>hOOQO-E;z-E;zOOQQ7+(Q7+(QO$7SQ&jO'#GhOOQQ1G2m1G2mOH_QWO1G2mO)rQYO1G2mOH_QWO1G2mO$7ZQWO1G2mO$7iQ#tO1G2mO5RQ!LYO1G2pO#7WQWO1G2pO4wQWO1G2pO!-RQpO1G2pO!-ZQ#tO1G2pO$7zQWO'#IOO$8VQWO,5?pO$8_Q&jO,5?pOOQ!LQ1G2q1G2qOOQQ7+$T7+$TO$8dQWO7+$TO5RQ!LYO7+$TO$8iQWO7+$TO)rQYO1G5_O)rQYO1G5`O$8nQYO1G2xO$8uQWO1G2xO$8zQYO1G2xO$9RQ!LYO1G5_OOQQ7+(b7+(bO5RQ!LYO7+(lO]QYO7+(nOOQQ'#JZ'#JZOOQQ'#IR'#IRO$9]QYO,5=mOOQQ,5=m,5=mO)rQYO'#HSO$9jQWO'#HUOOQQ7+(w7+(wO$9oQYO7+(wO6jQWO7+(wOOQQ7+({7+({OOQQ7+)P7+)POOQQ7+)R7+)ROOQO1G4t1G4tO$=jQ7^O1G0_O$=tQWO1G0_OOQO1G/d1G/dO$>PQ7^O1G/dO9qQWO1G/dO! PQYO'#D^OOQO,5>U,5>UOOQO-E;h-E;hOOQO,5>Z,5>ZOOQO-E;m-E;mO!-RQpO1G/dOOQO1G3t1G3tO9qQWO,5:dOOQO,5:h,5:hO!.OQYO,5:hO$>ZQ!LYO,5:hO$>fQ!LYO,5:hO!-RQpO,5:dOOQO-E;k-E;kOOQ!LS1G/}1G/}O!']Q&jO,5:dO$>tQ!LrO,5:hO$?`Q&jO,5:dO!']Q&jO,5:hO$?nQ&jO,5:hO$@SQ!LYO,5:hOOQ!LS7+%f7+%fO$ tQWO7+%fO$ yQ`O7+%fOOQ!LS7+%s7+%sO9qQWO7+%sO!-RQpO7+%sO$@hQ!LdO7+*eO)rQYO7+*eOOQO1G3v1G3vO6jQWO1G3vO$@xQWO7+*dO$AQQ!LdO1G2QO$CSQ!LdO1G2SO$EUQ!LdO1G1oO$G^Q#tO,5>VOOQO-E;i-E;iO$GhQbO,5>WO)rQYO,5>WOOQO-E;j-E;jO$GrQWO1G4vO$ItQ7^O1G0dO$KoQ7^O1G0dO$MjQ7^O1G0dO$MqQ7^O1G0dO% `Q7^O1G0dO% sQ7^O1G0dO%#zQ7^O1G0dO%$RQ7^O1G0dO%%|Q7^O1G0dO%&TQ7^O1G0dO%'xQ7^O1G0dO%(VQ!LdO<<IyO%(vQ7^O1G0dO%*fQ7^O'#IeO%,cQ7^O1G0vO! PQYO'#FSOOQO'#I|'#I|OOQO1G1W1G1WO%,jQWO1G1VO%,oQ7^O,5>_OOOO7+&y7+&yOOQ!LS1G3{1G3{OIkQWO7+'pO%,|QWO,5>`O5ZQWO,5>`OOQO-E;r-E;rO%-[QWO1G5UO%-[QWO1G5UO%-dQWO1G5UO%-oQ`O,5>bO%-yQWO,5>bOH_QWO,5>bOOQO-E;t-E;tO%.OQ`O1G5VO%.YQWO1G5VOOQO1G1x1G1xOOQO1G1y1G1yO5RQ!LYO1G1yO$1zQWO1G1yO5RQ!LYO1G1xO%.bQWO1G1zOH_QWO1G1zOOQO1G1{1G1{O5RQ!LYO1G2OO!-RQpO1G1xO#7RQWO1G1yO%.gQWO1G1zO%.oQWO1G1yOIkQWO7+*UOOQ!LS1G/S1G/SO%.zQWO1G/SOOQ!LS7+'U7+'UO%/PQ#tO7+']OOQ!LS<<Ji<<JiOH_QWO'#HyO%/aQWO,5?lOOQQ<<K^<<K^OH_QWO<<K^O$ tQWO<<K^O%/iQWO<<K^O%/qQ`O<<K^OH_QWO1G1|OOQQ<<Gx<<GxO9qQWO<<GxOOQ!LS<<I`<<I`OOQO,5>k,5>kO%/{QWO,5>kOOQO-E;}-E;}O%0QQWO1G5^O%0YQWO<<KzOOQQ<<Kz<<KzO%0_QWO<<KzO5RQ!LYO<<KzO)rQYO<<K^OH_QWO<<K^OOQQ<<Kf<<KfO$5oQ!LbO<<KfOOQQ<<Kg<<KgO$5yQ`O<<KgO%0dQ&jO'#H{O%0oQWO,5?oO! PQYO,5?oOOQQ1G2e1G2eO#NTQ!LrO'#D|O!']Q&jO'#GiOOQO'#H}'#H}O%0wQ&jO,5=SOOQQ,5=S,5=SO#7rQ&jO'#D|O%1OQ&jO'#D|O%1dQ&jO'#D|O%1nQ&jO'#GiO%1|QWO7+(XO%2RQWO7+(XO%2ZQ`O7+(XOOQQ7+(X7+(XOH_QWO7+(XO)rQYO7+(XOH_QWO7+(XO%2eQWO7+(XOOQQ7+([7+([O5RQ!LYO7+([O#7WQWO7+([O4wQWO7+([O!-RQpO7+([O%2sQWO,5>jOOQO-E;|-E;|OOQO'#Gl'#GlO%3OQWO1G5[O5RQ!LYO<<GoOOQQ<<Go<<GoO%3WQWO<<GoO%3]QWO7+*yO%3bQWO7+*zOOQQ7+(d7+(dO%3gQWO7+(dO%3lQYO7+(dO%3sQWO7+(dO)rQYO7+*yO)rQYO7+*zOOQQ<<LW<<LWOOQQ<<LY<<LYOOQQ-E<P-E<POOQQ1G3X1G3XO%3xQWO,5=nOOQQ,5=p,5=pO9qQWO<<LcO%3}QWO<<LcO! PQYO7+%yOOQO7+%O7+%OO%4SQ7^O1G4|O9qQWO7+%OOOQO1G0O1G0OO%4^Q!LdO1G0SOOQO1G0S1G0SO!.OQYO1G0SO%4hQ!LYO1G0SO9qQWO1G0OO!-RQpO1G0OO%4sQ!LYO1G0SO!']Q&jO1G0OO%5RQ!LYO1G0SO%5gQ!LrO1G0SO%5qQ&jO1G0OO!']Q&jO1G0SOOQ!LS<<IQ<<IQOOQ!LS<<I_<<I_O9qQWO<<I_O%6PQ!LdO<<NPOOQO7+)b7+)bO%6aQ!LdO7+']O%8iQbO1G3rO%8sQ7^O,5;yO%8}Q7^O,59fO%:zQ7^O,5;zO%<wQ7^O,5;|O%>tQ7^O,5<[O%@dQ7^O7+&|O%@kQWO,5;nOOQO7+&q7+&qO%@pQ#tO<<K[OOQO1G3z1G3zO%AQQWO1G3zO%A]QWO1G3zO%AkQWO7+*pO%AkQWO7+*pOH_QWO1G3|O%AsQ`O1G3|O%A}QWO7+*qOOQO7+'e7+'eO5RQ!LYO7+'eOOQO7+'d7+'dO$1zQWO7+'fO%BVQ`O7+'fOOQO7+'j7+'jO5RQ!LYO7+'dO$1zQWO7+'eO%B^QWO7+'fOH_QWO7+'fO#7RQWO7+'eO%BcQ#tO<<MpOOQ!LS7+$n7+$nO%BmQ`O,5>eOOQO-E;w-E;wO$ tQWOAN@xOOQQAN@xAN@xOH_QWOAN@xO%BwQ!LbO7+'hOOQQAN=dAN=dO5ZQWO1G4VO%CUQWO7+*xO5RQ!LYOANAfO%C^QWOANAfOOQQANAfANAfO%CcQWOAN@xO%CkQ`OAN@xOOQQANAQANAQOOQQANARANARO%CuQWO,5>gOOQO-E;y-E;yO%DQQ7^O1G5ZO#7WQWO,5=TO4wQWO,5=TO!-RQpO,5=TOOQO-E;{-E;{OOQQ1G2n1G2nO$>tQ!LrO,5:hO!']Q&jO,5=TO%D[Q&jO,5=TO%DjQ&jO,5:hOOQQ<<Ks<<KsOH_QWO<<KsO%1|QWO<<KsO%EOQWO<<KsO%EWQ`O<<KsO)rQYO<<KsOH_QWO<<KsOOQQ<<Kv<<KvO5RQ!LYO<<KvO#7WQWO<<KvO4wQWO<<KvO%EbQ&jO1G4UO%EgQWO7+*vOOQQAN=ZAN=ZO5RQ!LYOAN=ZOOQQ<<Ne<<NeOOQQ<<Nf<<NfOOQQ<<LO<<LOO%EoQWO<<LOO%EtQYO<<LOO%E{QWO<<NeO%FQQWO<<NfOOQQ1G3Y1G3YOOQQANA}ANA}O9qQWOANA}O%FVQ7^O<<IeOOQO<<Hj<<HjOOQO7+%n7+%nO%4^Q!LdO7+%nO!.OQYO7+%nOOQO7+%j7+%jO9qQWO7+%jO%FaQ!LYO7+%nO!-RQpO7+%jO%FlQ!LYO7+%nO!']Q&jO7+%jO%FzQ!LYO7+%nOOQ!LSAN>yAN>yO%G`Q!LdO<<K[O%IhQ7^O<<IyO%IoQ7^O1G1oO%K_Q7^O1G2QO%M[Q7^O1G2SOOQO1G1Y1G1YOOQO7+)f7+)fO& XQWO7+)fO& dQWO<<N[O& lQ`O7+)hOOQO<<KP<<KPO5RQ!LYO<<KQO$1zQWO<<KQOOQO<<KO<<KOO5RQ!LYO<<KPO& vQ`O<<KQO$1zQWO<<KPOOQQG26dG26dO$ tQWOG26dOOQO7+)q7+)qOOQQG27QG27QO5RQ!LYOG27QOH_QWOG26dO! PQYO1G4RO& }QWO7+*uO5RQ!LYO1G2oO#7WQWO1G2oO4wQWO1G2oO!-RQpO1G2oO!']Q&jO1G2oO%5gQ!LrO1G0SO&!VQ&jO1G2oO%1|QWOANA_OOQQANA_ANA_OH_QWOANA_O&!eQWOANA_O&!mQ`OANA_OOQQANAbANAbO5RQ!LYOANAbO#7WQWOANAbOOQO'#Gm'#GmOOQO7+)p7+)pOOQQG22uG22uOOQQANAjANAjO&!wQWOANAjOOQQANDPANDPOOQQANDQANDQO&!|QYOG27iOOQO<<IY<<IYO%4^Q!LdO<<IYOOQO<<IU<<IUO!.OQYO<<IYO9qQWO<<IUO&&wQ!LYO<<IYO!-RQpO<<IUO&'SQ!LYO<<IYO&'bQ7^O7+']OOQO<<MQ<<MQOOQOAN@lAN@lO5RQ!LYOAN@lOOQOAN@kAN@kO$1zQWOAN@lO5RQ!LYOAN@kOOQQLD,OLD,OOOQQLD,lLD,lO$ tQWOLD,OO&)QQ7^O7+)mOOQO7+(Z7+(ZO5RQ!LYO7+(ZO#7WQWO7+(ZO4wQWO7+(ZO!-RQpO7+(ZO!']Q&jO7+(ZOOQQG26yG26yO%1|QWOG26yOH_QWOG26yOOQQG26|G26|O5RQ!LYOG26|OOQQG27UG27UO9qQWOLD-TOOQOAN>tAN>tO%4^Q!LdOAN>tOOQOAN>pAN>pO!.OQYOAN>tO9qQWOAN>pO&)[Q!LYOAN>tO&)gQ7^O<<K[OOQOG26WG26WO5RQ!LYOG26WOOQOG26VG26VOOQQ!$( j!$( jOOQO<<Ku<<KuO5RQ!LYO<<KuO#7WQWO<<KuO4wQWO<<KuO!-RQpO<<KuOOQQLD,eLD,eO%1|QWOLD,eOOQQLD,hLD,hOOQQ!$(!o!$(!oOOQOG24`G24`O%4^Q!LdOG24`OOQOG24[G24[O!.OQYOG24`OOQOLD+rLD+rOOQOANAaANAaO5RQ!LYOANAaO#7WQWOANAaO4wQWOANAaOOQQ!$(!P!$(!POOQOLD)zLD)zO%4^Q!LdOLD)zOOQOG26{G26{O5RQ!LYOG26{O#7WQWOG26{OOQO!$'Mf!$'MfOOQOLD,gLD,gO5RQ!LYOLD,gOOQO!$(!R!$(!ROKYQYO'#DmO&+VQ!LdO'#IgO&+jQ!LdO'#IgOKYQYO'#DeO&+qQ!LdO'#CgO&,[QbO'#CgO&,lQYO,5:nOFbQYO,5:nOKYQYO,5:xOKYQYO,5:xOKYQYO,5:xOKYQYO,5:xOKYQYO,5:xOKYQYO,5:xOKYQYO,5:xOKYQYO,5:xOKYQYO,5:xOKYQYO,5:xOKYQYO,5:xO! PQYO'#HsO&.iQWO,5;yO&.qQWO,5:xOKYQYO,5;[O!(uQWO'#CzO!(uQWO'#CzOH_QWO'#F`O&.qQWO'#F`OH_QWO'#FbO&.qQWO'#FbOH_QWO'#FpO&.qQWO'#FpO! PQYO,5?bO&,lQYO1G0YOFbQYO1G0YO&/xQ7^O'#CgO&0SQ7^O'#IgO&0^Q7^O'#IgOKYQYO1G1bOH_QWO,5<fO&.qQWO,5<fOH_QWO,5<hO&.qQWO,5<hOH_QWO,5<TO&.qQWO,5<TO&,lQYO1G1cOFbQYO1G1cO&,lQYO1G1cO&,lQYO1G0YOKYQYO7+&_OH_QWO1G1qO&.qQWO1G1qO&,lQYO7+&}OFbQYO7+&}O&,lQYO7+&}O&,lQYO7+%tOFbQYO7+%tO&,lQYO7+%tOH_QWO7+'pO&.qQWO7+'pO&0eQWO'#ESO&0jQWO'#ESO&0oQWO'#ESO&0wQWO'#ESO&1PQWO'#EpO!.OQYO'#DeO!.OQYO'#DmO&1UQWO'#IvO&1aQWO'#ItO&1lQWO,5:nO&1qQWO,5:nO!.OQYO,5:xO!.OQYO,5:xO!.OQYO,5:xO!.OQYO,5:xO!.OQYO,5:xO!.OQYO,5:xO!.OQYO,5:xO!.OQYO,5:xO!.OQYO,5:xO!.OQYO,5:xO!.OQYO,5:xO!.OQYO,5;[O&1vQ#tO,5;vO&1}QWO'#FiO&2SQWO'#FiO&2XQWO,5;wO&2aQWO,5;wO&2iQWO,5;wO&2qQ!LdO,5:PO&3OQWO,5:nO&3TQWO,5:nO&3]QWO,5:nO&3eQWO,5:nO&5aQ!LdO1G0dO&5nQ!LdO1G0dO&7uQ!LdO1G0dO&7|Q!LdO1G0dO&9}Q!LdO1G0dO&:UQ!LdO1G0dO&<VQ!LdO1G0dO&<^Q!LdO1G0dO&>_Q!LdO1G0dO&>fQ!LdO1G0dO&>mQ7^O1G0sO&>tQ!LdO1G0vO!.OQYO1G1bO&?RQWO,5<VO&?WQWO,5<VO&?]QWO1G1cO&?bQWO1G1cO&?gQWO1G1cO&?lQWO1G0YO&?qQWO1G0YO&?vQWO1G0YO!.OQYO7+&_O&?{Q!LdO7+&|O&@YQ#tO1G2UO&@aQ#tO1G2UO&@hQ!LdO<<IyO&,lQYO,5:nO&BiQ!LdO'#IhO&B|QWO'#EpO3mQWO'#F^O4wQWO'#F]O4wQWO'#F]O4wQWO'#F]OBUQWO'#EROBUQWO'#EROBUQWO'#EROKYQYO,5;XO&CRQ#tO,5;vO!)PQWO'#FkO!)PQWO'#FkO&CYQ7^O1G0sOIkQWO,5<jOIkQWO,5<jO! PQYO'#DmO! PQYO'#DeO! PQYO,5:xO! PQYO,5:xO! PQYO,5:xO! PQYO,5:xO! PQYO,5:xO! PQYO,5:xO! PQYO,5:xO! PQYO,5:xO! PQYO,5:xO! PQYO,5:xO! PQYO,5:xO! PQYO,5;[O! PQYO1G1bO! PQYO7+&_O&CaQWO'#ESO&CfQWO'#ESO&CnQWO'#EpO&CsQ#tO,5;vO&CzQ7^O1G0sO3mQWO'#F^OKYQYO,5;XO&DRQ7^O'#IhO&DcQ7^O,5:PO&DpQ7^O1G0dO&FqQ7^O1G0dO&FxQ7^O1G0dO&HmQ7^O1G0dO&IQQ7^O1G0dO&K_Q7^O1G0dO&KfQ7^O1G0dO&MgQ7^O1G0dO&MnQ7^O1G0dO' cQ7^O1G0dO' vQ7^O1G0vO'!TQ7^O7+&|O'!bQ7^O<<IyO3mQWO'#F^OKYQYO,5;X",
+      stateData: "'#b~O&}OSSOSTOS~OPTOQTOWwO]bO^gOamOblOgbOiTOjbOkbOmTOoTOtROvbOwbOxbO!OSO!YjO!_UO!bTO!cTO!dTO!eTO!fTO!ikO#jnO#n]O$uoO$wrO$ypO$zpO${qO%OsO%QtO%TuO%UuO%WvO%exO%kyO%mzO%o{O%q|O%t}O%z!OO&O!PO&Q!QO&S!RO&U!SO&W!TO'PPO']QO'q`O~OPZXYZX^ZXiZXqZXrZXtZX|ZX![ZX!]ZX!_ZX!eZX!tZX#OcX#RZX#SZX#TZX#UZX#VZX#WZX#XZX#YZX#ZZX#]ZX#_ZX#`ZX#eZX&{ZX']ZX'eZX'lZX'mZX~O!W$bX~P$tO&x!VO&y!UO&z!XO~OPTOQTO]bOa!hOb!gOgbOiTOjbOkbOmTOoTOtROvbOwbOxbO!O!`O!YjO!_UO!bTO!cTO!dTO!eTO!fTO!i!fO#j!iO#n]O'P!YO']QO'q`O~O{!^O|!ZOy'`Py'iP~P'^O}!jO~P]OPTOQTO]bOa!hOb!gOgbOiTOjbOkbOmTOoTOtROvbOwbOxbO!O!`O!YjO!_UO!bTO!cTO!dTO!eTO!fTO!i!fO#j!iO#n]O'P8ZO']QO'q`O~OPTOQTO]bOa!hOb!gOgbOiTOjbOkbOmTOoTOtROvbOwbOxbO!O!`O!YjO!_UO!bTO!cTO!dTO!eTO!fTO!i!fO#j!iO#n]O']QO'q`O~O{!oO!|!rO!}!oO'P8[O!^'fP~P+oO#O!sO~O!W!tO#O!sO~OP#ZOY#aOi#OOq!xOr!xOt!yO|#_O![#QO!]!vO!_!wO!e#ZO#R!|O#S!}O#T!}O#U!}O#V#PO#W#QO#X#QO#Y#QO#Z#RO#]#TO#_#VO#`#WO']QO'e#XO'l!zO'm!{O^'ZX&{'ZX!^'ZXy'ZX!O'ZX$v'ZX!W'ZX~O!t#bO#e#bOP'[XY'[X^'[Xi'[Xq'[Xr'[Xt'[X|'[X!['[X!]'[X!_'[X!e'[X#R'[X#S'[X#T'[X#U'[X#V'[X#W'[X#Y'[X#Z'[X#]'[X#_'[X#`'[X']'[X'e'[X'l'[X'm'[X~O#X'[X&{'[Xy'[X!^'[X'_'[X!O'[X$v'[X!W'[X~P0gO!t#bO~O#p#cO#w#gO~O!O#hO#n]O#z#iO#|#kO~O]#nOg#zOi#oOj#nOk#nOm#{Oo#|Ot#tO!O#uO!Y$RO!_#rO!}$SO#j$PO$T#}O$V$OO$Y$QO'P#mO'T'VP~O!_$TO~O!W$VO~O^$WO&{$WO~O'P$[O~O!_$TO'P$[O'Q$^O'U$_O~Ob$eO!_$TO'P$[O~O]$nOq$jO!O$gO!_$iO$w$mO'P$[O'Q$^O['yP~O!i$oO~Ot$pO!O$qO'P$[O~Ot$pO!O$qO%Q$uO'P$[O~O'P$vO~O$wrO$ypO$zpO${qO%OsO%QtO%TuO%UuO~Oa%POb%OO!i$|O$u$}O%Y${O~P7YOa%SOblO!O%RO!ikO$uoO$ypO$zpO${qO%OsO%QtO%TuO%UuO%WvO~O_%VO!t%YO$w%TO'Q$^O~P8XO!_%ZO!b%_O~O!_%`O~O!OSO~O^$WO&w%hO&{$WO~O^$WO&w%kO&{$WO~O^$WO&w%mO&{$WO~O&x!VO&y!UO&z%qO~OPZXYZXiZXqZXrZXtZX|ZX|cX![ZX!]ZX!_ZX!eZX!tZX!tcX#OcX#RZX#SZX#TZX#UZX#VZX#WZX#XZX#YZX#ZZX#]ZX#_ZX#`ZX#eZX']ZX'eZX'lZX'mZX~OyZXycX~P:tO{%sOy&]X|&]X~P)rO|!ZOy'`X~OP#ZOY#aOi#OOq!xOr!xOt!yO|!ZO![#QO!]!vO!_!wO!e#ZO#R!|O#S!}O#T!}O#U!}O#V#PO#W#QO#X#QO#Y#QO#Z#RO#]#TO#_#VO#`#WO']QO'e#XO'l!zO'm!{O~Oy'`X~P=kOy%xO~Ot%{O!R&VO!S&OO!T&OO'Q$^O~O]%|Oj%|O{&PO'Y%yO}'aP}'kP~P?nOy'hX|'hX!W'hX!^'hX'e'hX~O!t'hX#O!wX}'hX~P@gO!t&WOy'jX|'jX~O|&XOy'iX~Oy&ZO~O!t#bO~P@gOR&_O!O&[O!j&^O'P$[O~Ob&dO!_$TO'P$[O~Oq$jO!_$iO~O}&eO~P]Oq!xOr!xOt!yO!]!vO!_!wO']QOP!aaY!aai!aa|!aa![!aa!e!aa#R!aa#S!aa#T!aa#U!aa#V!aa#W!aa#X!aa#Y!aa#Z!aa#]!aa#_!aa#`!aa'e!aa'l!aa'm!aa~O^!aa&{!aay!aa!^!aa'_!aa!O!aa$v!aa!W!aa~PBpO!^&fO~O!W!tO!t&hO'e&gO|'gX^'gX&{'gX~O!^'gX~PEYO|&lO!^'fX~O!^&nO~Ot$pO!O$qO!}&oO'P$[O~OPTOQTO]bOa!hOb!gOgbOiTOjbOkbOmTOoTOtROvbOwbOxbO!OSO!YjO!_UO!bTO!cTO!dTO!eTO!fTO!i!fO#j!iO#n]O'P8ZO']QO'q`O~O]#nOg#zOi#oOj#nOk#nOm#{Oo8nOt#tO!O#uO!Y;OO!_#rO!}8tO#j$PO$T8pO$V8rO$Y$QO'P&rO~O#O&tO~O]#nOg#zOi#oOj#nOk#nOm#{Oo#|Ot#tO!O#uO!Y$RO!_#rO!}$SO#j$PO$T#}O$V$OO$Y$QO'P&rO~O'T'cP~PIkO{&xO!^'dP~P)rO'Y&zO~OP8VOQ8VO]bOa:yOb!gOgbOi8VOjbOkbOm8VOo8VOtROvbOwbOxbO!O!`O!Y8YO!_UO!b8VO!c8VO!d8VO!e8VO!f8VO!i!fO#j!iO#n]O'P'YO']QO'q:uO~O!_!wO~O|#_O^$Ra&{$Ra!^$Ray$Ra!O$Ra$v$Ra!W$Ra~O!W'bO!O'nX#m'nX#p'nX#w'nX~Oq'cO~PMvOq'cO!O'nX#m'nX#p'nX#w'nX~O!O'eO#m'iO#p'dO#w'jO~OP;TOQ;TO]bOa:{Ob!gOgbOi;TOjbOkbOm;TOo;TOtROvbOwbOxbO!O!`O!Y;UO!_UO!b;TO!c;TO!d;TO!e;TO!f;TO!i!fO#j!iO#n]O'P'YO']QO'q;{O~O{'mO~P! PO#p#cO#w'pO~Oq$ZXt$ZX!]$ZX'e$ZX'l$ZX'm$ZX~OReX|eX!teX'TeX'T$ZX~P!#]Oj'rO~Oq'tOt'uO'e#XO'l'wO'm'yO~O'T'sO~P!$ZO'T'|O~O]#nOg#zOi#oOj#nOk#nOm#{Oo8nOt#tO!O#uO!Y;OO!_#rO!}8tO#j$PO$T8pO$V8rO$Y$QO~O{(QO'P'}O!^'rP~P!$xO#O(SO~O{(WO'P(TOy'sP~P!$xO^(aOi(fOt(^O!R(dO!S(]O!T(]O!_(ZO!q(eO$m(`O'Q$^O'Y(YO~O}(cO~P!&mO!]!vOq'XXt'XX'e'XX'l'XX'm'XX|'XX!t'XX~O'T'XX#c'XX~P!'iOR(iO!t(hO|'WX'T'WX~O|(jO'T'VX~O'P(lO~O!_(qO~O!_(ZO~Ot$pO{!oO!O$qO!|!rO!}!oO'P$[O!^'fP~O!W!tO#O(uO~OP#ZOY#aOi#OOq!xOr!xOt!yO![#QO!]!vO!_!wO!e#ZO#R!|O#S!}O#T!}O#U!}O#V#PO#W#QO#X#QO#Y#QO#Z#RO#]#TO#_#VO#`#WO']QO'e#XO'l!zO'm!{O~O^!Xa|!Xa&{!Xay!Xa!^!Xa'_!Xa!O!Xa$v!Xa!W!Xa~P!)uOR(}O!O&[O!j(|O$v({O'U$_O~O'P$vO'T'VP~O!W)QO!O'SX^'SX&{'SX~O!_$TO'U$_O~O!_$TO'P$[O'U$_O~O!W!tO#O&tO~O'P)YO}'zP~O|)^O['yX~OP9jOQ9jO]bOa:zOb!gOgbOi9jOjbOkbOm9jOo9jOtROvbOwbOxbO!O!`O!Y9iO!_UO!b9jO!c9jO!d9jO!e9jO!f9jO!i!fO#j!iO#n]O'P8ZO']QO'q;jO~OY)bO~O[)cO~O!O$gO'P$[O'Q$^O['yP~Ot$pO{)hO!O$qO'P$[Oy'iP~O]&SOj&SO{)iO'Y&zO}'kP~O|)jO^'vX&{'vX~O!t)nO'U$_O~OR)qO!O#uO'U$_O~O!O)sO~Oq)uO!OSO~O!i)zO~Ob*PO~O'P(lO}'xP~Ob$eO~O$wrO'P$vO~P8XOY*VO[*UO~OPTOQTO]bOamOblOgbOiTOjbOkbOmTOoTOtROvbOwbOxbO!YjO!_UO!bTO!cTO!dTO!eTO!fTO!ikO#n]O$uoO']QO'q`O~O!O!`O#j!iO'P8ZO~P!3PO[*UO^$WO&{$WO~O^*ZO$y*]O$z*]O${*]O~P)rO!_%ZO~O%k*bO~O!O*dO~O%{*gO%|*fOP%yaQ%yaW%ya]%ya^%yaa%yab%yag%yai%yaj%yak%yam%yao%yat%yav%yaw%yax%ya!O%ya!Y%ya!_%ya!b%ya!c%ya!d%ya!e%ya!f%ya!i%ya#j%ya#n%ya$u%ya$w%ya$y%ya$z%ya${%ya%O%ya%Q%ya%T%ya%U%ya%W%ya%e%ya%k%ya%m%ya%o%ya%q%ya%t%ya%z%ya&O%ya&Q%ya&S%ya&U%ya&W%ya&v%ya'P%ya']%ya'q%ya}%ya%r%ya_%ya%w%ya~O'P*jO~O'_*mO~Oy&]a|&]a~P!)uO|!ZOy'`a~Oy'`a~P=kO|&XOy'ia~O|sX|!UX}sX}!UX!WsX!W!UX!_!UX!tsX'U!UX~O!W*tO!t*sO|!{X|'bX}!{X}'bX!W'bX!_'bX'U'bX~O!W*vO!_$TO'U$_O|!QX}!QX~O]%zOj%zOt%{O'Y(YO~OP;TOQ;TO]bOa:{Ob!gOgbOi;TOjbOkbOm;TOo;TOtROvbOwbOxbO!O!`O!Y;UO!_UO!b;TO!c;TO!d;TO!e;TO!f;TO!i!fO#j!iO#n]O']QO'q;{O~O'P8yO~P!<wO|*zO}'aX~O}*|O~O!W*tO!t*sO|!{X}!{X~O|*}O}'kX~O}+PO~O]%zOj%zOt%{O'Q$^O'Y(YO~O!S+QO!T+QO~P!?rOt$pO{+TO!O$qO'P$[Oy&bX|&bX~O^+XO!R+[O!S+WO!T+WO!m+^O!n+]O!o+]O!q+_O'Q$^O'Y(YO~O}+ZO~P!@sOR+dO!O&[O!j+cO~O!t+jO|'ga!^'ga^'ga&{'ga~O!W!tO~P!AwO|&lO!^'fa~Ot$pO{+mO!O$qO!|+oO!}+mO'P$[O|&dX!^&dX~O#O!sa|!sa!^!sa!t!sa!O!sa^!sa&{!say!sa~P!$ZO#O'XXP'XXY'XX^'XXi'XXr'XX!['XX!_'XX!e'XX#R'XX#S'XX#T'XX#U'XX#V'XX#W'XX#X'XX#Y'XX#Z'XX#]'XX#_'XX#`'XX&{'XX']'XX!^'XXy'XX!O'XX$v'XX'_'XX!W'XX~P!'iO|+xO'T'cX~P!$ZO'T+zO~O|+{O!^'dX~P!)uO!^,OO~Oy,PO~OP#ZOq!xOr!xOt!yO!]!vO!_!wO!e#ZO']QOY#Qi^#Qii#Qi|#Qi![#Qi#S#Qi#T#Qi#U#Qi#V#Qi#W#Qi#X#Qi#Y#Qi#Z#Qi#]#Qi#_#Qi#`#Qi&{#Qi'e#Qi'l#Qi'm#Qiy#Qi!^#Qi'_#Qi!O#Qi$v#Qi!W#Qi~O#R#Qi~P!FeO#R!|O~P!FeOP#ZOq!xOr!xOt!yO!]!vO!_!wO!e#ZO#R!|O#S!}O#T!}O#U!}O']QOY#Qi^#Qi|#Qi![#Qi#V#Qi#W#Qi#X#Qi#Y#Qi#Z#Qi#]#Qi#_#Qi#`#Qi&{#Qi'e#Qi'l#Qi'm#Qiy#Qi!^#Qi'_#Qi!O#Qi$v#Qi!W#Qi~Oi#Qi~P!IPOi#OO~P!IPOP#ZOi#OOq!xOr!xOt!yO!]!vO!_!wO!e#ZO#R!|O#S!}O#T!}O#U!}O#V#PO']QO^#Qi|#Qi#Z#Qi#]#Qi#_#Qi#`#Qi&{#Qi'e#Qi'l#Qi'm#Qiy#Qi!^#Qi'_#Qi!O#Qi$v#Qi!W#Qi~OY#Qi![#Qi#W#Qi#X#Qi#Y#Qi~P!KkOY#aO![#QO#W#QO#X#QO#Y#QO~P!KkOP#ZOY#aOi#OOq!xOr!xOt!yO![#QO!]!vO!_!wO!e#ZO#R!|O#S!}O#T!}O#U!}O#V#PO#W#QO#X#QO#Y#QO#Z#RO']QO^#Qi|#Qi#]#Qi#_#Qi#`#Qi&{#Qi'e#Qi'm#Qiy#Qi!^#Qi'_#Qi!O#Qi$v#Qi!W#Qi~O'l#Qi~P!NcO'l!zO~P!NcOP#ZOY#aOi#OOq!xOr!xOt!yO![#QO!]!vO!_!wO!e#ZO#R!|O#S!}O#T!}O#U!}O#V#PO#W#QO#X#QO#Y#QO#Z#RO#]#TO']QO'l!zO^#Qi|#Qi#_#Qi#`#Qi&{#Qi'e#Qiy#Qi!^#Qi'_#Qi!O#Qi$v#Qi!W#Qi~O'm#Qi~P#!}O'm!{O~P#!}OP#ZOY#aOi#OOq!xOr!xOt!yO![#QO!]!vO!_!wO!e#ZO#R!|O#S!}O#T!}O#U!}O#V#PO#W#QO#X#QO#Y#QO#Z#RO#]#TO#_#VO']QO'l!zO'm!{O~O^#Qi|#Qi#`#Qi&{#Qi'e#Qiy#Qi!^#Qi'_#Qi!O#Qi$v#Qi!W#Qi~P#%iOPZXYZXiZXqZXrZXtZX![ZX!]ZX!_ZX!eZX!tZX#OcX#RZX#SZX#TZX#UZX#VZX#WZX#XZX#YZX#ZZX#]ZX#_ZX#`ZX#eZX']ZX'eZX'lZX'mZX|ZX}ZX~O#cZX~P#'|OP#ZOY8lOi8aOq!xOr!xOt!yO![8cO!]!vO!_!wO!e#ZO#R8_O#S8`O#T8`O#U8`O#V8bO#W8cO#X8cO#Y8cO#Z8dO#]8fO#_8hO#`8iO']QO'e#XO'l!zO'm!{O~O#c,RO~P#*WOP'[XY'[Xi'[Xq'[Xr'[Xt'[X!['[X!]'[X!_'[X!e'[X#R'[X#S'[X#T'[X#U'[X#V'[X#W'[X#X'[X#Y'[X#Z'[X#]'[X#_'[X#`'[X#c'[X']'[X'e'[X'l'[X'm'[X~O!t8mO#e8mO~P#,RO^&ga|&ga&{&ga!^&ga'_&gay&ga!O&ga$v&ga!W&ga~P!)uOP#QiY#Qi^#Qii#Qir#Qi|#Qi![#Qi!]#Qi!_#Qi!e#Qi#R#Qi#S#Qi#T#Qi#U#Qi#V#Qi#W#Qi#X#Qi#Y#Qi#Z#Qi#]#Qi#_#Qi#`#Qi&{#Qi']#Qiy#Qi!^#Qi'_#Qi!O#Qi$v#Qi!W#Qi~P!$ZO^#di|#di&{#diy#di!^#di'_#di!O#di$v#di!W#di~P!)uO#p,TO~O#p,UO~O!W'bO!t,VO!O#tX#m#tX#p#tX#w#tX~O{,WO~O!O'eO#m,YO#p'dO#w,ZO~OP#ZOY8lOi;XOq!xOr!xOt!yO|8jO![;ZO!]!vO!_!wO!e#ZO#R;VO#S;WO#T;WO#U;WO#V;YO#W;ZO#X;ZO#Y;ZO#Z;[O#];^O#_;`O#`;aO']QO'e#XO'l!zO'm!{O}'ZX~O},[O~O#w,^O~O],aOj,aOy,bO~O|cX!WcX!^cX!^$ZX'ecX~P!#]O!^,hO~P!$ZO|,iO!W!tO'e&gO!^'rX~O!^,nO~Oy$ZX|$ZX!W$bX~P!#]O|,pOy'sX~P!$ZO!W,rO~Oy,tO~O{(QO'P$[O!^'rP~Oi,xO!W!tO!_$TO'U$_O'e&gO~O!W)QO~O}-OO~P!&mO!S-PO!T-PO'Q$^O'Y(YO~Ot-RO'Y(YO~O!q-SO~O'P$vO|&lX'T&lX~O|(jO'T'Va~Oq-XOr-XOt-YO'ena'lna'mna|na!tna~O'Tna#cna~P#8dOq'tOt'uO'e$Sa'l$Sa'm$Sa|$Sa!t$Sa~O'T$Sa#c$Sa~P#9YOq'tOt'uO'e$Ua'l$Ua'm$Ua|$Ua!t$Ua~O'T$Ua#c$Ua~P#9{O]-ZO~O#O-[O~O'T$da|$da#c$da!t$da~P!$ZO#O-^O~OR-gO!O&[O!j-fO$v-eO~O'T-hO~O]#nOi#oOj#nOk#nOm#{Oo8nOt#tO!O#uO!Y;OO!_#rO!}8tO#j$PO$T8pO$V8rO$Y$QO~Og-jO'P-iO~P#;rO!W)QO!O'Sa^'Sa&{'Sa~O#O-pO~OYZX|cX}cX~O|-qO}'zX~O}-sO~OY-tO~O!O$gO'P$[O[&tX|&tX~O|)^O['ya~OP#ZOY#aOi9qOq!xOr!xOt!yO![9sO!]!vO!_!wO!e#ZO#R9oO#S9pO#T9pO#U9pO#V9rO#W9sO#X9sO#Y9sO#Z9tO#]9vO#_9xO#`9yO']QO'e#XO'l!zO'm!{O~O!^-wO~P#>gO]-yO~OY-zO~O[-{O~OR-gO!O&[O!j-fO$v-eO'U$_O~O|)jO^'va&{'va~O!t.RO~OR.UO!O#uO~O'Y&zO}'wP~OR.`O!O.[O!j._O$v.^O'U$_O~OY.jO|.hO}'xX~O}.kO~O[.mO^$WO&{$WO~O].nO~O#X.pO%i.qO~P0gO!t#bO#X.pO%i.qO~O^.rO~P)rO^.tO~O%r.xOP%piQ%piW%pi]%pi^%pia%pib%pig%pii%pij%pik%pim%pio%pit%piv%piw%pix%pi!O%pi!Y%pi!_%pi!b%pi!c%pi!d%pi!e%pi!f%pi!i%pi#j%pi#n%pi$u%pi$w%pi$y%pi$z%pi${%pi%O%pi%Q%pi%T%pi%U%pi%W%pi%e%pi%k%pi%m%pi%o%pi%q%pi%t%pi%z%pi&O%pi&Q%pi&S%pi&U%pi&W%pi&v%pi'P%pi']%pi'q%pi}%pi_%pi%w%pi~O_/OO}.|O%w.}O~P]O!OSO!_/RO~OP$RaY$Rai$Raq$Rar$Rat$Ra![$Ra!]$Ra!_$Ra!e$Ra#R$Ra#S$Ra#T$Ra#U$Ra#V$Ra#W$Ra#X$Ra#Y$Ra#Z$Ra#]$Ra#_$Ra#`$Ra']$Ra'e$Ra'l$Ra'm$Ra~O|#_O'_$Ra!^$Ra^$Ra&{$Ra~P#GwOy&]i|&]i~P!)uO|!ZOy'`i~O|&XOy'ii~Oy/VO~OP#ZOY8lOi;XOq!xOr!xOt!yO![;ZO!]!vO!_!wO!e#ZO#R;VO#S;WO#T;WO#U;WO#V;YO#W;ZO#X;ZO#Y;ZO#Z;[O#];^O#_;`O#`;aO']QO'e#XO'l!zO'm!{O~O|!Qa}!Qa~P#JoO]%zOj%zO{/]O'Y(YO|&^X}&^X~P?nO|*zO}'aa~O]&SOj&SO{)iO'Y&zO|&cX}&cX~O|*}O}'ka~Oy'ji|'ji~P!)uO^$WO!W!tO!_$TO!e/hO!t/fO&{$WO'U$_O'e&gO~O}/kO~P!@sO!S/lO!T/lO'Q$^O'Y(YO~O!R/nO!S/lO!T/lO!q/oO'Q$^O'Y(YO~O!n/pO!o/pO~P$ UO!O&[O~O!O&[O~P!$ZO|'gi!^'gi^'gi&{'gi~P!)uO!t/yO|'gi!^'gi^'gi&{'gi~O|&lO!^'fi~Ot$pO!O$qO!}/{O'P$[O~O#OnaPnaYna^naina![na!]na!_na!ena#Rna#Sna#Tna#Una#Vna#Wna#Xna#Yna#Zna#]na#_na#`na&{na']na!^nayna!Ona$vna'_na!Wna~P#8dO#O$SaP$SaY$Sa^$Sai$Sar$Sa![$Sa!]$Sa!_$Sa!e$Sa#R$Sa#S$Sa#T$Sa#U$Sa#V$Sa#W$Sa#X$Sa#Y$Sa#Z$Sa#]$Sa#_$Sa#`$Sa&{$Sa']$Sa!^$Say$Sa!O$Sa$v$Sa'_$Sa!W$Sa~P#9YO#O$UaP$UaY$Ua^$Uai$Uar$Ua![$Ua!]$Ua!_$Ua!e$Ua#R$Ua#S$Ua#T$Ua#U$Ua#V$Ua#W$Ua#X$Ua#Y$Ua#Z$Ua#]$Ua#_$Ua#`$Ua&{$Ua']$Ua!^$Uay$Ua!O$Ua$v$Ua'_$Ua!W$Ua~P#9{O#O$daP$daY$da^$dai$dar$da|$da![$da!]$da!_$da!e$da#R$da#S$da#T$da#U$da#V$da#W$da#X$da#Y$da#Z$da#]$da#_$da#`$da&{$da']$da!^$day$da!O$da!t$da$v$da'_$da!W$da~P!$ZO|&_X'T&_X~PIkO|+xO'T'ca~O{0TO|&`X!^&`X~P)rO|+{O!^'da~O|+{O!^'da~P!)uO#c!aa}!aa~PBpO#c!Xa~P#*WO!O0gO#n]O#u0hO~O}0lO~O^$Oq|$Oq&{$Oqy$Oq!^$Oq'_$Oq!O$Oq$v$Oq!W$Oq~P!)uOy0mO~O],aOj,aO~Oq'tOt'uO'm'yO'e$ni'l$ni|$ni!t$ni~O'T$ni#c$ni~P$.YOq'tOt'uO'e$pi'l$pi'm$pi|$pi!t$pi~O'T$pi#c$pi~P$.{O#c0nO~P!$ZO{0pO'P$[O|&hX!^&hX~O|,iO!^'ra~O|,iO!W!tO!^'ra~O|,iO!W!tO'e&gO!^'ra~O'T$]i|$]i#c$]i!t$]i~P!$ZO{0wO'P(TOy&jX|&jX~P!$xO|,pOy'sa~O|,pOy'sa~P!$ZO!W!tO~O!W!tO#X1RO~Oi1VO!W!tO'e&gO~O|'Wi'T'Wi~P!$ZO!t1YO|'Wi'T'Wi~P!$ZO!^1]O~O|1`O!O'tX~P!$ZO!O&[O$v1cO~O!O&[O$v1cO~P!$ZO!O$ZX$kZX^$ZX&{$ZX~P!#]O$k1gOqfXtfX!OfX'efX'lfX'mfX^fX&{fX~O$k1gO~O'P)YO|&sX}&sX~O|-qO}'za~O[1oO~O]1rO~OR1tO!O&[O!j1sO$v1cO~O^$WO&{$WO~P!$ZO!O#uO~P!$ZO|1yO!t1{O}'wX~O}1|O~Ot(^O!R2VO!S2OO!T2OO!m2UO!n2TO!o2TO!q2SO'Q$^O'Y(YO~O}2RO~P$6bOR2^O!O.[O!j2]O$v2[O~OR2^O!O.[O!j2]O$v2[O'U$_O~O'P(lO|&rX}&rX~O|.hO}'xa~O'Y2gO~O]2iO~O[2kO~O!^2nO~P)rO^2pO~O^2pO~P)rO#X2rO%i2sO~PEYO_/OO}2wO%w.}O~P]O!W2yO~O%|2zOP%yqQ%yqW%yq]%yq^%yqa%yqb%yqg%yqi%yqj%yqk%yqm%yqo%yqt%yqv%yqw%yqx%yq!O%yq!Y%yq!_%yq!b%yq!c%yq!d%yq!e%yq!f%yq!i%yq#j%yq#n%yq$u%yq$w%yq$y%yq$z%yq${%yq%O%yq%Q%yq%T%yq%U%yq%W%yq%e%yq%k%yq%m%yq%o%yq%q%yq%t%yq%z%yq&O%yq&Q%yq&S%yq&U%yq&W%yq&v%yq'P%yq']%yq'q%yq}%yq%r%yq_%yq%w%yq~O|!{i}!{i~P#JoO!t2|O|!{i}!{i~O|!Qi}!Qi~P#JoO^$WO!t3TO&{$WO~O^$WO!W!tO!t3TO&{$WO~O^$WO!W!tO!_$TO!e3XO!t3TO&{$WO'U$_O'e&gO~O!S3YO!T3YO'Q$^O'Y(YO~O!R3]O!S3YO!T3YO!q3^O'Q$^O'Y(YO~O^$WO!W!tO!e3XO!t3TO&{$WO'e&gO~O|'gq!^'gq^'gq&{'gq~P!)uO|&lO!^'fq~O#O$niP$niY$ni^$nii$nir$ni![$ni!]$ni!_$ni!e$ni#R$ni#S$ni#T$ni#U$ni#V$ni#W$ni#X$ni#Y$ni#Z$ni#]$ni#_$ni#`$ni&{$ni']$ni!^$niy$ni!O$ni$v$ni'_$ni!W$ni~P$.YO#O$piP$piY$pi^$pii$pir$pi![$pi!]$pi!_$pi!e$pi#R$pi#S$pi#T$pi#U$pi#V$pi#W$pi#X$pi#Y$pi#Z$pi#]$pi#_$pi#`$pi&{$pi']$pi!^$piy$pi!O$pi$v$pi'_$pi!W$pi~P$.{O#O$]iP$]iY$]i^$]ii$]ir$]i|$]i![$]i!]$]i!_$]i!e$]i#R$]i#S$]i#T$]i#U$]i#V$]i#W$]i#X$]i#Y$]i#Z$]i#]$]i#_$]i#`$]i&{$]i']$]i!^$]iy$]i!O$]i!t$]i$v$]i'_$]i!W$]i~P!$ZO|&_a'T&_a~P!$ZO|&`a!^&`a~P!)uO|+{O!^'di~OP#ZOq!xOr!xOt!yO!]!vO!_!wO!e#ZO']QOY#Qii#Qi![#Qi#S#Qi#T#Qi#U#Qi#V#Qi#W#Qi#X#Qi#Y#Qi#Z#Qi#]#Qi#_#Qi#`#Qi#c#Qi'e#Qi'l#Qi'm#Qi|#Qi}#Qi~O#R#Qi~P$GzOP#ZOq!xOr!xOt!yO!]!vO!_!wO!e#ZO']QOY#Qii#Qi![#Qi#S#Qi#T#Qi#U#Qi#V#Qi#W#Qi#X#Qi#Y#Qi#Z#Qi#]#Qi#_#Qi#`#Qi#c#Qi'e#Qi'l#Qi'm#Qi~O#R8_O~P$I{OP#ZOq!xOr!xOt!yO!]!vO!_!wO!e#ZO#R8_O#S8`O#T8`O#U8`O']QOY#Qi![#Qi#V#Qi#W#Qi#X#Qi#Y#Qi#Z#Qi#]#Qi#_#Qi#`#Qi#c#Qi'e#Qi'l#Qi'm#Qi~Oi#Qi~P$KvOi8aO~P$KvOP#ZOi8aOq!xOr!xOt!yO!]!vO!_!wO!e#ZO#R8_O#S8`O#T8`O#U8`O#V8bO']QO#Z#Qi#]#Qi#_#Qi#`#Qi#c#Qi'e#Qi'l#Qi'm#Qi~OY#Qi![#Qi#W#Qi#X#Qi#Y#Qi~P$MxOY8lO![8cO#W8cO#X8cO#Y8cO~P$MxOP#ZOY8lOi8aOq!xOr!xOt!yO![8cO!]!vO!_!wO!e#ZO#R8_O#S8`O#T8`O#U8`O#V8bO#W8cO#X8cO#Y8cO#Z8dO']QO#]#Qi#_#Qi#`#Qi#c#Qi'e#Qi'm#Qi~O'l#Qi~P%!WO'l!zO~P%!WOP#ZOY8lOi8aOq!xOr!xOt!yO![8cO!]!vO!_!wO!e#ZO#R8_O#S8`O#T8`O#U8`O#V8bO#W8cO#X8cO#Y8cO#Z8dO#]8fO']QO'l!zO#_#Qi#`#Qi#c#Qi'e#Qi~O'm#Qi~P%$YO'm!{O~P%$YOP#ZOY8lOi8aOq!xOr!xOt!yO![8cO!]!vO!_!wO!e#ZO#R8_O#S8`O#T8`O#U8`O#V8bO#W8cO#X8cO#Y8cO#Z8dO#]8fO#_8hO']QO'l!zO'm!{O~O#`#Qi#c#Qi'e#Qi~P%&[O^#ay|#ay&{#ayy#ay!^#ay'_#ay!O#ay$v#ay!W#ay~P!)uOP#QiY#Qii#Qir#Qi![#Qi!]#Qi!_#Qi!e#Qi#R#Qi#S#Qi#T#Qi#U#Qi#V#Qi#W#Qi#X#Qi#Y#Qi#Z#Qi#]#Qi#_#Qi#`#Qi#c#Qi']#Qi|#Qi}#Qi~P!$ZO!]!vOP'XXY'XXi'XXq'XXr'XXt'XX!['XX!_'XX!e'XX#R'XX#S'XX#T'XX#U'XX#V'XX#W'XX#X'XX#Y'XX#Z'XX#]'XX#_'XX#`'XX#c'XX']'XX'e'XX'l'XX'm'XX|'XX}'XX~O#c#di~P#*WO}3mO~O|&ga}&ga#c&ga~P#JoO!W!tO'e&gO|&ha!^&ha~O|,iO!^'ri~O|,iO!W!tO!^'ri~Oy&ja|&ja~P!$ZO!W3tO~O|,pOy'si~P!$ZO|,pOy'si~Oy3zO~O!W!tO#X4QO~Oi4RO!W!tO'e&gO~Oy4TO~O'T$_q|$_q#c$_q!t$_q~P!$ZO|1`O!O'ta~O!O&[O$v4YO~O!O&[O$v4YO~P!$ZOY4]O~O|-qO}'zi~O]4_O~O[4`O~O'Y&zO|&oX}&oX~O|1yO}'wa~O}4mO~P$6bO!R4pO!S4oO!T4oO!q/oO'Q$^O'Y(YO~O!n4qO!o4qO~P%1OO!S4oO!T4oO'Q$^O'Y(YO~O!O.[O~O!O.[O$v4sO~O!O.[O$v4sO~P!$ZOR4xO!O.[O!j4wO$v4sO~OY4}O|&ra}&ra~O|.hO}'xi~O]5QO~O!^5RO~O!^5SO~O!^5TO~O!^5TO~P)rO^5VO~O!W5YO~O!^5[O~O|'ji}'ji~P#JoO^$WO&{$WO~P#>gO^$WO!t5aO&{$WO~O^$WO!W!tO!t5aO&{$WO~O^$WO!W!tO!e5fO!t5aO&{$WO'e&gO~O!_$TO'U$_O~P%5RO!S5gO!T5gO'Q$^O'Y(YO~O|'gy!^'gy^'gy&{'gy~P!)uO#O$_qP$_qY$_q^$_qi$_qr$_q|$_q![$_q!]$_q!_$_q!e$_q#R$_q#S$_q#T$_q#U$_q#V$_q#W$_q#X$_q#Y$_q#Z$_q#]$_q#_$_q#`$_q&{$_q']$_q!^$_qy$_q!O$_q!t$_q$v$_q'_$_q!W$_q~P!$ZO|&`i!^&`i~P!)uO|8jO#c$Ra~P#GwOq-XOr-XOt-YOPnaYnaina![na!]na!_na!ena#Rna#Sna#Tna#Una#Vna#Wna#Xna#Yna#Zna#]na#_na#`na#cna']na'ena'lna'mna|na}na~Oq'tOt'uOP$SaY$Sai$Sar$Sa![$Sa!]$Sa!_$Sa!e$Sa#R$Sa#S$Sa#T$Sa#U$Sa#V$Sa#W$Sa#X$Sa#Y$Sa#Z$Sa#]$Sa#_$Sa#`$Sa#c$Sa']$Sa'e$Sa'l$Sa'm$Sa|$Sa}$Sa~Oq'tOt'uOP$UaY$Uai$Uar$Ua![$Ua!]$Ua!_$Ua!e$Ua#R$Ua#S$Ua#T$Ua#U$Ua#V$Ua#W$Ua#X$Ua#Y$Ua#Z$Ua#]$Ua#_$Ua#`$Ua#c$Ua']$Ua'e$Ua'l$Ua'm$Ua|$Ua}$Ua~OP$daY$dai$dar$da![$da!]$da!_$da!e$da#R$da#S$da#T$da#U$da#V$da#W$da#X$da#Y$da#Z$da#]$da#_$da#`$da#c$da']$da|$da}$da~P!$ZO#c$Oq~P#*WO}5oO~O'T$ry|$ry#c$ry!t$ry~P!$ZO!W!tO|&hi!^&hi~O!W!tO'e&gO|&hi!^&hi~O|,iO!^'rq~Oy&ji|&ji~P!$ZO|,pOy'sq~Oy5vO~P!$ZOy5vO~O|'Wy'T'Wy~P!$ZO|&ma!O&ma~P!$ZO!O$jq^$jq&{$jq~P!$ZO|-qO}'zq~O]6PO~O!O&[O$v6QO~O!O&[O$v6QO~P!$ZO!t6RO|&oa}&oa~O|1yO}'wi~P#JoO!S6XO!T6XO'Q$^O'Y(YO~O!R6ZO!S6XO!T6XO!q3^O'Q$^O'Y(YO~O!O.[O$v6^O~O!O.[O$v6^O~P!$ZO'Y6dO~O|.hO}'xq~O!^6gO~O!^6gO~P)rO!^6iO~O!^6jO~O|!{y}!{y~P#JoO^$WO!t6oO&{$WO~O^$WO!W!tO!t6oO&{$WO~O^$WO!W!tO!e6sO!t6oO&{$WO'e&gO~O#O$ryP$ryY$ry^$ryi$ryr$ry|$ry![$ry!]$ry!_$ry!e$ry#R$ry#S$ry#T$ry#U$ry#V$ry#W$ry#X$ry#Y$ry#Z$ry#]$ry#_$ry#`$ry&{$ry']$ry!^$ryy$ry!O$ry!t$ry$v$ry'_$ry!W$ry~P!$ZO#c#ay~P#*WOP$]iY$]ii$]ir$]i![$]i!]$]i!_$]i!e$]i#R$]i#S$]i#T$]i#U$]i#V$]i#W$]i#X$]i#Y$]i#Z$]i#]$]i#_$]i#`$]i#c$]i']$]i|$]i}$]i~P!$ZOq'tOt'uO'm'yOP$niY$nii$nir$ni![$ni!]$ni!_$ni!e$ni#R$ni#S$ni#T$ni#U$ni#V$ni#W$ni#X$ni#Y$ni#Z$ni#]$ni#_$ni#`$ni#c$ni']$ni'e$ni'l$ni|$ni}$ni~Oq'tOt'uOP$piY$pii$pir$pi![$pi!]$pi!_$pi!e$pi#R$pi#S$pi#T$pi#U$pi#V$pi#W$pi#X$pi#Y$pi#Z$pi#]$pi#_$pi#`$pi#c$pi']$pi'e$pi'l$pi'm$pi|$pi}$pi~O!W!tO|&hq!^&hq~O|,iO!^'ry~Oy&jq|&jq~P!$ZOy6yO~P!$ZO|1yO}'wq~O!S7UO!T7UO'Q$^O'Y(YO~O!O.[O$v7XO~O!O.[O$v7XO~P!$ZO!^7[O~O%|7]OP%y!ZQ%y!ZW%y!Z]%y!Z^%y!Za%y!Zb%y!Zg%y!Zi%y!Zj%y!Zk%y!Zm%y!Zo%y!Zt%y!Zv%y!Zw%y!Zx%y!Z!O%y!Z!Y%y!Z!_%y!Z!b%y!Z!c%y!Z!d%y!Z!e%y!Z!f%y!Z!i%y!Z#j%y!Z#n%y!Z$u%y!Z$w%y!Z$y%y!Z$z%y!Z${%y!Z%O%y!Z%Q%y!Z%T%y!Z%U%y!Z%W%y!Z%e%y!Z%k%y!Z%m%y!Z%o%y!Z%q%y!Z%t%y!Z%z%y!Z&O%y!Z&Q%y!Z&S%y!Z&U%y!Z&W%y!Z&v%y!Z'P%y!Z']%y!Z'q%y!Z}%y!Z%r%y!Z_%y!Z%w%y!Z~O^$WO!t7aO&{$WO~O^$WO!W!tO!t7aO&{$WO~OP$_qY$_qi$_qr$_q![$_q!]$_q!_$_q!e$_q#R$_q#S$_q#T$_q#U$_q#V$_q#W$_q#X$_q#Y$_q#Z$_q#]$_q#_$_q#`$_q#c$_q']$_q|$_q}$_q~P!$ZO|&oq}&oq~P#JoO^$WO!t7uO&{$WO~OP$ryY$ryi$ryr$ry![$ry!]$ry!_$ry!e$ry#R$ry#S$ry#T$ry#U$ry#V$ry#W$ry#X$ry#Y$ry#Z$ry#]$ry#_$ry#`$ry#c$ry']$ry|$ry}$ry~P!$ZO|#_O'_'ZX!^'ZX^'ZX&{'ZX~P!)uO'_'ZX~P.ZO'_ZXyZX!^ZX%iZX!OZX$vZX!WZX~P$tO!WcX!^ZX!^cX'ecX~P:tOP;TOQ;TO]bOa:{Ob!gOgbOi;TOjbOkbOm;TOo;TOtROvbOwbOxbO!OSO!Y;UO!_UO!b;TO!c;TO!d;TO!e;TO!f;TO!i!fO#j!iO#n]O'P'YO']QO'q;{O~O|8jO}$Ra~O]#nOg#zOi#oOj#nOk#nOm#{Oo8oOt#tO!O#uO!Y;PO!_#rO!}8uO#j$PO$T8qO$V8sO$Y$QO'P&rO~O}ZX}cX~P:tO|8jO#c'ZX~P#JoO#c'ZX~P#2iO#O8]O~O#O8^O~O!W!tO#O8]O~O!W!tO#O8^O~O!t8mO~O!t8vO|'jX}'jX~O!t;bO|'hX}'hX~O#O8wO~O#O8xO~O'T8|O~P!$ZO#O9RO~O#O9SO~O!W!tO#O9TO~O!W!tO#O9UO~O!W!tO#O9VO~O!^!Xa^!Xa&{!Xa~P#>gO#O9WO~O!W!tO#O8wO~O!W!tO#O8xO~O!W!tO#O9WO~OP#ZOq!xOr!xOt!yO!]!vO!_!wO!e#ZO#R9oO']QOY#Qii#Qi![#Qi!^#Qi#V#Qi#W#Qi#X#Qi#Y#Qi#Z#Qi#]#Qi#_#Qi#`#Qi'e#Qi'l#Qi'm#Qi^#Qi&{#Qi~O#S#Qi#T#Qi#U#Qi~P&3mO#S9pO#T9pO#U9pO~P&3mOP#ZOi9qOq!xOr!xOt!yO!]!vO!_!wO!e#ZO#R9oO#S9pO#T9pO#U9pO']QOY#Qi![#Qi!^#Qi#W#Qi#X#Qi#Y#Qi#Z#Qi#]#Qi#_#Qi#`#Qi'e#Qi'l#Qi'm#Qi^#Qi&{#Qi~O#V#Qi~P&5{O#V9rO~P&5{OP#ZOY#aOi9qOq!xOr!xOt!yO![9sO!]!vO!_!wO!e#ZO#R9oO#S9pO#T9pO#U9pO#V9rO#W9sO#X9sO#Y9sO']QO!^#Qi#]#Qi#_#Qi#`#Qi'e#Qi'l#Qi'm#Qi^#Qi&{#Qi~O#Z#Qi~P&8TO#Z9tO~P&8TOP#ZOY#aOi9qOq!xOr!xOt!yO![9sO!]!vO!_!wO!e#ZO#R9oO#S9pO#T9pO#U9pO#V9rO#W9sO#X9sO#Y9sO#Z9tO']QO'l!zO!^#Qi#_#Qi#`#Qi'e#Qi'm#Qi^#Qi&{#Qi~O#]#Qi~P&:]O#]9vO~P&:]OP#ZOY#aOi9qOq!xOr!xOt!yO![9sO!]!vO!_!wO!e#ZO#R9oO#S9pO#T9pO#U9pO#V9rO#W9sO#X9sO#Y9sO#Z9tO#]9vO']QO'l!zO'm!{O!^#Qi#`#Qi'e#Qi^#Qi&{#Qi~O#_#Qi~P&<eO#_9xO~P&<eO#c9XO~P#*WO!^#di^#di&{#di~P#>gO#O9YO~O#O9ZO~O#O9[O~O#O9]O~O#O9^O~O#O9_O~O#O9`O~O#O9aO~O!^$Oq^$Oq&{$Oq~P#>gO#c9bO~P!$ZO#c9cO~P!$ZO!^#ay^#ay&{#ay~P#>gOP'[XY'[Xi'[Xq'[Xr'[Xt'[X!['[X!]'[X!_'[X!e'[X#R'[X#S'[X#T'[X#U'[X#V'[X#W'[X#X'[X#Y'[X#Z'[X#]'[X#_'[X#`'[X']'[X'e'[X'l'[X'm'[X~O!t9zO#e9zO!^'[X^'[X&{'[X~P&@uO!t9zO~O'T:dO~P!$ZO#c:mO~P#*WO#O:rO~O!W!tO#O:rO~O!t;bO~O'T;cO~P!$ZO#c;dO~P#*WO!t;bO#e;bO|'[X}'[X~P#,RO|!Xa}!Xa#c!Xa~P#JoO#R;VO~P$GzOP#ZOq!xOr!xOt!yO!]!vO!_!wO!e#ZO#R;VO#S;WO#T;WO#U;WO']QOY#Qi|#Qi}#Qi![#Qi#V#Qi#W#Qi#X#Qi#Y#Qi#Z#Qi#]#Qi#_#Qi#`#Qi'e#Qi'l#Qi'm#Qi#c#Qi~Oi#Qi~P&DwOi;XO~P&DwOP#ZOi;XOq!xOr!xOt!yO!]!vO!_!wO!e#ZO#R;VO#S;WO#T;WO#U;WO#V;YO']QO|#Qi}#Qi#Z#Qi#]#Qi#_#Qi#`#Qi'e#Qi'l#Qi'm#Qi#c#Qi~OY#Qi![#Qi#W#Qi#X#Qi#Y#Qi~P&GPOY8lO![;ZO#W;ZO#X;ZO#Y;ZO~P&GPOP#ZOY8lOi;XOq!xOr!xOt!yO![;ZO!]!vO!_!wO!e#ZO#R;VO#S;WO#T;WO#U;WO#V;YO#W;ZO#X;ZO#Y;ZO#Z;[O']QO|#Qi}#Qi#]#Qi#_#Qi#`#Qi'e#Qi'm#Qi#c#Qi~O'l#Qi~P&IeO'l!zO~P&IeOP#ZOY8lOi;XOq!xOr!xOt!yO![;ZO!]!vO!_!wO!e#ZO#R;VO#S;WO#T;WO#U;WO#V;YO#W;ZO#X;ZO#Y;ZO#Z;[O#];^O']QO'l!zO|#Qi}#Qi#_#Qi#`#Qi'e#Qi#c#Qi~O'm#Qi~P&KmO'm!{O~P&KmOP#ZOY8lOi;XOq!xOr!xOt!yO![;ZO!]!vO!_!wO!e#ZO#R;VO#S;WO#T;WO#U;WO#V;YO#W;ZO#X;ZO#Y;ZO#Z;[O#];^O#_;`O']QO'l!zO'm!{O~O|#Qi}#Qi#`#Qi'e#Qi#c#Qi~P&MuO|#di}#di#c#di~P#JoO|$Oq}$Oq#c$Oq~P#JoO|#ay}#ay#c#ay~P#JoO#n~!]!m!o!|!}'q$T$V$Y$k$u$v$w%O%Q%T%U%W%Y~TS#n'q#p'Y'P&}#Sx~",
+      goto: "$!x(OPPPPPPP(PP(aP)|PPPP._PP.t4x6k7QP7QPPP7QP7QP8oPP8tP9]PPPP?RPPPP?RBoPPPBuDxP?RPGgPPPPIv?RPPPPPLW?RPP!!T!#QPPP!#UP!#^!$_P?R?R!'x!+y!1w!1w!6WPPP!6_?RPPPPPPPPP!:TP!;uPP?R!=_P?RP?R?R?R?RP?R!?zPP!CoP!G`!Gh!Gl!GlP!ClP!Gp!GpP!KaP!Ke?R?R!Kk# _7QP7QP7Q7QP#!v7Q7Q#$l7Q7Q7Q#&o7Q7Q#']#)W#)W#)[#)W#)dP#)WP7Q#*`7Q#+k7Q7Q._PPP#,yPPP#-c#-cP#-cP#-x#-cPP#.OP#-uP#-u#.b!#Y#-u#/P#/V#/Y(P#/](PP#/d#/d#/dP(PP(PP(PP(PPP(PP#/j#/mP#/m(PPPP(PP(PP(PP(PP(PP(P(P#/q#/{#0R#0a#0g#0m#0w#0}#1X#1_#1m#1s#1y#2a#2v#4Z#4i#4o#4u#4{#5R#5]#5c#5i#5s#5}#6TPPPPPPPP#6ZPP#6}#:{PP#<`#<i#<sP#AS#DVP#K}P#LR#LU#LX#Ld#LgP#Lj#Ln#M]#NQ#NU#NhPP#Nl#Nr#NvP#Ny#N}$ Q$ p$!W$!]$!`$!c$!i$!l$!p$!tmgOSi{!k$V%^%a%b%d*_*d.x.{Q$dlQ$knQ%UwS&O!`*zQ&c!gS(]#u(bQ)W$eQ)d$mQ*O%OQ+Q&VS+W&[+YQ+h&dQ-P(dQ.g*PU/l+[+]+^S2O.[2QS3Y/n/pU4o2T2U2VQ5g3]S6X4p4qR7U6Z$hZORSTUij{!Q!U!Z!^!k!s!w!y!|!}#O#P#Q#R#S#T#U#V#W#_#b$V%V%Y%^%`%a%b%d%h%s%{&W&^&h&t&x's(u(|*Z*_*d+c+j+{,R-Y-^-f-p._.p.q.r.t.x.{.}/y0T1s2]2p2r2s4w5V8^8x9U9]9`x'[#Y8V8Y8_8`8a8b8c8d8e8f8g8h8i8m8|9X:|;k;|Q(m#|Q)]$gQ*Q%RQ*X%ZQ+s8nQ-k)QQ.o*VQ1l-qQ2e.hQ3g8o!O:s$i/f3T5a6o7a7u9i9j9o9p9q9r9s9t9u9v9w9x9y9z:d:m!q;l#h&P'm*s*v,W/]0g1{2|6R8]8j8v8w9T9V9W9[9^9_9a:r;T;U;V;W;X;Y;Z;[;];^;_;`;a;b;c;dpdOSiw{!k$V%T%^%a%b%d*_*d.x.{R*S%V(WVOSTijm{!Q!U!Z!h!k!s!w!y!|!}#O#P#Q#R#S#T#U#V#W#Y#_#b#h$V$i%V%Y%Z%^%`%a%b%d%h%s%{&W&^&h&t&x'm's(u(|*Z*_*d*s*v+c+j+{,R,W-Y-^-f-p._.p.q.r.t.x.{.}/]/f/y0T0g1s1{2]2p2r2s2|3T4w5V5a6R6o7a7u8V8Y8]8^8_8`8a8b8c8d8e8f8g8h8i8j8m8v8w8x8|9T9U9V9W9X9[9]9^9_9`9a9i9j9o9p9q9r9s9t9u9v9w9x9y9z:d:m:r:y:z:{:|;T;U;V;W;X;Y;Z;[;];^;_;`;a;b;c;d;k;|W!aRU!^&PQ$]kQ$clS$hn$mv$rpq!o!r$T$p&X&l&o)h)i)j*]*t+T+m+o/R/{Q$zuQ&`!fQ&b!gS(P#r(ZS)V$d$eQ)Z$gQ)g$oQ)y$|Q)}%OS+g&c&dQ,m(QQ-o)WQ-u)^Q-x)bQ.b)zS.f*O*PQ/w+hQ0o,iQ1k-qQ1n-tQ1q-zQ2d.gQ3q0pR5}4]!W$al!g$c$d$e%}&b&c&d([)V)W*w+V+g+h,y-o/b/i/m/w1U3W3[5e6rQ)O$]Q)o$wQ)r$xQ)|%OQ-|)gQ.a)yU.e)}*O*PQ2_.bS2c.f.gQ4j1}Q4|2dS6V4k4nS7S6W6YQ7l7TR7z7m[#x`$_(j:u;j;{S$wr%TQ$xsQ$ytR)m$u$X#w`!t!v#a#r#t#}$O$S&_'x'z'{(S(W(h(i({(})Q)n)q+d+x,p,r-[-e-g.R.U.^.`0n0w1R1Y1`1c1g1t2[2^3t4Q4Y4s4x6Q6^7X8l8p8q8r8s8t8u8}9O9P9Q9R9S9Y9Z9b9c:u;R;S;j;{V(n#|8n8oU&S!`$q*}Q&{!xQ)a$jQ,`'tQ.V)sQ1Z-XR4f1y(UbORSTUij{!Q!U!Z!^!k!s!w!y!|!}#O#P#Q#R#S#T#U#V#W#Y#_#b#h$V$i%V%Y%Z%^%`%a%b%d%h%s%{&P&W&^&h&t&x'm's(u(|*Z*_*d*s*v+c+j+{,R,W-Y-^-f-p._.p.q.r.t.x.{.}/]/f/y0T0g1s1{2]2p2r2s2|3T4w5V5a6R6o7a7u8V8Y8]8^8_8`8a8b8c8d8e8f8g8h8i8j8m8v8w8x8|9T9U9V9W9X9[9]9^9_9`9a9i9j9o9p9q9r9s9t9u9v9w9x9y9z:d:m:r:|;T;U;V;W;X;Y;Z;[;];^;_;`;a;b;c;d;k;|%]#^Y!]!l$Z%r%v&w&}'O'P'Q'R'S'T'U'V'W'X'Z'^'a'k)`*o*x+R+i+},Q,S,_/W/Z/x0S0W0X0Y0Z0[0]0^0_0`0a0b0c0f0k3O3R3b3e3k4h5]5`5k6m7O7_7s7}8W8X8z8{:R:W:X:Y:Z:[:]:^:_:`:a:b:c:n:q;Q;i;m;n;o;p;q;r;s;t;u;v;w;x;y;z(VbORSTUij{!Q!U!Z!^!k!s!w!y!|!}#O#P#Q#R#S#T#U#V#W#Y#_#b#h$V$i%V%Y%Z%^%`%a%b%d%h%s%{&P&W&^&h&t&x'm's(u(|*Z*_*d*s*v+c+j+{,R,W-Y-^-f-p._.p.q.r.t.x.{.}/]/f/y0T0g1s1{2]2p2r2s2|3T4w5V5a6R6o7a7u8V8Y8]8^8_8`8a8b8c8d8e8f8g8h8i8j8m8v8w8x8|9T9U9V9W9X9[9]9^9_9`9a9i9j9o9p9q9r9s9t9u9v9w9x9y9z:d:m:r:|;T;U;V;W;X;Y;Z;[;];^;_;`;a;b;c;d;k;|Q&Q!`R/^*zY%z!`&O&V*z+QS([#u(bS+V&[+YS,y(](dQ,z(^Q-Q(eQ.X)uS/i+W+[S/m+]+^S/q+_2SQ1U-PQ1W-RQ1X-SS1}.[2QS3W/l/nQ3Z/oQ3[/pS4k2O2VS4n2T2US5e3Y3]Q5h3^S6W4o4pQ6Y4qQ6r5gS7T6X6ZR7m7UlgOSi{!k$V%^%a%b%d*_*d.x.{Q%f!OW&p!s8]8^:rQ)T$bQ)w$zQ)x${Q+e&aW+w&t8w8x9WW-](u9T9U9VQ-m)UQ.Z)vQ/P*fQ/Q*gQ/Y*uQ/u+fW1_-^9[9]9^Q1h-nW1j-p9_9`9aQ2}/[Q3Q/dQ3`/vQ4[1iQ5Z2zQ5^3PQ5b3VQ5i3aQ6k5[Q6n5cQ7`6pQ7q7]R7t7b%S#]Y!]!l%r%v&w&}'O'P'Q'R'S'T'U'V'W'X'Z'^'a'k)`*o*x+R+i+},Q,_/W/Z/x0S0W0X0Y0Z0[0]0^0_0`0a0b0c0f0k3O3R3b3e3k4h5]5`5k6m7O7_7s7}8W8X8z8{:W:X:Y:Z:[:]:^:_:`:a:b:c:n:q;Q;i;n;o;p;q;r;s;t;u;v;w;x;y;zU(g#v&s0eX(y$Z,S:R;m%S#[Y!]!l%r%v&w&}'O'P'Q'R'S'T'U'V'W'X'Z'^'a'k)`*o*x+R+i+},Q,_/W/Z/x0S0W0X0Y0Z0[0]0^0_0`0a0b0c0f0k3O3R3b3e3k4h5]5`5k6m7O7_7s7}8W8X8z8{:W:X:Y:Z:[:]:^:_:`:a:b:c:n:q;Q;i;n;o;p;q;r;s;t;u;v;w;x;y;zQ']#]W(x$Z,S:R;mR-_(y(UbORSTUij{!Q!U!Z!^!k!s!w!y!|!}#O#P#Q#R#S#T#U#V#W#Y#_#b#h$V$i%V%Y%Z%^%`%a%b%d%h%s%{&P&W&^&h&t&x'm's(u(|*Z*_*d*s*v+c+j+{,R,W-Y-^-f-p._.p.q.r.t.x.{.}/]/f/y0T0g1s1{2]2p2r2s2|3T4w5V5a6R6o7a7u8V8Y8]8^8_8`8a8b8c8d8e8f8g8h8i8j8m8v8w8x8|9T9U9V9W9X9[9]9^9_9`9a9i9j9o9p9q9r9s9t9u9v9w9x9y9z:d:m:r:|;T;U;V;W;X;Y;Z;[;];^;_;`;a;b;c;d;k;|Q%ayQ%bzQ%d|Q%e}R.w*bQ&]!fQ(z$]Q+b&`S-d)O)gS/r+`+aW1b-a-b-c-|S3_/s/tU4X1d1e1fU5{4W4b4cQ6{5|R7h6}T+X&[+YS+X&[+YT2P.[2QS&j!n.uQ,l(PQ,w([S/h+V1}Q0t,mS1O,x-QU3X/m/q4nQ3p0oS4O1V1XU5f3Z3[6YQ5q3qQ5z4RR6s5hQ!uXS&i!n.uQ(v$UQ)R$`Q)X$fQ+k&jQ,k(PQ,v([Q,{(_Q-l)SQ.c){S/g+V1}S0s,l,mS0},w-QQ1Q,zQ1T,|Q2a.dW3U/h/m/q4nQ3o0oQ3s0tS3x1O1XQ4P1WQ4z2bW5d3X3Z3[6YS5p3p3qQ5u3zQ5x4OQ6T4iQ6b4{S6q5f5hQ6u5qQ6w5vQ6z5zQ7Q6UQ7Z6cQ7c6sQ7f6yQ7j7RQ7x7kQ8P7yQ8T8QQ9m9fQ9n9gQ:S;fQ:g:OQ:h:PQ:i:QQ:j:TQ:k:UR:l:V$jWORSTUij{!Q!U!Z!^!k!s!w!y!|!}#O#P#Q#R#S#T#U#V#W#_#b$V%V%Y%Z%^%`%a%b%d%h%s%{&W&^&h&t&x's(u(|*Z*_*d+c+j+{,R-Y-^-f-p._.p.q.r.t.x.{.}/y0T1s2]2p2r2s4w5V8^8x9U9]9`S!um!hx9d#Y8V8Y8_8`8a8b8c8d8e8f8g8h8i8m8|9X:|;k;|!O9e$i/f3T5a6o7a7u9i9j9o9p9q9r9s9t9u9v9w9x9y9z:d:mQ9m:yQ9n:zQ:S:{!q;e#h&P'm*s*v,W/]0g1{2|6R8]8j8v8w9T9V9W9[9^9_9a:r;T;U;V;W;X;Y;Z;[;];^;_;`;a;b;c;d$jXORSTUij{!Q!U!Z!^!k!s!w!y!|!}#O#P#Q#R#S#T#U#V#W#_#b$V%V%Y%Z%^%`%a%b%d%h%s%{&W&^&h&t&x's(u(|*Z*_*d+c+j+{,R-Y-^-f-p._.p.q.r.t.x.{.}/y0T1s2]2p2r2s4w5V8^8x9U9]9`Q$Ua!W$`l!g$c$d$e%}&b&c&d([)V)W*w+V+g+h,y-o/b/i/m/w1U3W3[5e6rS$fm!hQ)S$aQ){%OW.d)|)}*O*PU2b.e.f.gQ4i1}S4{2c2dU6U4j4k4nQ6c4|U7R6V6W6YS7k7S7TS7y7l7mQ8Q7zx9f#Y8V8Y8_8`8a8b8c8d8e8f8g8h8i8m8|9X:|;k;|!O9g$i/f3T5a6o7a7u9i9j9o9p9q9r9s9t9u9v9w9x9y9z:d:mQ:O:vQ:P:wQ:Q:xQ:T:yQ:U:zQ:V:{!q;f#h&P'm*s*v,W/]0g1{2|6R8]8j8v8w9T9V9W9[9^9_9a:r;T;U;V;W;X;Y;Z;[;];^;_;`;a;b;c;d$b[OSTij{!Q!U!Z!k!s!w!y!|!}#O#P#Q#R#S#T#U#V#W#_#b$V%V%Y%^%`%a%b%d%h%s%{&W&^&h&t&x's(u(|*Z*_*d+c+j+{,R-Y-^-f-p._.p.q.r.t.x.{.}/y0T1s2]2p2r2s4w5V8^8x9U9]9`U!eRU!^v$rpq!o!r$T$p&X&l&o)h)i)j*]*t+T+m+o/R/{Q*Y%Zx9h#Y8V8Y8_8`8a8b8c8d8e8f8g8h8i8m8|9X:|;k;|Q9l&P!O:t$i/f3T5a6o7a7u9i9j9o9p9q9r9s9t9u9v9w9x9y9z:d:m!o;g#h'm*s*v,W/]0g1{2|6R8]8j8v8w9T9V9W9[9^9_9a:r;T;U;V;W;X;Y;Z;[;];^;_;`;a;b;c;dS&T!`$qR/`*}$hZORSTUij{!Q!U!Z!^!k!s!w!y!|!}#O#P#Q#R#S#T#U#V#W#_#b$V%V%Y%^%`%a%b%d%h%s%{&W&^&h&t&x's(u(|*Z*_*d+c+j+{,R-Y-^-f-p._.p.q.r.t.x.{.}/y0T1s2]2p2r2s4w5V8^8x9U9]9`x'[#Y8V8Y8_8`8a8b8c8d8e8f8g8h8i8m8|9X:|;k;|Q*X%Z!O:s$i/f3T5a6o7a7u9i9j9o9p9q9r9s9t9u9v9w9x9y9z:d:m!q;l#h&P'm*s*v,W/]0g1{2|6R8]8j8v8w9T9V9W9[9^9_9a:r;T;U;V;W;X;Y;Z;[;];^;_;`;a;b;c;d!Q#SY!]$Z%r%v&w'U'V'W'X'^'a*o+R+i+},_/x0S0c3b3e8W8Xh8e'Z,S0_0`0a0b0f3k5k:b;Q;in9u)`3R5`6m7_7s7}:R:^:_:`:a:c:n:qw;]'k*x/W/Z0k3O4h5]7O8z8{;m;t;u;v;w;x;y;z|#UY!]$Z%r%v&w'W'X'^'a*o+R+i+},_/x0S0c3b3e8W8Xd8g'Z,S0a0b0f3k5k:b;Q;ij9w)`3R5`6m7_7s7}:R:`:a:c:n:qs;_'k*x/W/Z0k3O4h5]7O8z8{;m;v;w;x;y;zx#YY!]$Z%r%v&w'^'a*o+R+i+},_/x0S0c3b3e8W8Xp'{#p&u(t,g,o-T-U0Q1^3n4S9{:o:p:};h`:|'Z,S0f3k5k:b;Q;i!^;R&q'`(O(U+a+v,s-`-c.Q.S/t0P0u0y1f1v1x2Y3d3u3{4U4Z4c4v5j5s5y6`Y;S0d3j5l6t7df;k)`3R5`6m7_7s7}:R:c:n:qo;|'k*x/W/Z0k3O4h5]7O8z8{;m;x;y;z(UbORSTUij{!Q!U!Z!^!k!s!w!y!|!}#O#P#Q#R#S#T#U#V#W#Y#_#b#h$V$i%V%Y%Z%^%`%a%b%d%h%s%{&P&W&^&h&t&x'm's(u(|*Z*_*d*s*v+c+j+{,R,W-Y-^-f-p._.p.q.r.t.x.{.}/]/f/y0T0g1s1{2]2p2r2s2|3T4w5V5a6R6o7a7u8V8Y8]8^8_8`8a8b8c8d8e8f8g8h8i8j8m8v8w8x8|9T9U9V9W9X9[9]9^9_9`9a9i9j9o9p9q9r9s9t9u9v9w9x9y9z:d:m:r:|;T;U;V;W;X;Y;Z;[;];^;_;`;a;b;c;d;k;|S#i_#jR0h,V(]^ORSTU_ij{!Q!U!Z!^!k!s!w!y!|!}#O#P#Q#R#S#T#U#V#W#Y#_#b#h#j$V$i%V%Y%Z%^%`%a%b%d%h%s%{&P&W&^&h&t&x'm's(u(|*Z*_*d*s*v+c+j+{,R,V,W-Y-^-f-p._.p.q.r.t.x.{.}/]/f/y0T0g1s1{2]2p2r2s2|3T4w5V5a6R6o7a7u8V8Y8]8^8_8`8a8b8c8d8e8f8g8h8i8j8m8v8w8x8|9T9U9V9W9X9[9]9^9_9`9a9i9j9o9p9q9r9s9t9u9v9w9x9y9z:d:m:r:|;T;U;V;W;X;Y;Z;[;];^;_;`;a;b;c;d;k;|S#d]#kT'd#f'hT#e]#kT'f#f'h(]_ORSTU_ij{!Q!U!Z!^!k!s!w!y!|!}#O#P#Q#R#S#T#U#V#W#Y#_#b#h#j$V$i%V%Y%Z%^%`%a%b%d%h%s%{&P&W&^&h&t&x'm's(u(|*Z*_*d*s*v+c+j+{,R,V,W-Y-^-f-p._.p.q.r.t.x.{.}/]/f/y0T0g1s1{2]2p2r2s2|3T4w5V5a6R6o7a7u8V8Y8]8^8_8`8a8b8c8d8e8f8g8h8i8j8m8v8w8x8|9T9U9V9W9X9[9]9^9_9`9a9i9j9o9p9q9r9s9t9u9v9w9x9y9z:d:m:r:|;T;U;V;W;X;Y;Z;[;];^;_;`;a;b;c;d;k;|T#i_#jQ#l_R'o#j$jaORSTUij{!Q!U!Z!^!k!s!w!y!|!}#O#P#Q#R#S#T#U#V#W#_#b$V%V%Y%Z%^%`%a%b%d%h%s%{&W&^&h&t&x's(u(|*Z*_*d+c+j+{,R-Y-^-f-p._.p.q.r.t.x.{.}/y0T1s2]2p2r2s4w5V8^8x9U9]9`x:v#Y8V8Y8_8`8a8b8c8d8e8f8g8h8i8m8|9X:|;k;|!O:w$i/f3T5a6o7a7u9i9j9o9p9q9r9s9t9u9v9w9x9y9z:d:m!q:x#h&P'm*s*v,W/]0g1{2|6R8]8j8v8w9T9V9W9[9^9_9a:r;T;U;V;W;X;Y;Z;[;];^;_;`;a;b;c;d#{cOSUi{!Q!U!k!s!y#h$V%V%Y%Z%^%`%a%b%d%h%{&^&t'm(u(|*Z*_*d+c,W-Y-^-f-p._.p.q.r.t.x.{.}0g1s2]2p2r2s4w5V8]8^8w8x9T9U9V9W9[9]9^9_9`9a:rx#v`!v#}$O$S'x'z'{(S(h(i+x-[0n1Y:u;R;S;j;{!z&s!t#a#r#t&_(W({(})Q)n)q+d,p,r-e-g.R.U.^.`0w1R1`1c1g1t2[2^3t4Q4Y4s4x6Q6^7X8p8r8t8}9P9R9Y9bQ(r$Qc0e8l8q8s8u9O9Q9S9Z9cx#s`!v#}$O$S'x'z'{(S(h(i+x-[0n1Y:u;R;S;j;{S(_#u(bQ(s$RQ,|(`!z9|!t#a#r#t&_(W({(})Q)n)q+d,p,r-e-g.R.U.^.`0w1R1`1c1g1t2[2^3t4Q4Y4s4x6Q6^7X8p8r8t8}9P9R9Y9bb9}8l8q8s8u9O9Q9S9Z9cQ:e;OR:f;PleOSi{!k$V%^%a%b%d*_*d.x.{Q(V#tQ*k%kQ*l%mR0v,p$W#w`!t!v#a#r#t#}$O$S&_'x'z'{(S(W(h(i({(})Q)n)q+d+x,p,r-[-e-g.R.U.^.`0n0w1R1Y1`1c1g1t2[2^3t4Q4Y4s4x6Q6^7X8l8p8q8r8s8t8u8}9O9P9Q9R9S9Y9Z9b9c:u;R;S;j;{Q)p$xQ.T)rQ1w.SR4e1xT(a#u(bS(a#u(bT2P.[2QQ)R$`Q,{(_Q-l)SQ.c){Q2a.dQ4z2bQ6T4iQ6b4{Q7Q6UQ7Z6cQ7j7RQ7x7kQ8P7yR8T8Qp'x#p&u(t,g,o-T-U0Q1^3n4S9{:o:p:};h!^8}&q'`(O(U+a+v,s-`-c.Q.S/t0P0u0y1f1v1x2Y3d3u3{4U4Z4c4v5j5s5y6`Z9O0d3j5l6t7dr'z#p&u(t,e,g,o-T-U0Q1^3n4S9{:o:p:};h!`9P&q'`(O(U+a+v,s-`-c.Q.S/t/}0P0u0y1f1v1x2Y3d3u3{4U4Z4c4v5j5s5y6`]9Q0d3j5l5m6t7dpdOSiw{!k$V%T%^%a%b%d*_*d.x.{Q%QvR*Z%ZpdOSiw{!k$V%T%^%a%b%d*_*d.x.{R%QvQ)t$yR.P)mqdOSiw{!k$V%T%^%a%b%d*_*d.x.{Q.])yS2Z.a.bW4r2W2X2Y2_U6]4t4u4vU7V6[6_6`Q7n7WR7{7oQ%XwR*T%TR2h.jR6e4}S$hn$mR-u)^Q%^xR*_%_R*e%eT.y*d.{QiOQ!kST$Yi!kQ!WQR%p!WQ![RU%t![%u*pQ%u!]R*p%vQ*{&QR/_*{Q+y&uR0R+yQ+|&wS0U+|0VR0V+}Q+Y&[R/j+YQ&Y!cQ*q%wT+U&Y*qQ+O&TR/a+OQ&m!pQ+l&kU+p&m+l/|R/|+qQ'h#fR,X'hQ#j_R'n#jQ#`YW'_#`*n3f8kQ*n8WS+r8X8{Q3f8zR8k'kQ,j(PW0q,j0r3r5rU0r,k,l,mS3r0s0tR5r3s#s'v#p&q&u'`(O(U(o(p(t+a+t+u+v,e,f,g,o,s-T-U-`-c.Q.S/t/}0O0P0Q0d0u0y1^1f1v1x2Y3d3h3i3j3n3u3{4S4U4Z4c4v5j5l5m5n5s5y6`6t7d9{:o:p:};hQ,q(UU0x,q0z3vQ0z,sR3v0yQ(b#uR,}(bQ(k#yR-W(kQ1a-`R4V1aQ)k$sR.O)kQ1z.VS4g1z6SR6S4hQ)v$zR.Y)vQ2Q.[R4l2QQ.i*QS2f.i5OR5O2hQ-r)ZS1m-r4^R4^1nQ)_$hR-v)_Q.{*dR2v.{WhOSi!kQ%c{Q(w$VQ*^%^Q*`%aQ*a%bQ*c%dQ.v*_S.y*d.{R2u.xQ$XfQ%g!PQ%j!RQ%l!SQ%n!TQ)f$nQ)l$tQ*S%XQ*i%iS.l*T*WQ/S*hQ/T*kQ/U*lS/e+V1}Q0{,uQ0|,vQ1S,{Q1p-yQ1u.QQ2`.cQ2j.nQ2t.wY3S/g/h/m/q4nQ3w0}Q3y1PQ3|1TQ4a1rQ4d1vQ4y2aQ5P2i[5_3R3U3X3Z3[6YQ5t3xQ5w3}Q6O4_Q6a4zQ6f5QW6l5`5d5f5hQ6v5uQ6x5xQ6|6PQ7P6TQ7Y6bU7^6m6q6sQ7e6wQ7g6zQ7i7QQ7p7ZS7r7_7cQ7v7fQ7w7jQ7|7sQ8O7xQ8R7}Q8S8PR8U8TQ$blQ&a!gU)U$c$d$eQ*u%}U+f&b&c&dQ,u([S-n)V)WQ/[*wQ/d+VS/v+g+hQ1P,yQ1i-oQ3P/bS3V/i/mQ3a/wQ3}1US5c3W3[Q6p5eR7b6rW#q`:u;j;{R)P$_Y#y`$_:u;j;{R-V(jQ#p`S&q!t)QQ&u!vQ'`#aQ(O#rQ(U#tQ(o#}Q(p$OQ(t$SQ+a&_Q+t8pQ+u8rQ+v8tQ,e'xQ,f'zQ,g'{Q,o(SQ,s(WQ-T(hQ-U(id-`({-e.^1c2[4Y4s6Q6^7XQ-c(}Q.Q)nQ.S)qQ/t+dQ/}8}Q0O9PQ0P9RQ0Q+xQ0d8lQ0u,pQ0y,rQ1^-[Q1f-gQ1v.RQ1x.UQ2Y.`Q3d9YQ3h8qQ3i8sQ3j8uQ3n0nQ3u0wQ3{1RQ4S1YQ4U1`Q4Z1gQ4c1tQ4v2^Q5j9bQ5l9SQ5m9OQ5n9QQ5s3tQ5y4QQ6`4xQ6t9ZQ7d9cQ9{:uQ:o;RQ:p;SQ:};jR;h;{lfOSi{!k$V%^%a%b%d*_*d.x.{S!mU%`Q%i!QQ%o!UW&p!s8]8^:rQ&|!yQ'l#hS*W%V%YQ*[%ZQ*h%hQ*r%{Q+`&^W+w&t8w8x9WQ,]'mW-](u9T9U9VQ-b(|Q.s*ZQ/s+cQ0j,WQ1[-YW1_-^9[9]9^Q1e-fW1j-p9_9`9aQ2X._Q2l.pQ2m.qQ2o.rQ2q.tQ2x.}Q3l0gQ4b1sQ4u2]Q5U2pQ5W2rQ5X2sQ6_4wR6h5V!vYOSUi{!Q!k!y$V%V%Y%Z%^%`%a%b%d%h%{&^(|*Z*_*d+c-Y-f._.p.q.r.t.x.{.}1s2]2p2r2s4w5VQ!]RS!lT9jQ$ZjQ%r!ZQ%v!^Q&w!wS&}!|9oQ'O!}Q'P#OQ'Q#PQ'R#QQ'S#RQ'T#SQ'U#TQ'V#UQ'W#VQ'X#WQ'Z#YQ'^#_Q'a#bW'k#h'm,W0gQ)`$iQ*o%sS*x&P/]Q+R&WQ+i&hQ+}&xS,Q8V;TQ,S8YQ,_'sQ/W*sQ/Z*vQ/x+jQ0S+{S0W8_;VQ0X8`Q0Y8aQ0Z8bQ0[8cQ0]8dQ0^8eQ0_8fQ0`8gQ0a8hQ0b8iQ0c,RQ0f8mQ0k8jQ3O8vQ3R/fQ3b/yQ3e0TQ3k8|Q4h1{Q5]2|Q5`3TQ5k9XQ6m5aQ7O6RQ7_6oQ7s7aQ7}7u[8W!U8^8x9U9]9`Y8X!s&t(u-^-pY8z8]8w9T9[9_Y8{9V9W9^9a:rQ:R9iQ:W9pQ:X9qQ:Y9rQ:Z9sQ:[9tQ:]9uQ:^9vQ:_9wQ:`9xQ:a9yQ:b:|Q:c9zQ:n:dQ:q:mQ;Q;kQ;i;|Q;m;UQ;n;WQ;o;XQ;p;YQ;q;ZQ;r;[Q;s;]Q;t;^Q;u;_Q;v;`Q;w;aQ;x;bQ;y;cR;z;dT!VQ!WR!_RR&R!`S%}!`*zS*w&O&VR/b+QR&v!vR&y!wT!qU$TS!pU$TU$spq*]S&k!o!rQ+n&lQ+q&oQ-})jS/z+m+oR3c/{[!bR!^$p&X)h+Th!nUpq!o!r$T&l&o)j+m+o/{Q.u*]Q/X*tQ2{/RT9k&P)iT!dR$pS!cR$pS%w!^)hS*y&P)iQ+S&XR/c+TT&U!`$qQ#f]R'q#kT'g#f'hR0i,VT(R#r(ZR(X#tQ-a({Q1d-eQ2W.^Q4W1cQ4t2[Q5|4YQ6[4sQ6}6QQ7W6^R7o7XlgOSi{!k$V%^%a%b%d*_*d.x.{Q%WwR*S%TV$tpq*]R.W)sR*R%RQ$lnR)e$mR)[$gT%[x%_T%]x%_T.z*d.{",
+      nodeNames: "⚠ ArithOp ArithOp extends LineComment BlockComment Script ExportDeclaration export Star as VariableName from String ; default FunctionDeclaration async function VariableDefinition TypeParamList TypeDefinition ThisType this LiteralType ArithOp Number BooleanLiteral VoidType void TypeofType typeof MemberExpression . ?. PropertyName [ TemplateString null super RegExp ] ArrayExpression Spread , } { ObjectExpression Property async get set PropertyNameDefinition Block : NewExpression new TypeArgList CompareOp < ) ( ArgList UnaryExpression await yield delete LogicOp BitOp ParenthesizedExpression ClassExpression class extends ClassBody MethodDeclaration Privacy static abstract PropertyDeclaration readonly Optional TypeAnnotation Equals FunctionExpression ArrowFunction ParamList ParamList ArrayPattern ObjectPattern PatternProperty Privacy readonly Arrow MemberExpression BinaryExpression ArithOp ArithOp ArithOp ArithOp BitOp CompareOp in instanceof CompareOp BitOp BitOp BitOp LogicOp LogicOp ConditionalExpression LogicOp LogicOp AssignmentExpression UpdateOp PostfixExpression CallExpression TaggedTemplatExpression DynamicImport import ImportMeta JSXElement JSXSelfCloseEndTag JSXStartTag JSXSelfClosingTag JSXIdentifier JSXNamespacedName JSXMemberExpression JSXSpreadAttribute JSXAttribute JSXAttributeValue JSXEscape JSXEndTag JSXOpenTag JSXFragmentTag JSXText JSXEscape JSXStartCloseTag JSXCloseTag PrefixCast ArrowFunction TypeParamList SequenceExpression KeyofType keyof UniqueType unique ImportType InferredType infer TypeName ParenthesizedType FunctionSignature ParamList NewSignature IndexedType TupleType Label ArrayType ReadonlyType ObjectType MethodType PropertyType IndexSignature CallSignature TypePredicate is NewSignature new UnionType LogicOp IntersectionType LogicOp ConditionalType ParameterizedType ClassDeclaration abstract implements type VariableDeclaration let var const TypeAliasDeclaration InterfaceDeclaration interface EnumDeclaration enum EnumBody NamespaceDeclaration namespace module AmbientDeclaration declare GlobalDeclaration global ClassDeclaration ClassBody MethodDeclaration AmbientFunctionDeclaration ExportGroup VariableName VariableName ImportDeclaration ImportGroup ForStatement for ForSpec ForInSpec ForOfSpec of WhileStatement while WithStatement with DoStatement do IfStatement if else SwitchStatement switch SwitchBody CaseLabel case DefaultLabel TryStatement try catch finally ReturnStatement return ThrowStatement throw BreakStatement break ContinueStatement continue DebuggerStatement debugger LabeledStatement ExpressionStatement",
+      maxTerm: 321,
       nodeProps: [
-        [NodeProp.group, -26,7,14,16,53,173,177,181,182,184,187,190,201,203,209,211,213,215,218,224,228,230,232,234,236,238,239,"Statement",-30,11,13,23,26,27,37,38,39,40,42,47,55,63,69,70,83,84,93,94,109,112,114,115,116,117,119,120,137,138,140,"Expression",-21,22,24,28,30,141,143,145,146,148,149,150,152,153,154,156,157,158,167,169,171,172,"Type",-2,74,78,"ClassItem"],
-        [NodeProp.closedBy, 36,"]",46,"}",61,")",122,"JSXSelfCloseEndTag JSXEndTag",135,"JSXEndTag"],
-        [NodeProp.openedBy, 41,"[",45,"{",60,"(",121,"JSXStartTag",130,"JSXStartTag JSXStartCloseTag"]
+        [NodeProp.group, -26,7,14,16,53,174,178,182,183,185,188,191,202,204,210,212,214,216,219,225,229,231,233,235,237,239,240,"Statement",-30,11,13,23,26,27,37,38,39,40,42,47,55,63,69,70,83,84,93,94,109,112,114,115,116,117,119,120,138,139,141,"Expression",-21,22,24,28,30,142,144,146,147,149,150,151,153,154,155,157,158,159,168,170,172,173,"Type",-2,74,78,"ClassItem"],
+        [NodeProp.closedBy, 36,"]",46,"}",61,")",122,"JSXSelfCloseEndTag JSXEndTag",136,"JSXEndTag"],
+        [NodeProp.openedBy, 41,"[",45,"{",60,"(",121,"JSXStartTag",131,"JSXStartTag JSXStartCloseTag"]
       ],
       skippedNodes: [0,4,5],
       repeatNodeCount: 27,
-      tokenData: "!Ck~R!ZOX$tX^%S^p$tpq%Sqr&rrs'zst$ttu/wuv2Xvw2|wx3zxy:byz:rz{;S{|<S|}<g}!O<S!O!P<w!P!QAT!Q!R!0Z!R![!2j![!]!8Y!]!^!8l!^!_!8|!_!`!9y!`!a!;U!a!b!<{!b!c$t!c!}/w!}#O!>^#O#P$t#P#Q!>n#Q#R!?O#R#S/w#S#T!?c#T#o/w#o#p!?s#p#q!?x#q#r!@`#r#s!@r#s#y$t#y#z%S#z$f$t$f$g%S$g#BY/w#BY#BZ!AS#BZ$IS/w$IS$I_!AS$I_$I|/w$I|$JO!AS$JO$JT/w$JT$JU!AS$JU$KV/w$KV$KW!AS$KW&FU/w&FU&FV!AS&FV~/wW$yR#yWO!^$t!_#o$t#p~$t,T%Zg#yW&|+{OX$tX^%S^p$tpq%Sq!^$t!_#o$t#p#y$t#y#z%S#z$f$t$f$g%S$g#BY$t#BY#BZ%S#BZ$IS$t$IS$I_%S$I_$I|$t$I|$JO%S$JO$JT$t$JT$JU%S$JU$KV$t$KV$KW%S$KW&FU$t&FU&FV%S&FV~$t$T&yS#yW!e#{O!^$t!_!`'V!`#o$t#p~$t$O'^S#Z#v#yWO!^$t!_!`'j!`#o$t#p~$t$O'qR#Z#v#yWO!^$t!_#o$t#p~$t'u(RZ#yW]!ROY'zYZ(tZr'zrs*Rs!^'z!^!_*e!_#O'z#O#P,q#P#o'z#o#p*e#p~'z&r(yV#yWOr(trs)`s!^(t!^!_)p!_#o(t#o#p)p#p~(t&r)gR#u&j#yWO!^$t!_#o$t#p~$t&j)sROr)prs)|s~)p&j*RO#u&j'u*[R#u&j#yW]!RO!^$t!_#o$t#p~$t'm*jV]!ROY*eYZ)pZr*ers+Ps#O*e#O#P+W#P~*e'm+WO#u&j]!R'm+ZROr*ers+ds~*e'm+kU#u&j]!ROY+}Zr+}rs,fs#O+}#O#P,k#P~+}!R,SU]!ROY+}Zr+}rs,fs#O+}#O#P,k#P~+}!R,kO]!R!R,nPO~+}'u,vV#yWOr'zrs-]s!^'z!^!_*e!_#o'z#o#p*e#p~'z'u-fZ#u&j#yW]!ROY.XYZ$tZr.Xrs/Rs!^.X!^!_+}!_#O.X#O#P/c#P#o.X#o#p+}#p~.X!Z.`Z#yW]!ROY.XYZ$tZr.Xrs/Rs!^.X!^!_+}!_#O.X#O#P/c#P#o.X#o#p+}#p~.X!Z/YR#yW]!RO!^$t!_#o$t#p~$t!Z/hT#yWO!^.X!^!_+}!_#o.X#o#p+}#p~.X&i0S_#yW#pS'Xp'O%kOt$ttu/wu}$t}!O1R!O!Q$t!Q![/w![!^$t!_!c$t!c!}/w!}#R$t#R#S/w#S#T$t#T#o/w#p$g$t$g~/w[1Y_#yW#pSOt$ttu1Ru}$t}!O1R!O!Q$t!Q![1R![!^$t!_!c$t!c!}1R!}#R$t#R#S1R#S#T$t#T#o1R#p$g$t$g~1R$O2`S#T#v#yWO!^$t!_!`2l!`#o$t#p~$t$O2sR#yW#e#vO!^$t!_#o$t#p~$t%r3TU'l%j#yWOv$tvw3gw!^$t!_!`2l!`#o$t#p~$t$O3nS#yW#_#vO!^$t!_!`2l!`#o$t#p~$t'u4RZ#yW]!ROY3zYZ4tZw3zwx*Rx!^3z!^!_5l!_#O3z#O#P7l#P#o3z#o#p5l#p~3z&r4yV#yWOw4twx)`x!^4t!^!_5`!_#o4t#o#p5`#p~4t&j5cROw5`wx)|x~5`'m5qV]!ROY5lYZ5`Zw5lwx+Px#O5l#O#P6W#P~5l'm6ZROw5lwx6dx~5l'm6kU#u&j]!ROY6}Zw6}wx,fx#O6}#O#P7f#P~6}!R7SU]!ROY6}Zw6}wx,fx#O6}#O#P7f#P~6}!R7iPO~6}'u7qV#yWOw3zwx8Wx!^3z!^!_5l!_#o3z#o#p5l#p~3z'u8aZ#u&j#yW]!ROY9SYZ$tZw9Swx/Rx!^9S!^!_6}!_#O9S#O#P9|#P#o9S#o#p6}#p~9S!Z9ZZ#yW]!ROY9SYZ$tZw9Swx/Rx!^9S!^!_6}!_#O9S#O#P9|#P#o9S#o#p6}#p~9S!Z:RT#yWO!^9S!^!_6}!_#o9S#o#p6}#p~9S%V:iR!_$}#yWO!^$t!_#o$t#p~$tZ:yR!^R#yWO!^$t!_#o$t#p~$t%R;]U'P!R#U#v#yWOz$tz{;o{!^$t!_!`2l!`#o$t#p~$t$O;vS#R#v#yWO!^$t!_!`2l!`#o$t#p~$t$u<ZSi$m#yWO!^$t!_!`2l!`#o$t#p~$t&i<nR|&a#yWO!^$t!_#o$t#p~$t&i=OVq%n#yWO!O$t!O!P=e!P!Q$t!Q![>Z![!^$t!_#o$t#p~$ty=jT#yWO!O$t!O!P=y!P!^$t!_#o$t#p~$ty>QR{q#yWO!^$t!_#o$t#p~$ty>bZ#yWjqO!Q$t!Q![>Z![!^$t!_!g$t!g!h?T!h#R$t#R#S>Z#S#X$t#X#Y?T#Y#o$t#p~$ty?YZ#yWO{$t{|?{|}$t}!O?{!O!Q$t!Q![@g![!^$t!_#R$t#R#S@g#S#o$t#p~$ty@QV#yWO!Q$t!Q![@g![!^$t!_#R$t#R#S@g#S#o$t#p~$ty@nV#yWjqO!Q$t!Q![@g![!^$t!_#R$t#R#S@g#S#o$t#p~$t,TA[`#yW#S#vOYB^YZ$tZzB^z{HT{!PB^!P!Q!*|!Q!^B^!^!_Da!_!`!+u!`!a!,t!a!}B^!}#O!-s#O#P!/o#P#oB^#o#pDa#p~B^XBe[#yWxPOYB^YZ$tZ!PB^!P!QCZ!Q!^B^!^!_Da!_!}B^!}#OFY#O#PGi#P#oB^#o#pDa#p~B^XCb_#yWxPO!^$t!_#Z$t#Z#[CZ#[#]$t#]#^CZ#^#a$t#a#bCZ#b#g$t#g#hCZ#h#i$t#i#jCZ#j#m$t#m#nCZ#n#o$t#p~$tPDfVxPOYDaZ!PDa!P!QD{!Q!}Da!}#OEd#O#PFP#P~DaPEQUxP#Z#[D{#]#^D{#a#bD{#g#hD{#i#jD{#m#nD{PEgTOYEdZ#OEd#O#PEv#P#QDa#Q~EdPEyQOYEdZ~EdPFSQOYDaZ~DaXF_Y#yWOYFYYZ$tZ!^FY!^!_Ed!_#OFY#O#PF}#P#QB^#Q#oFY#o#pEd#p~FYXGSV#yWOYFYYZ$tZ!^FY!^!_Ed!_#oFY#o#pEd#p~FYXGnV#yWOYB^YZ$tZ!^B^!^!_Da!_#oB^#o#pDa#p~B^,TH[^#yWxPOYHTYZIWZzHTz{Ki{!PHT!P!Q!)j!Q!^HT!^!_Mt!_!}HT!}#O!%e#O#P!(x#P#oHT#o#pMt#p~HT,TI]V#yWOzIWz{Ir{!^IW!^!_Jt!_#oIW#o#pJt#p~IW,TIwX#yWOzIWz{Ir{!PIW!P!QJd!Q!^IW!^!_Jt!_#oIW#o#pJt#p~IW,TJkR#yWT+{O!^$t!_#o$t#p~$t+{JwROzJtz{KQ{~Jt+{KTTOzJtz{KQ{!PJt!P!QKd!Q~Jt+{KiOT+{,TKp^#yWxPOYHTYZIWZzHTz{Ki{!PHT!P!QLl!Q!^HT!^!_Mt!_!}HT!}#O!%e#O#P!(x#P#oHT#o#pMt#p~HT,TLu_#yWT+{xPO!^$t!_#Z$t#Z#[CZ#[#]$t#]#^CZ#^#a$t#a#bCZ#b#g$t#g#hCZ#h#i$t#i#jCZ#j#m$t#m#nCZ#n#o$t#p~$t+{MyYxPOYMtYZJtZzMtz{Ni{!PMt!P!Q!$a!Q!}Mt!}#O! w#O#P!#}#P~Mt+{NnYxPOYMtYZJtZzMtz{Ni{!PMt!P!Q! ^!Q!}Mt!}#O! w#O#P!#}#P~Mt+{! eUT+{xP#Z#[D{#]#^D{#a#bD{#g#hD{#i#jD{#m#nD{+{! zWOY! wYZJtZz! wz{!!d{#O! w#O#P!#k#P#QMt#Q~! w+{!!gYOY! wYZJtZz! wz{!!d{!P! w!P!Q!#V!Q#O! w#O#P!#k#P#QMt#Q~! w+{!#[TT+{OYEdZ#OEd#O#PEv#P#QDa#Q~Ed+{!#nTOY! wYZJtZz! wz{!!d{~! w+{!$QTOYMtYZJtZzMtz{Ni{~Mt+{!$f_xPOzJtz{KQ{#ZJt#Z#[!$a#[#]Jt#]#^!$a#^#aJt#a#b!$a#b#gJt#g#h!$a#h#iJt#i#j!$a#j#mJt#m#n!$a#n~Jt,T!%j[#yWOY!%eYZIWZz!%ez{!&`{!^!%e!^!_! w!_#O!%e#O#P!(W#P#QHT#Q#o!%e#o#p! w#p~!%e,T!&e^#yWOY!%eYZIWZz!%ez{!&`{!P!%e!P!Q!'a!Q!^!%e!^!_! w!_#O!%e#O#P!(W#P#QHT#Q#o!%e#o#p! w#p~!%e,T!'hY#yWT+{OYFYYZ$tZ!^FY!^!_Ed!_#OFY#O#PF}#P#QB^#Q#oFY#o#pEd#p~FY,T!(]X#yWOY!%eYZIWZz!%ez{!&`{!^!%e!^!_! w!_#o!%e#o#p! w#p~!%e,T!(}X#yWOYHTYZIWZzHTz{Ki{!^HT!^!_Mt!_#oHT#o#pMt#p~HT,T!)qc#yWxPOzIWz{Ir{!^IW!^!_Jt!_#ZIW#Z#[!)j#[#]IW#]#^!)j#^#aIW#a#b!)j#b#gIW#g#h!)j#h#iIW#i#j!)j#j#mIW#m#n!)j#n#oIW#o#pJt#p~IW,T!+TV#yWS+{OY!*|YZ$tZ!^!*|!^!_!+j!_#o!*|#o#p!+j#p~!*|+{!+oQS+{OY!+jZ~!+j$P!,O[#yW#e#vxPOYB^YZ$tZ!PB^!P!QCZ!Q!^B^!^!_Da!_!}B^!}#OFY#O#PGi#P#oB^#o#pDa#p~B^]!,}[#mS#yWxPOYB^YZ$tZ!PB^!P!QCZ!Q!^B^!^!_Da!_!}B^!}#OFY#O#PGi#P#oB^#o#pDa#p~B^X!-xY#yWOY!-sYZ$tZ!^!-s!^!_!.h!_#O!-s#O#P!/T#P#QB^#Q#o!-s#o#p!.h#p~!-sP!.kTOY!.hZ#O!.h#O#P!.z#P#QDa#Q~!.hP!.}QOY!.hZ~!.hX!/YV#yWOY!-sYZ$tZ!^!-s!^!_!.h!_#o!-s#o#p!.h#p~!-sX!/tV#yWOYB^YZ$tZ!^B^!^!_Da!_#oB^#o#pDa#p~B^y!0bd#yWjqO!O$t!O!P!1p!P!Q$t!Q![!2j![!^$t!_!g$t!g!h?T!h#R$t#R#S!2j#S#U$t#U#V!4Q#V#X$t#X#Y?T#Y#b$t#b#c!3p#c#d!5`#d#l$t#l#m!6h#m#o$t#p~$ty!1wZ#yWjqO!Q$t!Q![!1p![!^$t!_!g$t!g!h?T!h#R$t#R#S!1p#S#X$t#X#Y?T#Y#o$t#p~$ty!2q_#yWjqO!O$t!O!P!1p!P!Q$t!Q![!2j![!^$t!_!g$t!g!h?T!h#R$t#R#S!2j#S#X$t#X#Y?T#Y#b$t#b#c!3p#c#o$t#p~$ty!3wR#yWjqO!^$t!_#o$t#p~$ty!4VW#yWO!Q$t!Q!R!4o!R!S!4o!S!^$t!_#R$t#R#S!4o#S#o$t#p~$ty!4vW#yWjqO!Q$t!Q!R!4o!R!S!4o!S!^$t!_#R$t#R#S!4o#S#o$t#p~$ty!5eV#yWO!Q$t!Q!Y!5z!Y!^$t!_#R$t#R#S!5z#S#o$t#p~$ty!6RV#yWjqO!Q$t!Q!Y!5z!Y!^$t!_#R$t#R#S!5z#S#o$t#p~$ty!6mZ#yWO!Q$t!Q![!7`![!^$t!_!c$t!c!i!7`!i#R$t#R#S!7`#S#T$t#T#Z!7`#Z#o$t#p~$ty!7gZ#yWjqO!Q$t!Q![!7`![!^$t!_!c$t!c!i!7`!i#R$t#R#S!7`#S#T$t#T#Z!7`#Z#o$t#p~$t%w!8cR!WV#yW#c%hO!^$t!_#o$t#p~$t!P!8sR^w#yWO!^$t!_#o$t#p~$t+c!9XR'Td![%Y#n&s'pP!P!Q!9b!^!_!9g!_!`!9tW!9gO#{W#v!9lP#V#v!_!`!9o#v!9tO#e#v#v!9yO#W#v%w!:QT!t%o#yWO!^$t!_!`!:a!`!a!:t!a#o$t#p~$t$O!:hS#Z#v#yWO!^$t!_!`'j!`#o$t#p~$t$P!:{R#O#w#yWO!^$t!_#o$t#p~$t%w!;aT'S!s#W#v#vS#yWO!^$t!_!`!;p!`!a!<Q!a#o$t#p~$t$O!;wR#W#v#yWO!^$t!_#o$t#p~$t$O!<XT#V#v#yWO!^$t!_!`2l!`!a!<h!a#o$t#p~$t$O!<oS#V#v#yWO!^$t!_!`2l!`#o$t#p~$t%w!=SV'd%o#yWO!O$t!O!P!=i!P!^$t!_!a$t!a!b!=y!b#o$t#p~$t$`!=pRr$W#yWO!^$t!_#o$t#p~$t$O!>QS#yW#`#vO!^$t!_!`2l!`#o$t#p~$t&e!>eRt&]#yWO!^$t!_#o$t#p~$tZ!>uRyR#yWO!^$t!_#o$t#p~$t$O!?VS#]#v#yWO!^$t!_!`2l!`#o$t#p~$t$P!?jR#yW'[#wO!^$t!_#o$t#p~$t~!?xO!O~%r!@PT'k%j#yWO!^$t!_!`2l!`#o$t#p#q!=y#q~$t$u!@iR}$k#yW'^QO!^$t!_#o$t#p~$tX!@yR!fP#yWO!^$t!_#o$t#p~$t,T!Aar#yW#pS'Xp'O%k&|+{OX$tX^%S^p$tpq%Sqt$ttu/wu}$t}!O1R!O!Q$t!Q![/w![!^$t!_!c$t!c!}/w!}#R$t#R#S/w#S#T$t#T#o/w#p#y$t#y#z%S#z$f$t$f$g%S$g#BY/w#BY#BZ!AS#BZ$IS/w$IS$I_!AS$I_$I|/w$I|$JO!AS$JO$JT/w$JT$JU!AS$JU$KV/w$KV$KW!AS$KW&FU/w&FU&FV!AS&FV~/w",
+      tokenData: "!Ck~R!ZOX$tX^%S^p$tpq%Sqr&rrs'zst$ttu/wuv2Xvw2|wx3zxy:byz:rz{;S{|<S|}<g}!O<S!O!P<w!P!QAT!Q!R!0Z!R![!2j![!]!8Y!]!^!8l!^!_!8|!_!`!9y!`!a!;U!a!b!<{!b!c$t!c!}/w!}#O!>^#O#P$t#P#Q!>n#Q#R!?O#R#S/w#S#T!?c#T#o/w#o#p!?s#p#q!?x#q#r!@`#r#s!@r#s#y$t#y#z%S#z$f$t$f$g%S$g#BY/w#BY#BZ!AS#BZ$IS/w$IS$I_!AS$I_$I|/w$I|$JO!AS$JO$JT/w$JT$JU!AS$JU$KV/w$KV$KW!AS$KW&FU/w&FU&FV!AS&FV~/wW$yR#zWO!^$t!_#o$t#p~$t,T%Zg#zW&}+{OX$tX^%S^p$tpq%Sq!^$t!_#o$t#p#y$t#y#z%S#z$f$t$f$g%S$g#BY$t#BY#BZ%S#BZ$IS$t$IS$I_%S$I_$I|$t$I|$JO%S$JO$JT$t$JT$JU%S$JU$KV$t$KV$KW%S$KW&FU$t&FU&FV%S&FV~$t$T&yS#zW!e#{O!^$t!_!`'V!`#o$t#p~$t$O'^S#Z#v#zWO!^$t!_!`'j!`#o$t#p~$t$O'qR#Z#v#zWO!^$t!_#o$t#p~$t'u(RZ#zW]!ROY'zYZ(tZr'zrs*Rs!^'z!^!_*e!_#O'z#O#P,q#P#o'z#o#p*e#p~'z&r(yV#zWOr(trs)`s!^(t!^!_)p!_#o(t#o#p)p#p~(t&r)gR#u&j#zWO!^$t!_#o$t#p~$t&j)sROr)prs)|s~)p&j*RO#u&j'u*[R#u&j#zW]!RO!^$t!_#o$t#p~$t'm*jV]!ROY*eYZ)pZr*ers+Ps#O*e#O#P+W#P~*e'm+WO#u&j]!R'm+ZROr*ers+ds~*e'm+kU#u&j]!ROY+}Zr+}rs,fs#O+}#O#P,k#P~+}!R,SU]!ROY+}Zr+}rs,fs#O+}#O#P,k#P~+}!R,kO]!R!R,nPO~+}'u,vV#zWOr'zrs-]s!^'z!^!_*e!_#o'z#o#p*e#p~'z'u-fZ#u&j#zW]!ROY.XYZ$tZr.Xrs/Rs!^.X!^!_+}!_#O.X#O#P/c#P#o.X#o#p+}#p~.X!Z.`Z#zW]!ROY.XYZ$tZr.Xrs/Rs!^.X!^!_+}!_#O.X#O#P/c#P#o.X#o#p+}#p~.X!Z/YR#zW]!RO!^$t!_#o$t#p~$t!Z/hT#zWO!^.X!^!_+}!_#o.X#o#p+}#p~.X&i0S_#zW#pS'Yp'P%kOt$ttu/wu}$t}!O1R!O!Q$t!Q![/w![!^$t!_!c$t!c!}/w!}#R$t#R#S/w#S#T$t#T#o/w#p$g$t$g~/w[1Y_#zW#pSOt$ttu1Ru}$t}!O1R!O!Q$t!Q![1R![!^$t!_!c$t!c!}1R!}#R$t#R#S1R#S#T$t#T#o1R#p$g$t$g~1R$O2`S#T#v#zWO!^$t!_!`2l!`#o$t#p~$t$O2sR#zW#e#vO!^$t!_#o$t#p~$t%r3TU'm%j#zWOv$tvw3gw!^$t!_!`2l!`#o$t#p~$t$O3nS#zW#_#vO!^$t!_!`2l!`#o$t#p~$t'u4RZ#zW]!ROY3zYZ4tZw3zwx*Rx!^3z!^!_5l!_#O3z#O#P7l#P#o3z#o#p5l#p~3z&r4yV#zWOw4twx)`x!^4t!^!_5`!_#o4t#o#p5`#p~4t&j5cROw5`wx)|x~5`'m5qV]!ROY5lYZ5`Zw5lwx+Px#O5l#O#P6W#P~5l'm6ZROw5lwx6dx~5l'm6kU#u&j]!ROY6}Zw6}wx,fx#O6}#O#P7f#P~6}!R7SU]!ROY6}Zw6}wx,fx#O6}#O#P7f#P~6}!R7iPO~6}'u7qV#zWOw3zwx8Wx!^3z!^!_5l!_#o3z#o#p5l#p~3z'u8aZ#u&j#zW]!ROY9SYZ$tZw9Swx/Rx!^9S!^!_6}!_#O9S#O#P9|#P#o9S#o#p6}#p~9S!Z9ZZ#zW]!ROY9SYZ$tZw9Swx/Rx!^9S!^!_6}!_#O9S#O#P9|#P#o9S#o#p6}#p~9S!Z:RT#zWO!^9S!^!_6}!_#o9S#o#p6}#p~9S%V:iR!_$}#zWO!^$t!_#o$t#p~$tZ:yR!^R#zWO!^$t!_#o$t#p~$t%R;]U'Q!R#U#v#zWOz$tz{;o{!^$t!_!`2l!`#o$t#p~$t$O;vS#R#v#zWO!^$t!_!`2l!`#o$t#p~$t$u<ZSi$m#zWO!^$t!_!`2l!`#o$t#p~$t&i<nR|&a#zWO!^$t!_#o$t#p~$t&i=OVq%n#zWO!O$t!O!P=e!P!Q$t!Q![>Z![!^$t!_#o$t#p~$ty=jT#zWO!O$t!O!P=y!P!^$t!_#o$t#p~$ty>QR{q#zWO!^$t!_#o$t#p~$ty>bZ#zWjqO!Q$t!Q![>Z![!^$t!_!g$t!g!h?T!h#R$t#R#S>Z#S#X$t#X#Y?T#Y#o$t#p~$ty?YZ#zWO{$t{|?{|}$t}!O?{!O!Q$t!Q![@g![!^$t!_#R$t#R#S@g#S#o$t#p~$ty@QV#zWO!Q$t!Q![@g![!^$t!_#R$t#R#S@g#S#o$t#p~$ty@nV#zWjqO!Q$t!Q![@g![!^$t!_#R$t#R#S@g#S#o$t#p~$t,TA[`#zW#S#vOYB^YZ$tZzB^z{HT{!PB^!P!Q!*|!Q!^B^!^!_Da!_!`!+u!`!a!,t!a!}B^!}#O!-s#O#P!/o#P#oB^#o#pDa#p~B^XBe[#zWxPOYB^YZ$tZ!PB^!P!QCZ!Q!^B^!^!_Da!_!}B^!}#OFY#O#PGi#P#oB^#o#pDa#p~B^XCb_#zWxPO!^$t!_#Z$t#Z#[CZ#[#]$t#]#^CZ#^#a$t#a#bCZ#b#g$t#g#hCZ#h#i$t#i#jCZ#j#m$t#m#nCZ#n#o$t#p~$tPDfVxPOYDaZ!PDa!P!QD{!Q!}Da!}#OEd#O#PFP#P~DaPEQUxP#Z#[D{#]#^D{#a#bD{#g#hD{#i#jD{#m#nD{PEgTOYEdZ#OEd#O#PEv#P#QDa#Q~EdPEyQOYEdZ~EdPFSQOYDaZ~DaXF_Y#zWOYFYYZ$tZ!^FY!^!_Ed!_#OFY#O#PF}#P#QB^#Q#oFY#o#pEd#p~FYXGSV#zWOYFYYZ$tZ!^FY!^!_Ed!_#oFY#o#pEd#p~FYXGnV#zWOYB^YZ$tZ!^B^!^!_Da!_#oB^#o#pDa#p~B^,TH[^#zWxPOYHTYZIWZzHTz{Ki{!PHT!P!Q!)j!Q!^HT!^!_Mt!_!}HT!}#O!%e#O#P!(x#P#oHT#o#pMt#p~HT,TI]V#zWOzIWz{Ir{!^IW!^!_Jt!_#oIW#o#pJt#p~IW,TIwX#zWOzIWz{Ir{!PIW!P!QJd!Q!^IW!^!_Jt!_#oIW#o#pJt#p~IW,TJkR#zWT+{O!^$t!_#o$t#p~$t+{JwROzJtz{KQ{~Jt+{KTTOzJtz{KQ{!PJt!P!QKd!Q~Jt+{KiOT+{,TKp^#zWxPOYHTYZIWZzHTz{Ki{!PHT!P!QLl!Q!^HT!^!_Mt!_!}HT!}#O!%e#O#P!(x#P#oHT#o#pMt#p~HT,TLu_#zWT+{xPO!^$t!_#Z$t#Z#[CZ#[#]$t#]#^CZ#^#a$t#a#bCZ#b#g$t#g#hCZ#h#i$t#i#jCZ#j#m$t#m#nCZ#n#o$t#p~$t+{MyYxPOYMtYZJtZzMtz{Ni{!PMt!P!Q!$a!Q!}Mt!}#O! w#O#P!#}#P~Mt+{NnYxPOYMtYZJtZzMtz{Ni{!PMt!P!Q! ^!Q!}Mt!}#O! w#O#P!#}#P~Mt+{! eUT+{xP#Z#[D{#]#^D{#a#bD{#g#hD{#i#jD{#m#nD{+{! zWOY! wYZJtZz! wz{!!d{#O! w#O#P!#k#P#QMt#Q~! w+{!!gYOY! wYZJtZz! wz{!!d{!P! w!P!Q!#V!Q#O! w#O#P!#k#P#QMt#Q~! w+{!#[TT+{OYEdZ#OEd#O#PEv#P#QDa#Q~Ed+{!#nTOY! wYZJtZz! wz{!!d{~! w+{!$QTOYMtYZJtZzMtz{Ni{~Mt+{!$f_xPOzJtz{KQ{#ZJt#Z#[!$a#[#]Jt#]#^!$a#^#aJt#a#b!$a#b#gJt#g#h!$a#h#iJt#i#j!$a#j#mJt#m#n!$a#n~Jt,T!%j[#zWOY!%eYZIWZz!%ez{!&`{!^!%e!^!_! w!_#O!%e#O#P!(W#P#QHT#Q#o!%e#o#p! w#p~!%e,T!&e^#zWOY!%eYZIWZz!%ez{!&`{!P!%e!P!Q!'a!Q!^!%e!^!_! w!_#O!%e#O#P!(W#P#QHT#Q#o!%e#o#p! w#p~!%e,T!'hY#zWT+{OYFYYZ$tZ!^FY!^!_Ed!_#OFY#O#PF}#P#QB^#Q#oFY#o#pEd#p~FY,T!(]X#zWOY!%eYZIWZz!%ez{!&`{!^!%e!^!_! w!_#o!%e#o#p! w#p~!%e,T!(}X#zWOYHTYZIWZzHTz{Ki{!^HT!^!_Mt!_#oHT#o#pMt#p~HT,T!)qc#zWxPOzIWz{Ir{!^IW!^!_Jt!_#ZIW#Z#[!)j#[#]IW#]#^!)j#^#aIW#a#b!)j#b#gIW#g#h!)j#h#iIW#i#j!)j#j#mIW#m#n!)j#n#oIW#o#pJt#p~IW,T!+TV#zWS+{OY!*|YZ$tZ!^!*|!^!_!+j!_#o!*|#o#p!+j#p~!*|+{!+oQS+{OY!+jZ~!+j$P!,O[#zW#e#vxPOYB^YZ$tZ!PB^!P!QCZ!Q!^B^!^!_Da!_!}B^!}#OFY#O#PGi#P#oB^#o#pDa#p~B^]!,}[#mS#zWxPOYB^YZ$tZ!PB^!P!QCZ!Q!^B^!^!_Da!_!}B^!}#OFY#O#PGi#P#oB^#o#pDa#p~B^X!-xY#zWOY!-sYZ$tZ!^!-s!^!_!.h!_#O!-s#O#P!/T#P#QB^#Q#o!-s#o#p!.h#p~!-sP!.kTOY!.hZ#O!.h#O#P!.z#P#QDa#Q~!.hP!.}QOY!.hZ~!.hX!/YV#zWOY!-sYZ$tZ!^!-s!^!_!.h!_#o!-s#o#p!.h#p~!-sX!/tV#zWOYB^YZ$tZ!^B^!^!_Da!_#oB^#o#pDa#p~B^y!0bd#zWjqO!O$t!O!P!1p!P!Q$t!Q![!2j![!^$t!_!g$t!g!h?T!h#R$t#R#S!2j#S#U$t#U#V!4Q#V#X$t#X#Y?T#Y#b$t#b#c!3p#c#d!5`#d#l$t#l#m!6h#m#o$t#p~$ty!1wZ#zWjqO!Q$t!Q![!1p![!^$t!_!g$t!g!h?T!h#R$t#R#S!1p#S#X$t#X#Y?T#Y#o$t#p~$ty!2q_#zWjqO!O$t!O!P!1p!P!Q$t!Q![!2j![!^$t!_!g$t!g!h?T!h#R$t#R#S!2j#S#X$t#X#Y?T#Y#b$t#b#c!3p#c#o$t#p~$ty!3wR#zWjqO!^$t!_#o$t#p~$ty!4VW#zWO!Q$t!Q!R!4o!R!S!4o!S!^$t!_#R$t#R#S!4o#S#o$t#p~$ty!4vW#zWjqO!Q$t!Q!R!4o!R!S!4o!S!^$t!_#R$t#R#S!4o#S#o$t#p~$ty!5eV#zWO!Q$t!Q!Y!5z!Y!^$t!_#R$t#R#S!5z#S#o$t#p~$ty!6RV#zWjqO!Q$t!Q!Y!5z!Y!^$t!_#R$t#R#S!5z#S#o$t#p~$ty!6mZ#zWO!Q$t!Q![!7`![!^$t!_!c$t!c!i!7`!i#R$t#R#S!7`#S#T$t#T#Z!7`#Z#o$t#p~$ty!7gZ#zWjqO!Q$t!Q![!7`![!^$t!_!c$t!c!i!7`!i#R$t#R#S!7`#S#T$t#T#Z!7`#Z#o$t#p~$t%w!8cR!WV#zW#c%hO!^$t!_#o$t#p~$t!P!8sR^w#zWO!^$t!_#o$t#p~$t+c!9XR'Ud![%Y#n&s'qP!P!Q!9b!^!_!9g!_!`!9tW!9gO#|W#v!9lP#V#v!_!`!9o#v!9tO#e#v#v!9yO#W#v%w!:QT!t%o#zWO!^$t!_!`!:a!`!a!:t!a#o$t#p~$t$O!:hS#Z#v#zWO!^$t!_!`'j!`#o$t#p~$t$P!:{R#O#w#zWO!^$t!_#o$t#p~$t%w!;aT'T!s#W#v#wS#zWO!^$t!_!`!;p!`!a!<Q!a#o$t#p~$t$O!;wR#W#v#zWO!^$t!_#o$t#p~$t$O!<XT#V#v#zWO!^$t!_!`2l!`!a!<h!a#o$t#p~$t$O!<oS#V#v#zWO!^$t!_!`2l!`#o$t#p~$t%w!=SV'e%o#zWO!O$t!O!P!=i!P!^$t!_!a$t!a!b!=y!b#o$t#p~$t$`!=pRr$W#zWO!^$t!_#o$t#p~$t$O!>QS#zW#`#vO!^$t!_!`2l!`#o$t#p~$t&e!>eRt&]#zWO!^$t!_#o$t#p~$tZ!>uRyR#zWO!^$t!_#o$t#p~$t$O!?VS#]#v#zWO!^$t!_!`2l!`#o$t#p~$t$P!?jR#zW']#wO!^$t!_#o$t#p~$t~!?xO!O~%r!@PT'l%j#zWO!^$t!_!`2l!`#o$t#p#q!=y#q~$t$u!@iR}$k#zW'_QO!^$t!_#o$t#p~$tX!@yR!fP#zWO!^$t!_#o$t#p~$t,T!Aar#zW#pS'Yp'P%k&}+{OX$tX^%S^p$tpq%Sqt$ttu/wu}$t}!O1R!O!Q$t!Q![/w![!^$t!_!c$t!c!}/w!}#R$t#R#S/w#S#T$t#T#o/w#p#y$t#y#z%S#z$f$t$f$g%S$g#BY/w#BY#BZ!AS#BZ$IS/w$IS$I_!AS$I_$I|/w$I|$JO!AS$JO$JT/w$JT$JU!AS$JU$KV/w$KV$KW!AS$KW&FU/w&FU&FV!AS&FV~/w",
       tokenizers: [noSemicolon, incdecToken, template, 0, 1, 2, 3, 4, 5, 6, 7, 8, insertSemicolon],
       topRules: {"Script":[0,6]},
-      dialects: {jsx: 12762, ts: 12764},
-      dynamicPrecedences: {"138":1,"165":1},
-      specialized: [{term: 276, get: (value, stack) => (tsExtends(value, stack) << 1) | 1},{term: 276, get: value => spec_identifier[value] || -1},{term: 285, get: value => spec_word[value] || -1},{term: 58, get: value => spec_LessThan[value] || -1}],
-      tokenPrec: 12784
+      dialects: {jsx: 12773, ts: 12775},
+      dynamicPrecedences: {"139":1,"166":1},
+      specialized: [{term: 277, get: (value, stack) => (tsExtends(value, stack) << 1) | 1},{term: 277, get: value => spec_identifier$1[value] || -1},{term: 286, get: value => spec_word[value] || -1},{term: 58, get: value => spec_LessThan[value] || -1}],
+      tokenPrec: 12795
     });
 
     /// A collection of JavaScript-related
     /// [snippets](#autocomplete.snippet).
-    const snippets = [
+    [
         snippetCompletion("function ${name}(${params}) {\n\t${}\n}", {
             label: "function",
             detail: "definition",
@@ -18328,7 +18744,7 @@ const cm = (function () {
     /// parser](https://github.com/lezer-parser/javascript), extended with
     /// highlighting and indentation information.
     const javascriptLanguage = LezerLanguage.define({
-        parser: parser.configure({
+        parser: parser$3.configure({
             props: [
                 indentNodeProp.add({
                     IfStatement: continuedIndent({ except: /^\s*({|else\b)/ }),
@@ -18339,89 +18755,100 @@ const cm = (function () {
                         return context.baseIndent + (closed ? 0 : isCase ? 1 : 2) * context.unit;
                     },
                     Block: delimitedIndent({ closing: "}" }),
+                    ArrowFunction: cx => cx.baseIndent + cx.unit,
                     "TemplateString BlockComment": () => -1,
-                    "Statement Property": continuedIndent({ except: /^{/ })
+                    "Statement Property": continuedIndent({ except: /^{/ }),
+                    JSXElement(context) {
+                        let closed = /^\s*<\//.test(context.textAfter);
+                        return context.lineIndent(context.state.doc.lineAt(context.node.from)) + (closed ? 0 : context.unit);
+                    },
+                    JSXEscape(context) {
+                        let closed = /\s*\}/.test(context.textAfter);
+                        return context.lineIndent(context.state.doc.lineAt(context.node.from)) + (closed ? 0 : context.unit);
+                    },
+                    "JSXOpenTag JSXSelfClosingTag"(context) {
+                        return context.column(context.node.from) + context.unit;
+                    }
                 }),
                 foldNodeProp.add({
-                    "Block ClassBody SwitchBody EnumBody ObjectExpression ArrayExpression"(tree) {
-                        return { from: tree.from + 1, to: tree.to - 1 };
-                    },
+                    "Block ClassBody SwitchBody EnumBody ObjectExpression ArrayExpression": foldInside$1,
                     BlockComment(tree) { return { from: tree.from + 2, to: tree.to - 2 }; }
                 }),
                 styleTags({
-                    "get set async static": tags.modifier,
-                    "for while do if else switch try catch finally return throw break continue default case": tags.controlKeyword,
-                    "in of await yield void typeof delete instanceof": tags.operatorKeyword,
-                    "export import let var const function class extends": tags.definitionKeyword,
-                    "with debugger from as new": tags.keyword,
-                    TemplateString: tags.special(tags.string),
-                    Super: tags.atom,
-                    BooleanLiteral: tags.bool,
-                    this: tags.self,
-                    null: tags.null,
-                    Star: tags.modifier,
-                    VariableName: tags.variableName,
-                    "CallExpression/VariableName": tags.function(tags.variableName),
-                    VariableDefinition: tags.definition(tags.variableName),
-                    Label: tags.labelName,
-                    PropertyName: tags.propertyName,
-                    "CallExpression/MemberExpression/PropertyName": tags.function(tags.propertyName),
-                    PropertyNameDefinition: tags.definition(tags.propertyName),
-                    UpdateOp: tags.updateOperator,
-                    LineComment: tags.lineComment,
-                    BlockComment: tags.blockComment,
-                    Number: tags.number,
-                    String: tags.string,
-                    ArithOp: tags.arithmeticOperator,
-                    LogicOp: tags.logicOperator,
-                    BitOp: tags.bitwiseOperator,
-                    CompareOp: tags.compareOperator,
-                    RegExp: tags.regexp,
-                    Equals: tags.definitionOperator,
-                    "Arrow : Spread": tags.punctuation,
-                    "( )": tags.paren,
-                    "[ ]": tags.squareBracket,
-                    "{ }": tags.brace,
-                    ".": tags.derefOperator,
-                    ", ;": tags.separator,
-                    TypeName: tags.typeName,
-                    TypeDefinition: tags.definition(tags.typeName),
-                    "type enum interface implements namespace module declare": tags.definitionKeyword,
-                    "abstract global privacy readonly": tags.modifier,
-                    "is keyof unique infer": tags.operatorKeyword,
-                    JSXAttributeValue: tags.string,
-                    JSXText: tags.content,
-                    "JSXStartTag JSXStartCloseTag JSXSelfCloseEndTag JSXEndTag": tags.angleBracket,
-                    "JSXIdentifier JSXNameSpacedName": tags.typeName,
-                    "JSXAttribute/JSXIdentifier JSXAttribute/JSXNameSpacedName": tags.propertyName
+                    "get set async static": tags$1.modifier,
+                    "for while do if else switch try catch finally return throw break continue default case": tags$1.controlKeyword,
+                    "in of await yield void typeof delete instanceof": tags$1.operatorKeyword,
+                    "export import let var const function class extends": tags$1.definitionKeyword,
+                    "with debugger from as new": tags$1.keyword,
+                    TemplateString: tags$1.special(tags$1.string),
+                    Super: tags$1.atom,
+                    BooleanLiteral: tags$1.bool,
+                    this: tags$1.self,
+                    null: tags$1.null,
+                    Star: tags$1.modifier,
+                    VariableName: tags$1.variableName,
+                    "CallExpression/VariableName": tags$1.function(tags$1.variableName),
+                    VariableDefinition: tags$1.definition(tags$1.variableName),
+                    Label: tags$1.labelName,
+                    PropertyName: tags$1.propertyName,
+                    "CallExpression/MemberExpression/PropertyName": tags$1.function(tags$1.propertyName),
+                    "FunctionDeclaration/VariableDefinition": tags$1.function(tags$1.definition(tags$1.variableName)),
+                    "ClassDeclaration/VariableDefinition": tags$1.definition(tags$1.className),
+                    PropertyNameDefinition: tags$1.definition(tags$1.propertyName),
+                    UpdateOp: tags$1.updateOperator,
+                    LineComment: tags$1.lineComment,
+                    BlockComment: tags$1.blockComment,
+                    Number: tags$1.number,
+                    String: tags$1.string,
+                    ArithOp: tags$1.arithmeticOperator,
+                    LogicOp: tags$1.logicOperator,
+                    BitOp: tags$1.bitwiseOperator,
+                    CompareOp: tags$1.compareOperator,
+                    RegExp: tags$1.regexp,
+                    Equals: tags$1.definitionOperator,
+                    "Arrow : Spread": tags$1.punctuation,
+                    "( )": tags$1.paren,
+                    "[ ]": tags$1.squareBracket,
+                    "{ }": tags$1.brace,
+                    ".": tags$1.derefOperator,
+                    ", ;": tags$1.separator,
+                    TypeName: tags$1.typeName,
+                    TypeDefinition: tags$1.definition(tags$1.typeName),
+                    "type enum interface implements namespace module declare": tags$1.definitionKeyword,
+                    "abstract global privacy readonly": tags$1.modifier,
+                    "is keyof unique infer": tags$1.operatorKeyword,
+                    JSXAttributeValue: tags$1.string,
+                    JSXText: tags$1.content,
+                    "JSXStartTag JSXStartCloseTag JSXSelfCloseEndTag JSXEndTag": tags$1.angleBracket,
+                    "JSXIdentifier JSXNameSpacedName": tags$1.tagName,
+                    "JSXAttribute/JSXIdentifier JSXAttribute/JSXNameSpacedName": tags$1.propertyName
                 })
             ]
         }),
         languageData: {
             closeBrackets: { brackets: ["(", "[", "{", "'", '"', "`"] },
             commentTokens: { line: "//", block: { open: "/*", close: "*/" } },
-            indentOnInput: /^\s*(?:case |default:|\{|\})$/,
+            indentOnInput: /^\s*(?:case |default:|\{|\}|<\/)$/,
             wordChars: "$"
         }
     });
     /// A language provider for TypeScript.
-    const typescriptLanguage = javascriptLanguage.configure({ dialect: "ts" });
+    javascriptLanguage.configure({ dialect: "ts" });
     /// Language provider for JSX.
-    const jsxLanguage = javascriptLanguage.configure({ dialect: "jsx" });
+    javascriptLanguage.configure({ dialect: "jsx" });
     /// Language provider for JSX + TypeScript.
-    const tsxLanguage = javascriptLanguage.configure({ dialect: "jsx ts" });
+    javascriptLanguage.configure({ dialect: "jsx ts" });
 
     // This file was generated by lezer-generator. You probably shouldn't edit it.
-    const 
-      StartTag = 1,
+    const StartTag = 1,
       StartCloseTag = 2,
       MismatchedStartCloseTag = 3,
-      missingCloseTag = 33,
+      missingCloseTag = 34,
       IncompleteCloseTag = 4,
       SelfCloseEndTag = 5,
-      Element = 10,
+      commentContent = 35,
+      Element$1 = 10,
       OpenTag = 11,
-      SelfClosingTag = 20,
       RawText = 25,
       Dialect_noMatch = 0;
 
@@ -18471,72 +18898,95 @@ const cm = (function () {
       return ch == 9 || ch == 10 || ch == 13 || ch == 32
     }
 
-    const lessThan = 60, greaterThan = 62, slash$1 = 47, question = 63, bang = 33;
-
-    const tagStartExpr = /^<\s*([\.\-\:\w\xa1-\uffff]+)/;
-
-    let elementQuery = [Element], openAt = 0;
-
-    function parentElement(input, stack, pos, len) {
-      openAt = stack.startOf(elementQuery, pos);
-      if (openAt == null) return null
-      let match = tagStartExpr.exec(input.read(openAt, openAt + len + 10));
-      return match ? match[1].toLowerCase() : ""
+    let cachedName = null, cachedInput = null, cachedPos = 0;
+    function tagNameAfter(input, pos) {
+      if (cachedPos == pos && cachedInput == input) return cachedName
+      let next = input.get(pos);
+      while (isSpace(next)) next = input.get(++pos);
+      let start = pos;
+      while (nameChar(next)) next = input.get(++pos);
+      // Undefined to signal there's a <? or <!, null for just missing
+      cachedInput = input; cachedPos = pos;
+      return cachedName = pos > start ? input.read(start, pos).toLowerCase() : next == question || next == bang ? undefined : null
     }
 
+    const lessThan = 60, greaterThan = 62, slash = 47, question = 63, bang = 33;
+
+    function ElementContext(name, parent) {
+      this.name = name;
+      this.parent = parent;
+      this.hash = parent ? parent.hash : 0;
+      for (let i = 0; i < name.length; i++) this.hash += (this.hash << 4) + name.charCodeAt(i) + (name.charCodeAt(i) << 8);
+    }
+
+    const elementContext = new ContextTracker({
+      start: null,
+      shift(context, term, input, stack) {
+        return term == StartTag ? new ElementContext(tagNameAfter(input, stack.pos) || "", context) : context
+      },
+      reduce(context, term) {
+        return term == Element$1 && context ? context.parent : context
+      },
+      reuse(context, node, input, stack) {
+        let type = node.type.id;
+        return type == StartTag || type == OpenTag
+          ? new ElementContext(tagNameAfter(input, stack.pos - node.length + 1) || "", context) : context
+      },
+      // Always returns 0 to avoid interfering with reuse. May not be safe
+      // but I haven't found a counterexample yet.
+      hash() { return 0 }
+    });
+
     const tagStart = new ExternalTokenizer((input, token, stack) => {
-      let pos = token.start, first = input.get(pos);
-      // End of file, just close anything
-      if (first < 0) {
-        let contextStart = stack.startOf(elementQuery);
-        let match = contextStart == null ? null : tagStartExpr.exec(input.read(contextStart, contextStart + 30));
-        if (match && implicitlyClosed[match[1].toLowerCase()]) token.accept(missingCloseTag, token.start);
-      }
+      let pos = token.start, first = input.get(pos), close;
+      // End of file, close any open tags
+      if (first < 0 && stack.context) token.accept(missingCloseTag, token.start);
       if (first != lessThan) return
       pos++;
-      let close = false, tokEnd = pos;
-      for (let next; next = input.get(pos);) {
-        if (next == slash$1 && !close) { close = true; pos++; tokEnd = pos; }
-        else if (next == question || next == bang) return
-        else if (isSpace(next)) pos++;
-        else break
-      }
-      let nameStart = pos;
-      while (nameChar(input.get(pos))) pos++;
-      if (pos == nameStart) return token.accept(close ? IncompleteCloseTag : StartTag, tokEnd)
+      if (close = (input.get(pos) == slash)) pos++;
+      let name = tagNameAfter(input, pos);
+      if (name === undefined) return
+      if (!name) return token.accept(close ? IncompleteCloseTag : StartTag, pos)
 
-      let name = input.read(nameStart, pos).toLowerCase();
-      let parent = parentElement(input, stack, stack.pos, name.length);
+      let parent = stack.context ? stack.context.name : null;
       if (close) {
-        if (name == parent) return token.accept(StartCloseTag, tokEnd)
-        if (implicitlyClosed[parent]) return token.accept(missingCloseTag, token.start)
-        if (stack.dialectEnabled(Dialect_noMatch)) return token.accept(StartCloseTag, tokEnd)
-        while (parent != null) {
-          parent = parentElement(input, stack, openAt - 1, name.length);
-          if (parent == name) return
-        }
-        token.accept(MismatchedStartCloseTag, tokEnd);
+        if (name == parent) return token.accept(StartCloseTag, pos)
+        if (parent && implicitlyClosed[parent]) return token.accept(missingCloseTag, token.start)
+        if (stack.dialectEnabled(Dialect_noMatch)) return token.accept(StartCloseTag, pos)
+        for (let cx = stack.context; cx; cx = cx.parent) if (cx.name == name) return
+        token.accept(MismatchedStartCloseTag, pos);
       } else {
-        if (parent && closeOnOpen[parent] && closeOnOpen[parent][name])
-          return token.accept(missingCloseTag, token.start)
-        token.accept(StartTag, tokEnd);
+        if (parent && closeOnOpen[parent] && closeOnOpen[parent][name]) token.accept(missingCloseTag, token.start);
+        else token.accept(StartTag, pos);
       }
-    }, {contextual: true});
-
-    const tagQuery = [OpenTag, SelfClosingTag];
+    });
 
     const selfClosed = new ExternalTokenizer((input, token, stack) => {
       let next = input.get(token.start), end = token.start + 1;
-      if (next == slash$1) {
+      if (next == slash) {
         if (input.get(end) != greaterThan) return
         end++;
       } else if (next != greaterThan) {
         return
       }
-      let from = stack.startOf(tagQuery);
-      let match = from == null ? null : tagStartExpr.exec(input.read(from, token.start));
-      if (match && selfClosers[match[1].toLowerCase()]) token.accept(SelfCloseEndTag, end);
-    }, {contextual: true});
+      if (stack.context && selfClosers[stack.context.name]) token.accept(SelfCloseEndTag, end);
+    });
+
+    const commentContent$1 = new ExternalTokenizer((input, token) => {
+      let pos = token.start, endPos = 0;
+      for (;;) {
+        let next = input.get(pos);
+        if (next < 0) break
+        pos++;
+        if (next == "-->".charCodeAt(endPos)) {
+          endPos++;
+          if (endPos == 3) { pos -= 3; break }
+        } else {
+          endPos = 0;
+        }
+      }
+      if (pos > token.start) token.accept(commentContent, pos);
+    });
 
     const openTag = /^<\/?\s*([\.\-\:\w\xa1-\uffff]+)/;
 
@@ -18599,25 +19049,26 @@ const cm = (function () {
     }
 
     // This file was generated by lezer-generator. You probably shouldn't edit it.
-    const parser$1 = Parser.deserialize({
+    const parser$2 = Parser.deserialize({
       version: 13,
-      states: "*hOQOTOOOoOWO'#CgS!cOTO'#CfOOOP'#Cf'#CfO!mOWO'#CsOOOP'#DO'#DOOOOP'#Cv'#CvQQOTOOOOOQ'#Cw'#CwO!uOWO,59RO!}ObO,59ROOOP'#C{'#C{O#]OTO'#DUO#gOPO,59QO#oOWO,59_O#wOWO,59_OOOP-E6t-E6tOOOQ-E6u-E6uO$PObO1G.mO$PObO1G.mO$_ObO'#CiOOOQ'#Cx'#CxO$pObO1G.mOOOP1G.m1G.mOOOP1G.v1G.vOOOP-E6y-E6yO${OWO'#CoOOOP1G.l1G.lO%TOWO1G.yO%TOWO1G.yOOOP1G.y1G.yO%]ObO7+$XO%kObO7+$XOOOP7+$X7+$XOOOP7+$b7+$bO%vObO,59TO&XOpO,59TOOOQ-E6v-E6vO&gOWO,59ZO&oOWO,59ZO&wOWO7+$eOOOP7+$e7+$eO'PObO<<GsOOOP<<Gs<<GsOOOP<<G|<<G|O'[OpO1G.oO'[OpO1G.oO'jO!bO'#ClO'xO#tO'#ClO(WObO1G.oO(fOWO1G.uO(fOWO1G.uOOOP1G.u1G.uOOOP<<HP<<HPOOOPAN=_AN=_OOOPAN=hAN=hO(nOpO7+$ZO(|ObO7+$ZOOOO'#Cy'#CyO)[O!bO,59WOOOQ,59W,59WOOOO'#Cz'#CzO)jO#tO,59WO(|ObO7+$ZO)xOWO7+$aOOOP7+$a7+$aO*QObO<<GuO*QObO<<GuOOOO-E6w-E6wOOOQ1G.r1G.rOOOO-E6x-E6xOOOP<<G{<<G{O*`ObOAN=a",
-      stateData: "*s~OPPORSOSTOVTOWTOXTOeTOfTOhUO~O[YOsWO~OPPORSOSTOVTOWTOXTOeTOfTO~OQxPqxP~PwO[_OsWO~O[bOsWO~OThO^dObgOsWO~OQxXqxX~PwOQjOqkO~O[lOsWO~ObnOsWO~OTrO^dObqOsWO~O_tOsWOT]X^]Xb]X~OTrO^dObqO~O[wOsWO~ObyOsWO~OT|O^dOb{OsWO~OT|O^dOb{O~O_}OsWOT]a^]ab]a~Oa!ROsWOt!POv!QO~O[!SOsWO~Ob!UOsWO~Ob!VOsWO~OT!XO^dOb!WO~Oa!ZOsWOt!POv!QO~OW![OX![Ot!^Ou![O~OW!_OX!_Ov!^Ow!_O~OsWOT]i^]ib]i~Ob!cOsWO~Oa!dOsWOt!POv!QO~OsWOT]q^]qb]q~OW![OX![Ot!gOu![O~OW!_OX!_Ov!gOw!_O~Ob!iOsWO~OsWOT]y^]yb]y~OsWOT]!R^]!Rb]!R~Oefhf~",
-      goto: "%YyPPPPPPPPPPz!QP!WPP!aPP!k!nPPzPP!t!z$[$k$q$wPP$}PPPPP%VXTOQV[XQOQV[_eYbcfopzQ!RtS!Z}!OR!d!YRk]XROQV[QVOR`VQXPQ^SnaX^cmosvx!O!T!Y!a!b!e!jQcYQm_QobQsdQvjQxlQ!OtQ!TwQ!Y}Q!a!RQ!b!SQ!e!ZR!j!dQfYSpbcUufpzRzoQ!]!PR!f!]Q!`!QR!h!`Q[QRi[SUOVTZQ[R]Q",
+      states: "+^OQOXOOOoO`O'#CgS!cOXO'#CfOOOP'#Cf'#CfO!mOdO'#CqO!uO`O'#CsOOOP'#DQ'#DQOOOP'#Cv'#CvQQOXOOOOOQ'#Cw'#CwO!}O`O,59RO#VOrO,59ROOOP'#C{'#C{O#eOXO'#DWO#oOPO,59QOOOS'#C|'#C|O#wOdO,59]OOOP,59],59]O$PO`O,59_O$XO`O,59_OOOP-E6t-E6tOOOQ-E6u-E6uO$aOrO1G.mO$aOrO1G.mO$oOrO'#CiOOOQ'#Cx'#CxO%QOrO1G.mOOOP1G.m1G.mOOOP1G.v1G.vOOOP-E6y-E6yO%]O`O'#CoOOOP1G.l1G.lOOOS-E6z-E6zOOOP1G.w1G.wO%eO`O1G.yO%eO`O1G.yOOOP1G.y1G.yO%mOrO7+$XO%{OrO7+$XOOOP7+$X7+$XOOOP7+$b7+$bO&WOrO,59TO&iO!bO,59TOOOQ-E6v-E6vO&wO`O,59ZO'PO`O,59ZO'XO`O7+$eOOOP7+$e7+$eO'aOrO<<GsOOOP<<Gs<<GsOOOP<<G|<<G|O'lO!bO1G.oO'lO!bO1G.oO'zO#tO'#ClO(YO&jO'#ClO(hOrO1G.oO(vO`O1G.uO(vO`O1G.uOOOP1G.u1G.uOOOP<<HP<<HPOOOPAN=_AN=_OOOPAN=hAN=hO)OO!bO7+$ZO)^OrO7+$ZOOOO'#Cy'#CyO)lO#tO,59WOOOQ,59W,59WOOOO'#Cz'#CzO)zO&jO,59WO)^OrO7+$ZO*YO`O7+$aOOOP7+$a7+$aO*bOrO<<GuO*bOrO<<GuOOOO-E6w-E6wOOOQ1G.r1G.rOOOO-E6x-E6xOOOP<<G{<<G{O*pOrOAN=a",
+      stateData: "+T~OPPORTOSUOVUOWUOXUOfUOhVO{SO~O[ZOuXO~OPPORTOSUOVUOWUOXUOfUO{SO~OQzPrzP~PwOs_O|aO~O[cOuXO~O[fOuXO~OTlO^hObkOuXO~OQzXrzX~PwOQnOroO~Os_O|qO~O[rOuXO~ObtOuXO~OTxO^hObwOuXO~O_zOuXOT]X^]Xb]X~OTxO^hObwO~O[}OuXO~Ob!POuXO~OT!SO^hOb!ROuXO~OT!SO^hOb!RO~O_!TOuXOT]a^]ab]a~Oa!XOuXOv!VOx!WO~O[!YOuXO~Ob![OuXO~Ob!]OuXO~OT!_O^hOb!^O~Oa!aOuXOv!VOx!WO~OW!bOX!bOv!dOw!bO~OW!eOX!eOx!dOy!eO~OuXOT]i^]ib]i~Ob!iOuXO~Oa!jOuXOv!VOx!WO~OuXOT]q^]qb]q~OW!bOX!bOv!mOw!bO~OW!eOX!eOx!mOy!eO~Ob!oOuXO~OuXOT]y^]yb]y~OuXOT]!R^]!Rb]!R~O{fhf~",
+      goto: "%b{PPPPPPPPPP|!SP!YPP!cPP!m!p|P|PP!v!|$^$m$s$y%PPPP%VPPPPP%_XUOQW]XQOQW]_iZfgjuv!QQ!XzS!a!T!UR!j!`Ro^XROQW]QWORdWQYPQbTneYbgsuy|!O!U!Z!`!g!h!k!pQgZQscQufQyhQ|nQ!OrQ!UzQ!Z}Q!`!TQ!g!XQ!h!YQ!k!aR!p!jQjZSvfgU{jv!QR!QuQ!c!VR!l!cQ!f!WR!n!fQ]QRm]Q`SRp`SVOWT[Q]R^Q",
       nodeNames: "⚠ StartTag StartCloseTag StartCloseTag IncompleteCloseTag SelfCloseEndTag Document Text EntityReference CharacterReference Element OpenTag TagName Attribute AttributeName Is AttributeValue UnquotedAttributeValue EndTag CloseTag SelfClosingTag Comment ProcessingInst MismatchedCloseTag DoctypeDecl RawText",
-      maxTerm: 40,
+      maxTerm: 44,
+      context: elementContext,
       nodeProps: [
         [NodeProp.closedBy, -2,1,2,"EndTag SelfCloseEndTag",11,"CloseTag"],
         [NodeProp.openedBy, 5,"StartTag",18,"StartTag StartCloseTag",19,"OpenTag"]
       ],
       skippedNodes: [0,25],
-      repeatNodeCount: 6,
-      tokenData: "!(Q!aR!UOX$eXY)mYZ)mZ]$e]^)m^p$epq)mqr$ers*tsv$evw+^wx2qx!P$e!P!Q3^!Q![$e![!]4t!]!^$e!^!_:a!_!`!%r!`!a4S!a!c$e!c!}4t!}#R$e#R#S4t#S#T$e#T#o4t#o$f$e$f$g%{$g%W$e%W%o4t%o%p$e%p&a4t&a&b$e&b1p4t1p4U$e4U4d4t4d4e$e4e$IS4t$IS$I`$e$I`$Ib4t$Ib$Kh$e$Kh%#t4t%#t&/x$e&/x&Et4t&Et&FV$e&FV;'S4t;'S;:j!&d;:j?&r$e?&r?Ah4t?Ah?BY$e?BY?Mn4t?Mn~$e!Z$pcVPaWu`wpOX$eXZ%{Z]$e]^%{^p$epq%{qr$ers&ksv$evw({wx'lx!P$e!P!Q%{!Q!^$e!^!_(e!_!a%{!a$f$e$f$g%{$g~$e!R&UVVPu`wpOr%{rs&ksv%{wx'lx!^%{!^!_(e!_~%{q&rTVPwpOv&kwx'Rx!^&k!^!_'a!_~&kP'WRVPOv'Rw!^'R!_~'Rp'fQwpOv'ax~'aa'sUVPu`Or'lrs'Rsv'lw!^'l!^!_(V!_~'l`([Ru`Or(Vsv(Vw~(V!Q(lTu`wpOr(ers'asv(ewx(Vx~(eW)QXaWOX({Z]({^p({qr({sw({x!P({!Q!^({!a$f({$g~({!a)x^VPu`wps^OX%{XY)mYZ)mZ]%{]^)m^p%{pq)mqr%{rs&ksv%{wx'lx!^%{!^!_(e!_~%{!Z*}TthVPwpOv&kwx'Rx!^&k!^!_'a!_~&k!Z+cbaWOX,kXZ-xZ],k]^-x^p,kqr,krs-xst/Ttw,kwx-xx!P,k!P!Q-x!Q!],k!]!^({!^!a-x!a$f,k$f$g-x$g~,k!Z,pbaWOX,kXZ-xZ],k]^-x^p,kqr,krs-xst({tw,kwx-xx!P,k!P!Q-x!Q!],k!]!^.a!^!a-x!a$f,k$f$g-x$g~,k!R-{TOp-xqs-xt!]-x!]!^.[!^~-x!R.aOW!R!Z.hXW!RaWOX({Z]({^p({qr({sw({x!P({!Q!^({!a$f({$g~({!Z/YaaWOX0_XZ1iZ]0_]^1i^p0_qr0_rs1isw0_wx1ix!P0_!P!Q1i!Q!]0_!]!^({!^!a1i!a$f0_$f$g1i$g~0_!Z0daaWOX0_XZ1iZ]0_]^1i^p0_qr0_rs1isw0_wx1ix!P0_!P!Q1i!Q!]0_!]!^1}!^!a1i!a$f0_$f$g1i$g~0_!R1lSOp1iq!]1i!]!^1x!^~1i!R1}OX!R!Z2UXX!RaWOX({Z]({^p({qr({sw({x!P({!Q!^({!a$f({$g~({!Z2zUvxVPu`Or'lrs'Rsv'lw!^'l!^!_(V!_~'l!X3gXVPu`wpOr%{rs&ksv%{wx'lx!^%{!^!_(e!_!`%{!`!a4S!a~%{!X4_VbUVPu`wpOr%{rs&ksv%{wx'lx!^%{!^!_(e!_~%{!a5T!Y^S[QVPaWu`wpOX$eXZ%{Z]$e]^%{^p$epq%{qr$ers&ksv$evw({wx'lx}$e}!O4t!O!P4t!P!Q%{!Q![4t![!]4t!]!^$e!^!_(e!_!a%{!a!c$e!c!}4t!}#R$e#R#S4t#S#T$e#T#o4t#o$f$e$f$g%{$g$}$e$}%O4t%O%W$e%W%o4t%o%p$e%p&a4t&a&b$e&b1p4t1p4U4t4U4d4t4d4e$e4e$IS4t$IS$I`$e$I`$Ib4t$Ib$Je$e$Je$Jg4t$Jg$Kh$e$Kh%#t4t%#t&/x$e&/x&Et4t&Et&FV$e&FV;'S4t;'S;:j8s;:j?&r$e?&r?Ah4t?Ah?BY$e?BY?Mn4t?Mn~$e!a9OeVPaWu`wpOX$eXZ%{Z]$e]^%{^p$epq%{qr$ers&ksv$evw({wx'lx!P$e!P!Q%{!Q!^$e!^!_(e!_!a%{!a$f$e$f$g%{$g;=`$e;=`<%l4t<%l~$e!R:hWu`wpOq(eqr;Qrs'asv(ewx(Vx!a(e!a!bNl!b~(e!R;XZu`wpOr(ers'asv(ewx(Vx}(e}!O;z!O!f(e!f!gDT!g#W(e#W#XJ|#X~(e!R<RVu`wpOr(ers'asv(ewx(Vx}(e}!O<h!O~(e!R<oWu`wpOr<hrs=Xsv<hvw=mwx?{x}<h}!OBT!O~<hq=^TwpOv=Xvx=mx}=X}!O>n!O~=XP=pRO}=m}!O=y!O~=mP=|RO}=m}!O>V!O~=mP>YTO}=m}!O>V!O!`=m!`!a>i!a~=mP>nOePq>sTwpOv=Xvx=mx}=X}!O?S!O~=Xq?XVwpOv=Xvx=mx}=X}!O?S!O!`=X!`!a?n!a~=Xq?uQwpePOv'ax~'aa@QVu`Or?{rs=msv?{vw=mw}?{}!O@g!O~?{a@lVu`Or?{rs=msv?{vw=mw}?{}!OAR!O~?{aAWXu`Or?{rs=msv?{vw=mw}?{}!OAR!O!`?{!`!aAs!a~?{aAzRu`ePOr(Vsv(Vw~(V!RB[Wu`wpOr<hrs=Xsv<hvw=mwx?{x}<h}!OBt!O~<h!RB{Yu`wpOr<hrs=Xsv<hvw=mwx?{x}<h}!OBt!O!`<h!`!aCk!a~<h!RCtTu`wpePOr(ers'asv(ewx(Vx~(e!RD[Vu`wpOr(ers'asv(ewx(Vx!q(e!q!rDq!r~(e!RDxVu`wpOr(ers'asv(ewx(Vx!e(e!e!fE_!f~(e!REfVu`wpOr(ers'asv(ewx(Vx!v(e!v!wE{!w~(e!RFSVu`wpOr(ers'asv(ewx(Vx!{(e!{!|Fi!|~(e!RFpVu`wpOr(ers'asv(ewx(Vx!r(e!r!sGV!s~(e!RG^Vu`wpOr(ers'asv(ewx(Vx!g(e!g!hGs!h~(e!RGzWu`wpOrGsrsHdsvGsvwHxwxIhx!`Gs!`!aJd!a~GsqHiTwpOvHdvxHxx!`Hd!`!aIZ!a~HdPH{RO!`Hx!`!aIU!a~HxPIZOhPqIbQwphPOv'ax~'aaImVu`OrIhrsHxsvIhvwHxw!`Ih!`!aJS!a~IhaJZRu`hPOr(Vsv(Vw~(V!RJmTu`wphPOr(ers'asv(ewx(Vx~(e!RKTVu`wpOr(ers'asv(ewx(Vx#c(e#c#dKj#d~(e!RKqVu`wpOr(ers'asv(ewx(Vx#V(e#V#WLW#W~(e!RL_Vu`wpOr(ers'asv(ewx(Vx#h(e#h#iLt#i~(e!RL{Vu`wpOr(ers'asv(ewx(Vx#m(e#m#nMb#n~(e!RMiVu`wpOr(ers'asv(ewx(Vx#d(e#d#eNO#e~(e!RNVVu`wpOr(ers'asv(ewx(Vx#X(e#X#YGs#Y~(e!RNsWu`wpOrNlrs! ]svNlvw! qwx!#Rx!aNl!a!b!$i!b~Nlq! bTwpOv! ]vx! qx!a! ]!a!b!!`!b~! ]P! tRO!a! q!a!b! }!b~! qP!!QRO!`! q!`!a!!Z!a~! qP!!`OfPq!!eTwpOv! ]vx! qx!`! ]!`!a!!t!a~! ]q!!{QwpfPOv'ax~'aa!#WVu`Or!#Rrs! qsv!#Rvw! qw!a!#R!a!b!#m!b~!#Ra!#rVu`Or!#Rrs! qsv!#Rvw! qw!`!#R!`!a!$X!a~!#Ra!$`Ru`fPOr(Vsv(Vw~(V!R!$pWu`wpOrNlrs! ]svNlvw! qwx!#Rx!`Nl!`!a!%Y!a~Nl!R!%cTu`wpfPOr(ers'asv(ewx(Vx~(e!V!%}V_SVPu`wpOr%{rs&ksv%{wx'lx!^%{!^!_(e!_~%{!a!&oeVPaWu`wpOX$eXZ%{Z]$e]^%{^p$epq%{qr$ers&ksv$evw({wx'lx!P$e!P!Q%{!Q!^$e!^!_(e!_!a%{!a$f$e$f$g%{$g;=`$e;=`<%l4t<%l~$e",
-      tokenizers: [tagStart, selfClosed, 0, 1, 2, 3, 4, 5],
+      repeatNodeCount: 7,
+      tokenData: "!$|!aR!WOX$kXY)sYZ)sZ]$k]^)s^p$kpq)sqr$krs*zsv$kvw+dwx2wx}$k}!O3d!O!P$k!P!Q7]!Q![$k![!]8s!]!^$k!^!_>`!_!`!!n!`!a8R!a!c$k!c!}8s!}#R$k#R#S8s#S#T$k#T#o8s#o$f$k$f$g&R$g%W$k%W%o8s%o%p$k%p&a8s&a&b$k&b1p8s1p4U$k4U4d8s4d4e$k4e$IS8s$IS$I`$k$I`$Ib8s$Ib$Kh$k$Kh%#t8s%#t&/x$k&/x&Et8s&Et&FV$k&FV;'S8s;'S;:j!#`;:j?&r$k?&r?Ah8s?Ah?BY$k?BY?Mn8s?Mn~$k!Z$vcVPaWw`ypOX$kXZ&RZ]$k]^&R^p$kpq&Rqr$krs&qsv$kvw)Rwx'rx!P$k!P!Q&R!Q!^$k!^!_(k!_!a&R!a$f$k$f$g&R$g~$k!R&[VVPw`ypOr&Rrs&qsv&Rwx'rx!^&R!^!_(k!_~&Rq&xTVPypOv&qwx'Xx!^&q!^!_'g!_~&qP'^RVPOv'Xw!^'X!_~'Xp'lQypOv'gx~'ga'yUVPw`Or'rrs'Xsv'rw!^'r!^!_(]!_~'r`(bRw`Or(]sv(]w~(]!Q(rTw`ypOr(krs'gsv(kwx(]x~(kW)WXaWOX)RZ])R^p)Rqr)Rsw)Rx!P)R!Q!^)R!a$f)R$g~)R!a*O^VPw`ypu^OX&RXY)sYZ)sZ]&R]^)s^p&Rpq)sqr&Rrs&qsv&Rwx'rx!^&R!^!_(k!_~&R!Z+TTvhVPypOv&qwx'Xx!^&q!^!_'g!_~&q!Z+ibaWOX,qXZ.OZ],q]^.O^p,qqr,qrs.Ost/Ztw,qwx.Ox!P,q!P!Q.O!Q!],q!]!^)R!^!a.O!a$f,q$f$g.O$g~,q!Z,vbaWOX,qXZ.OZ],q]^.O^p,qqr,qrs.Ost)Rtw,qwx.Ox!P,q!P!Q.O!Q!],q!]!^.g!^!a.O!a$f,q$f$g.O$g~,q!R.RTOp.Oqs.Ot!].O!]!^.b!^~.O!R.gOW!R!Z.nXW!RaWOX)RZ])R^p)Rqr)Rsw)Rx!P)R!Q!^)R!a$f)R$g~)R!Z/`aaWOX0eXZ1oZ]0e]^1o^p0eqr0ers1osw0ewx1ox!P0e!P!Q1o!Q!]0e!]!^)R!^!a1o!a$f0e$f$g1o$g~0e!Z0jaaWOX0eXZ1oZ]0e]^1o^p0eqr0ers1osw0ewx1ox!P0e!P!Q1o!Q!]0e!]!^2T!^!a1o!a$f0e$f$g1o$g~0e!R1rSOp1oq!]1o!]!^2O!^~1o!R2TOX!R!Z2[XX!RaWOX)RZ])R^p)Rqr)Rsw)Rx!P)R!Q!^)R!a$f)R$g~)R!Z3QUxxVPw`Or'rrs'Xsv'rw!^'r!^!_(]!_~'r!]3oeVPaWw`ypOX$kXZ&RZ]$k]^&R^p$kpq&Rqr$krs&qsv$kvw)Rwx'rx}$k}!O5Q!O!P$k!P!Q&R!Q!^$k!^!_(k!_!a&R!a$f$k$f$g&R$g~$k!]5]dVPaWw`ypOX$kXZ&RZ]$k]^&R^p$kpq&Rqr$krs&qsv$kvw)Rwx'rx!P$k!P!Q&R!Q!^$k!^!_(k!_!`&R!`!a6k!a$f$k$f$g&R$g~$k!T6vVVPw`yp|QOr&Rrs&qsv&Rwx'rx!^&R!^!_(k!_~&R!X7fXVPw`ypOr&Rrs&qsv&Rwx'rx!^&R!^!_(k!_!`&R!`!a8R!a~&R!X8^VbUVPw`ypOr&Rrs&qsv&Rwx'rx!^&R!^!_(k!_~&R!a9S!Y^S[QVPaWw`ypOX$kXZ&RZ]$k]^&R^p$kpq&Rqr$krs&qsv$kvw)Rwx'rx}$k}!O8s!O!P8s!P!Q&R!Q![8s![!]8s!]!^$k!^!_(k!_!a&R!a!c$k!c!}8s!}#R$k#R#S8s#S#T$k#T#o8s#o$f$k$f$g&R$g$}$k$}%O8s%O%W$k%W%o8s%o%p$k%p&a8s&a&b$k&b1p8s1p4U8s4U4d8s4d4e$k4e$IS8s$IS$I`$k$I`$Ib8s$Ib$Je$k$Je$Jg8s$Jg$Kh$k$Kh%#t8s%#t&/x$k&/x&Et8s&Et&FV$k&FV;'S8s;'S;:j<r;:j?&r$k?&r?Ah8s?Ah?BY$k?BY?Mn8s?Mn~$k!a<}eVPaWw`ypOX$kXZ&RZ]$k]^&R^p$kpq&Rqr$krs&qsv$kvw)Rwx'rx!P$k!P!Q&R!Q!^$k!^!_(k!_!a&R!a$f$k$f$g&R$g;=`$k;=`<%l8s<%l~$k!R>gWw`ypOq(kqr?Prs'gsv(kwx(]x!a(k!a!bKh!b~(k!R?WZw`ypOr(krs'gsv(kwx(]x}(k}!O?y!O!f(k!f!gAP!g#W(k#W#XGx#X~(k!R@QVw`ypOr(krs'gsv(kwx(]x}(k}!O@g!O~(k!R@pTw`yp{POr(krs'gsv(kwx(]x~(k!RAWVw`ypOr(krs'gsv(kwx(]x!q(k!q!rAm!r~(k!RAtVw`ypOr(krs'gsv(kwx(]x!e(k!e!fBZ!f~(k!RBbVw`ypOr(krs'gsv(kwx(]x!v(k!v!wBw!w~(k!RCOVw`ypOr(krs'gsv(kwx(]x!{(k!{!|Ce!|~(k!RClVw`ypOr(krs'gsv(kwx(]x!r(k!r!sDR!s~(k!RDYVw`ypOr(krs'gsv(kwx(]x!g(k!g!hDo!h~(k!RDvWw`ypOrDorsE`svDovwEtwxFdx!`Do!`!aG`!a~DoqEeTypOvE`vxEtx!`E`!`!aFV!a~E`PEwRO!`Et!`!aFQ!a~EtPFVOhPqF^QyphPOv'gx~'gaFiVw`OrFdrsEtsvFdvwEtw!`Fd!`!aGO!a~FdaGVRw`hPOr(]sv(]w~(]!RGiTw`yphPOr(krs'gsv(kwx(]x~(k!RHPVw`ypOr(krs'gsv(kwx(]x#c(k#c#dHf#d~(k!RHmVw`ypOr(krs'gsv(kwx(]x#V(k#V#WIS#W~(k!RIZVw`ypOr(krs'gsv(kwx(]x#h(k#h#iIp#i~(k!RIwVw`ypOr(krs'gsv(kwx(]x#m(k#m#nJ^#n~(k!RJeVw`ypOr(krs'gsv(kwx(]x#d(k#d#eJz#e~(k!RKRVw`ypOr(krs'gsv(kwx(]x#X(k#X#YDo#Y~(k!RKoWw`ypOrKhrsLXsvKhvwLmwxM}x!aKh!a!b! e!b~KhqL^TypOvLXvxLmx!aLX!a!bM[!b~LXPLpRO!aLm!a!bLy!b~LmPL|RO!`Lm!`!aMV!a~LmPM[OfPqMaTypOvLXvxLmx!`LX!`!aMp!a~LXqMwQypfPOv'gx~'gaNSVw`OrM}rsLmsvM}vwLmw!aM}!a!bNi!b~M}aNnVw`OrM}rsLmsvM}vwLmw!`M}!`!a! T!a~M}a! [Rw`fPOr(]sv(]w~(]!R! lWw`ypOrKhrsLXsvKhvwLmwxM}x!`Kh!`!a!!U!a~Kh!R!!_Tw`ypfPOr(krs'gsv(kwx(]x~(k!V!!yV_SVPw`ypOr&Rrs&qsv&Rwx'rx!^&R!^!_(k!_~&R!a!#keVPaWw`ypOX$kXZ&RZ]$k]^&R^p$kpq&Rqr$krs&qsv$kvw)Rwx'rx!P$k!P!Q&R!Q!^$k!^!_(k!_!a&R!a$f$k$f$g&R$g;=`$k;=`<%l8s<%l~$k",
+      tokenizers: [tagStart, selfClosed, commentContent$1, 0, 1, 2, 3, 4, 5],
       topRules: {"Document":[0,6]},
-      nested: [["elementContent", elementContent,"&k~RP!^!_U~XP!P!Q[~_dXY!mYZ!m]^!mpq!m![!]$O!c!}$O#R#S$O#T#o$O%W%o$O%p&a$O&b1p$O4U4d$O4e$IS$O$I`$Ib$O$Kh%#t$O&/x&Et$O&FV;'S$O;'S;:j&e?&r?Ah$O?BY?Mn$O~!pdXY!mYZ!m]^!mpq!m![!]$O!c!}$O#R#S$O#T#o$O%W%o$O%p&a$O&b1p$O4U4d$O4e$IS$O$I`$Ib$O$Kh%#t$O&/x&Et$O&FV;'S$O;'S;:j&e?&r?Ah$O?BY?Mn$O~$RkXY%vYZ%v]^%vpq%v}!O$O!O!P$O!Q![$O![!]$O!`!a&Y!c!}$O#R#S$O#T#o$O$}%O$O%W%o$O%p&a$O&b1p$O1p4U$O4U4d$O4e$IS$O$I`$Ib$O$Je$Jg$O$Kh%#t$O&/x&Et$O&FV;'S$O;'S;:j&_?&r?Ah$O?BY?Mn$O~%yTXY%vYZ%v]^%vpq%v!`!a&Y~&_Op~~&bP;=`<%l$O~&hP;=`<%l$O", 40]],
+      nested: [["elementContent", elementContent,"&k~RP!^!_U~XP!P!Q[~_dXY!mYZ!m]^!mpq!m![!]$O!c!}$O#R#S$O#T#o$O%W%o$O%p&a$O&b1p$O4U4d$O4e$IS$O$I`$Ib$O$Kh%#t$O&/x&Et$O&FV;'S$O;'S;:j&e?&r?Ah$O?BY?Mn$O~!pdXY!mYZ!m]^!mpq!m![!]$O!c!}$O#R#S$O#T#o$O%W%o$O%p&a$O&b1p$O4U4d$O4e$IS$O$I`$Ib$O$Kh%#t$O&/x&Et$O&FV;'S$O;'S;:j&e?&r?Ah$O?BY?Mn$O~$RkXY%vYZ%v]^%vpq%v}!O$O!O!P$O!Q![$O![!]$O!`!a&Y!c!}$O#R#S$O#T#o$O$}%O$O%W%o$O%p&a$O&b1p$O1p4U$O4U4d$O4e$IS$O$I`$Ib$O$Je$Jg$O$Kh%#t$O&/x&Et$O&FV;'S$O;'S;:j&_?&r?Ah$O?BY?Mn$O~%yTXY%vYZ%v]^%vpq%v!`!a&Y~&_Oq~~&bP;=`<%l$O~&hP;=`<%l$O", 42]],
       dialects: {noMatch: 0},
-      tokenPrec: 444
+      tokenPrec: 460
     });
 
     // This file was generated by lezer-generator. You probably shouldn't edit it.
@@ -18625,7 +19076,7 @@ const cm = (function () {
       descendantOp = 92,
       Unit = 1,
       callee = 93,
-      identifier = 94;
+      identifier$1 = 94;
 
     /* Hand-written tokenizers for CSS tokens that can't be
        expressed by Lezer's built-in tokenizer. */
@@ -18649,7 +19100,7 @@ const cm = (function () {
           continue
         }
         if (inside)
-          token.accept(next == parenL ? callee : identifier, pos);
+          token.accept(next == parenL ? callee : identifier$1, pos);
         break
       }
     });
@@ -18679,8 +19130,8 @@ const cm = (function () {
     // This file was generated by lezer-generator. You probably shouldn't edit it.
     const spec_callee = {__proto__:null,not:30, url:64, "url-prefix":64, domain:64, regexp:64, selector:132};
     const spec_AtKeyword = {__proto__:null,"@import":112, "@media":136, "@charset":140, "@namespace":144, "@keyframes":150, "@supports":162};
-    const spec_identifier$1 = {__proto__:null,not:126, only:126, from:156, to:158};
-    const parser$2 = Parser.deserialize({
+    const spec_identifier = {__proto__:null,not:126, only:126, from:156, to:158};
+    const parser$1 = Parser.deserialize({
       version: 13,
       states: "7WOYQ[OOOOQP'#Cc'#CcOOQP'#Cb'#CbO!ZQ[O'#CeO!}QXO'#C`O#UQ[O'#CgO#aQ[O'#DOO#fQ[O'#DSOOQP'#Eb'#EbO#kQdO'#DdO$SQ[O'#DqO#kQdO'#DsO$eQ[O'#DuO$pQ[O'#DxO$uQ[O'#EOO%TQ[O'#EQOOQS'#Ea'#EaOOQS'#ER'#ERQYQ[OOOOQP'#Cf'#CfOOQP,59P,59PO!ZQ[O,59PO%[Q[O'#ESO%vQWO,58zO&OQ[O,59RO#aQ[O,59jO#fQ[O,59nO%[Q[O,59rO%[Q[O,59tO%[Q[O,59uO'[Q[O'#D_OOQS,58z,58zOOQP'#Cj'#CjOOQO'#Cp'#CpOOQP,59R,59RO'cQWO,59RO'hQWO,59ROOQP'#DQ'#DQOOQP,59j,59jOOQO'#DU'#DUO'mQ`O,59nOOQS'#Cr'#CrO#kQdO'#CsO'uQvO'#CuO(|QtO,5:OOOQO'#Cz'#CzO'hQWO'#CyO)bQWO'#C{OOQS'#Ef'#EfOOQO'#Dg'#DgO)gQ[O'#DnO)uQWO'#EhO$uQ[O'#DlO*TQWO'#DoOOQO'#Ei'#EiO%yQWO,5:]O*YQpO,5:_OOQS'#Dw'#DwO*bQWO,5:aO*gQ[O,5:aOOQO'#Dz'#DzO*oQWO,5:dO*tQWO,5:jO*|QWO,5:lOOQS-E8P-E8POOQP1G.k1G.kO+pQXO,5:nOOQO-E8Q-E8QOOQS1G.f1G.fOOQP1G.m1G.mO'cQWO1G.mO'hQWO1G.mOOQP1G/U1G/UO+}Q`O1G/YO,hQXO1G/^O-OQXO1G/`O-fQXO1G/aO-|QXO'#CcO.qQWO'#D`OOQS,59y,59yO.vQWO,59yO/OQ[O,59yO/VQ[O'#CnO/^QdO'#CqOOQP1G/Y1G/YO#kQdO1G/YO/eQpO,59_OOQS,59a,59aO#kQdO,59cO/mQWO1G/jOOQS,59e,59eO/rQ!bO,59gO/zQWO'#DgO0VQWO,5:SO0[QWO,5:YO$uQ[O,5:UO$uQ[O'#EXO0dQWO,5;SO0oQWO,5:WO%[Q[O,5:ZOOQS1G/w1G/wOOQS1G/y1G/yOOQS1G/{1G/{O1QQWO1G/{O1VQdO'#D{OOQS1G0O1G0OOOQS1G0U1G0UOOQS1G0W1G0WOOQP7+$X7+$XOOQP7+$t7+$tO#kQdO7+$tO#kQdO,59zO1eQ[O'#EWO1oQWO1G/eOOQS1G/e1G/eO1oQWO1G/eO1wQXO'#EdO2OQWO,59YO2TQtO'#ETO2uQdO'#EeO3PQWO,59]O3UQpO7+$tOOQS1G.y1G.yOOQS1G.}1G.}OOQS7+%U7+%UO3^QWO1G/RO#kQdO1G/nOOQO1G/t1G/tOOQO1G/p1G/pO3cQWO,5:sOOQO-E8V-E8VO3qQXO1G/uOOQS7+%g7+%gO3xQYO'#CuO%yQWO'#EYO4QQdO,5:gOOQS,5:g,5:gO4`QpO<<H`O4hQtO1G/fOOQO,5:r,5:rO4{Q[O,5:rOOQO-E8U-E8UOOQS7+%P7+%PO5VQWO7+%PO5_QWO,5;OOOQP1G.t1G.tOOQS-E8R-E8RO#kQdO'#EUO5gQWO,5;POOQT1G.w1G.wOOQP<<H`<<H`OOQS7+$m7+$mO5oQdO7+%YOOQO7+%a7+%aOOQS,5:t,5:tOOQS-E8W-E8WOOQS1G0R1G0ROOQPAN=zAN=zO5vQtO'#EVO#kQdO'#EVO6nQdO7+%QOOQO7+%Q7+%QOOQO1G0^1G0^OOQS<<Hk<<HkO7OQdO,5:pOOQO-E8S-E8SOOQO<<Ht<<HtO7YQtO,5:qOOQS-E8T-E8TOOQO<<Hl<<Hl",
       stateData: "8W~O#SOSQOS~OTWOWWO[TO]TOsUOwVO!X_O!YXO!fYO!hZO!j[O!m]O!s^O#QPO#VRO~O#QcO~O[hO]hOcfOsiOwjO{kO!OmO#OlO#VeO~O!QnO~P!`O_sO#PqO#QpO~O#QuO~O#QwO~OazOh!QOj!QOp!PO#P}O#QyO#Z{O~Oa!SO!a!UO!d!VO#Q!RO!Q#[P~Oj![Op!PO#Q!ZO~O#Q!^O~Oa!SO!a!UO!d!VO#Q!RO~O!V#[P~P$SOTWOWWO[TO]TOsUOwVO#QPO#VRO~OcfO!QnO~O_!hO#PqO#QpO~OTWOWWO[TO]TOsUOwVO!X_O!YXO!fYO!hZO!j[O!m]O!s^O#Q!oO#VRO~O!P!qO~P&ZOa!tO~Oa!uO~Ou!vOy!wO~OP!yOaiXliX!ViX!aiX!diX#QiX`iXciXhiXjiXpiX#PiX#ZiXuiX!PiX!UiX~Oa!SOl!zO!a!UO!d!VO#Q!RO!V#[P~Oa!}O~Oa!SO!a!UO!d!VO#Q#OO~Oc#SO!_#RO!Q#[X!V#[X~Oa#VO~Ol!zO!V#XO~O!V#YO~Oj#ZOp!PO~O!Q#[O~O!QnO!_#RO~O!QnO!V#_O~O[hO]hOsiOwjO{kO!OmO#OlO#VeO~Oc!va!Q!va`!va~P+UOu#aOy#bO~O[hO]hOsiOwjO#VeO~Oczi{zi!Ozi!Qzi#Ozi`zi~P,VOc|i{|i!O|i!Q|i#O|i`|i~P,VOc}i{}i!O}i!Q}i#O}i`}i~P,VO[VX[!TX]VXcVXsVXwVX{VX!OVX!QVX#OVX#VVX~O[#cO~O!P#fO!V#dO~O!P#fO~P&ZO`#WP~P%[O`#XP~P#kO`#nOl!zO~O!V#pO~Oj#qOq#qO~O[!]X`!ZX!_!ZX~O[#rO~O`#sO!_#RO~Oc#SO!Q#[a!V#[a~O!_#ROc!`a!Q!`a!V!`a`!`a~O!V#xO~O!P#|O!p#zO!q#zO#Z#yO~O!P!zX!V!zX~P&ZO!P$SO!V#dO~O`#WX~P!`O`$VO~Ol!zO`!wXa!wXc!wXh!wXj!wXp!wX#P!wX#Q!wX#Z!wX~Oc$XO`#XX~P#kO`$ZO~Ol!zOu$[O~O`$]O~O!_#ROc!{a!Q!{a!V!{a~O`$_O~P+UOP!yO!QiX~O!P$bO!p#zO!q#zO#Z#yO~Ol!zOu$cO~Oc$eOl!zO!U$gO!P!Si!V!Si~P#kO!P!za!V!za~P&ZO!P$iO!V#dO~OcfO`#Wa~Oc$XO`#Xa~O`$lO~P#kOl!zOa!yXc!yXh!yXj!yXp!yX!P!yX!U!yX!V!yX#P!yX#Q!yX#Z!yX~Oc$eO!U$oO!P!Sq!V!Sq~P#kO`!xac!xa~P#kOl!zOa!yac!yah!yaj!yap!ya!P!ya!U!ya!V!ya#P!ya#Q!ya#Z!ya~Oq#Zl!Ol~",
@@ -18696,7 +19147,7 @@ const cm = (function () {
       tokenData: "Bj~R![OX$wX^%]^p$wpq%]qr(crs+}st,otu2Uuv$wvw2rwx2}xy3jyz3uz{3z{|4_|}8u}!O9Q!O!P9i!P!Q9z!Q![<U![!]<y!]!^=i!^!_$w!_!`=t!`!a>P!a!b$w!b!c>o!c!}$w!}#O?{#O#P$w#P#Q@W#Q#R2U#R#T$w#T#U@c#U#c$w#c#dAb#d#o$w#o#pAq#p#q2U#q#rA|#r#sBX#s#y$w#y#z%]#z$f$w$f$g%]$g#BY$w#BY#BZ%]#BZ$IS$w$IS$I_%]$I_$I|$w$I|$JO%]$JO$JT$w$JT$JU%]$JU$KV$w$KV$KW%]$KW&FU$w&FU&FV%]&FV~$wW$zQOy%Qz~%QW%VQqWOy%Qz~%Q~%bf#S~OX%QX^&v^p%Qpq&vqy%Qz#y%Q#y#z&v#z$f%Q$f$g&v$g#BY%Q#BY#BZ&v#BZ$IS%Q$IS$I_&v$I_$I|%Q$I|$JO&v$JO$JT%Q$JT$JU&v$JU$KV%Q$KV$KW&v$KW&FU%Q&FU&FV&v&FV~%Q~&}f#S~qWOX%QX^&v^p%Qpq&vqy%Qz#y%Q#y#z&v#z$f%Q$f$g&v$g#BY%Q#BY#BZ&v#BZ$IS%Q$IS$I_&v$I_$I|%Q$I|$JO&v$JO$JT%Q$JT$JU&v$JU$KV%Q$KV$KW&v$KW&FU%Q&FU&FV&v&FV~%Q^(fSOy%Qz#]%Q#]#^(r#^~%Q^(wSqWOy%Qz#a%Q#a#b)T#b~%Q^)YSqWOy%Qz#d%Q#d#e)f#e~%Q^)kSqWOy%Qz#c%Q#c#d)w#d~%Q^)|SqWOy%Qz#f%Q#f#g*Y#g~%Q^*_SqWOy%Qz#h%Q#h#i*k#i~%Q^*pSqWOy%Qz#T%Q#T#U*|#U~%Q^+RSqWOy%Qz#b%Q#b#c+_#c~%Q^+dSqWOy%Qz#h%Q#h#i+p#i~%Q^+wQ!UUqWOy%Qz~%Q~,QUOY+}Zr+}rs,ds#O+}#O#P,i#P~+}~,iOj~~,lPO~+}_,tWsPOy%Qz!Q%Q!Q![-^![!c%Q!c!i-^!i#T%Q#T#Z-^#Z~%Q^-cWqWOy%Qz!Q%Q!Q![-{![!c%Q!c!i-{!i#T%Q#T#Z-{#Z~%Q^.QWqWOy%Qz!Q%Q!Q![.j![!c%Q!c!i.j!i#T%Q#T#Z.j#Z~%Q^.qWhUqWOy%Qz!Q%Q!Q![/Z![!c%Q!c!i/Z!i#T%Q#T#Z/Z#Z~%Q^/bWhUqWOy%Qz!Q%Q!Q![/z![!c%Q!c!i/z!i#T%Q#T#Z/z#Z~%Q^0PWqWOy%Qz!Q%Q!Q![0i![!c%Q!c!i0i!i#T%Q#T#Z0i#Z~%Q^0pWhUqWOy%Qz!Q%Q!Q![1Y![!c%Q!c!i1Y!i#T%Q#T#Z1Y#Z~%Q^1_WqWOy%Qz!Q%Q!Q![1w![!c%Q!c!i1w!i#T%Q#T#Z1w#Z~%Q^2OQhUqWOy%Qz~%QY2XSOy%Qz!_%Q!_!`2e!`~%QY2lQyQqWOy%Qz~%QX2wQWPOy%Qz~%Q~3QUOY2}Zw2}wx,dx#O2}#O#P3d#P~2}~3gPO~2}_3oQaVOy%Qz~%Q~3zO`~_4RSTPlSOy%Qz!_%Q!_!`2e!`~%Q_4fUlS!OPOy%Qz!O%Q!O!P4x!P!Q%Q!Q![7_![~%Q^4}SqWOy%Qz!Q%Q!Q![5Z![~%Q^5bWqW#ZUOy%Qz!Q%Q!Q![5Z![!g%Q!g!h5z!h#X%Q#X#Y5z#Y~%Q^6PWqWOy%Qz{%Q{|6i|}%Q}!O6i!O!Q%Q!Q![6z![~%Q^6nSqWOy%Qz!Q%Q!Q![6z![~%Q^7RSqW#ZUOy%Qz!Q%Q!Q![6z![~%Q^7fYqW#ZUOy%Qz!O%Q!O!P8U!P!Q%Q!Q![7_![!g%Q!g!h5z!h#X%Q#X#Y5z#Y~%Q^8]WqW#ZUOy%Qz!Q%Q!Q![8U![!g%Q!g!h5z!h#X%Q#X#Y5z#Y~%Q_8zQcVOy%Qz~%Q^9VUlSOy%Qz!O%Q!O!P4x!P!Q%Q!Q![7_![~%Q_9nS#VPOy%Qz!Q%Q!Q![5Z![~%Q~:PRlSOy%Qz{:Y{~%Q~:_SqWOy:Yyz:kz{;`{~:Y~:nROz:kz{:w{~:k~:zTOz:kz{:w{!P:k!P!Q;Z!Q~:k~;`OQ~~;eUqWOy:Yyz:kz{;`{!P:Y!P!Q;w!Q~:Y~<OQQ~qWOy%Qz~%Q^<ZY#ZUOy%Qz!O%Q!O!P8U!P!Q%Q!Q![7_![!g%Q!g!h5z!h#X%Q#X#Y5z#Y~%QX=OS[POy%Qz![%Q![!]=[!]~%QX=cQ]PqWOy%Qz~%Q_=nQ!VVOy%Qz~%QY=yQyQOy%Qz~%QX>US{POy%Qz!`%Q!`!a>b!a~%QX>iQ{PqWOy%Qz~%QX>rUOy%Qz!c%Q!c!}?U!}#T%Q#T#o?U#o~%QX?]Y!XPqWOy%Qz}%Q}!O?U!O!Q%Q!Q![?U![!c%Q!c!}?U!}#T%Q#T#o?U#o~%QX@QQwPOy%Qz~%Q^@]QuUOy%Qz~%QX@fSOy%Qz#b%Q#b#c@r#c~%QX@wSqWOy%Qz#W%Q#W#XAT#X~%QXA[Q!_PqWOy%Qz~%QXAeSOy%Qz#f%Q#f#gAT#g~%QXAvQ!QPOy%Qz~%Q_BRQ!PVOy%Qz~%QZB^S!OPOy%Qz!_%Q!_!`2e!`~%Q",
       tokenizers: [descendant, unitToken, identifiers, 0, 1, 2, 3],
       topRules: {"StyleSheet":[0,3]},
-      specialized: [{term: 93, get: value => spec_callee[value] || -1},{term: 55, get: value => spec_AtKeyword[value] || -1},{term: 94, get: value => spec_identifier$1[value] || -1}],
+      specialized: [{term: 93, get: value => spec_callee[value] || -1},{term: 55, get: value => spec_AtKeyword[value] || -1},{term: 94, get: value => spec_identifier[value] || -1}],
       tokenPrec: 1060
     });
 
@@ -18806,7 +19257,7 @@ const cm = (function () {
         "teal", "thistle", "tomato", "turquoise", "violet", "wheat", "white",
         "whitesmoke", "yellow", "yellowgreen"
     ].map(name => ({ type: "constant", label: name })));
-    const tags$1 = [
+    const tags = [
         "a", "abbr", "address", "article", "aside", "b", "bdi", "bdo", "blockquote", "body",
         "br", "button", "canvas", "caption", "cite", "code", "col", "colgroup", "dd", "del",
         "details", "dfn", "dialog", "div", "dl", "dt", "em", "figcaption", "figure", "footer",
@@ -18828,7 +19279,7 @@ const cm = (function () {
             for (let { parent } = node; parent; parent = parent.parent)
                 if (parent.name == "Block")
                     return { from: node.from, options: properties(), span };
-            return { from: node.from, options: tags$1, span };
+            return { from: node.from, options: tags, span };
         }
         if (!context.explicit)
             return null;
@@ -18846,49 +19297,49 @@ const cm = (function () {
     /// parser](https://github.com/lezer-parser/css), extended with
     /// highlighting and indentation information.
     const cssLanguage = LezerLanguage.define({
-        parser: parser$2.configure({
+        parser: parser$1.configure({
             props: [
                 indentNodeProp.add({
                     Declaration: continuedIndent()
                 }),
                 foldNodeProp.add({
-                    Block(subtree) { return { from: subtree.from + 1, to: subtree.to - 1 }; }
+                    Block: foldInside$1
                 }),
                 styleTags({
-                    "import charset namespace keyframes": tags.definitionKeyword,
-                    "media supports": tags.controlKeyword,
-                    "from to": tags.keyword,
-                    NamespaceName: tags.namespace,
-                    KeyframeName: tags.labelName,
-                    TagName: tags.typeName,
-                    ClassName: tags.className,
-                    PseudoClassName: tags.constant(tags.className),
-                    not: tags.operatorKeyword,
-                    IdName: tags.labelName,
-                    "FeatureName PropertyName AttributeName": tags.propertyName,
-                    NumberLiteral: tags.number,
-                    KeywordQuery: tags.keyword,
-                    UnaryQueryOp: tags.operatorKeyword,
-                    callee: tags.keyword,
-                    "CallTag ValueName": tags.atom,
-                    Callee: tags.variableName,
-                    Unit: tags.unit,
-                    "UniversalSelector NestingSelector": tags.definitionOperator,
-                    AtKeyword: tags.keyword,
-                    MatchOp: tags.compareOperator,
-                    "ChildOp SiblingOp, LogicOp": tags.logicOperator,
-                    BinOp: tags.arithmeticOperator,
-                    Important: tags.modifier,
-                    Comment: tags.blockComment,
-                    ParenthesizedContent: tags.special(tags.name),
-                    ColorLiteral: tags.color,
-                    StringLiteral: tags.string,
-                    ":": tags.punctuation,
-                    "PseudoOp #": tags.derefOperator,
-                    "; ,": tags.separator,
-                    "( )": tags.paren,
-                    "[ ]": tags.squareBracket,
-                    "{ }": tags.brace
+                    "import charset namespace keyframes": tags$1.definitionKeyword,
+                    "media supports": tags$1.controlKeyword,
+                    "from to": tags$1.keyword,
+                    NamespaceName: tags$1.namespace,
+                    KeyframeName: tags$1.labelName,
+                    TagName: tags$1.typeName,
+                    ClassName: tags$1.className,
+                    PseudoClassName: tags$1.constant(tags$1.className),
+                    not: tags$1.operatorKeyword,
+                    IdName: tags$1.labelName,
+                    "FeatureName PropertyName AttributeName": tags$1.propertyName,
+                    NumberLiteral: tags$1.number,
+                    KeywordQuery: tags$1.keyword,
+                    UnaryQueryOp: tags$1.operatorKeyword,
+                    callee: tags$1.keyword,
+                    "CallTag ValueName": tags$1.atom,
+                    Callee: tags$1.variableName,
+                    Unit: tags$1.unit,
+                    "UniversalSelector NestingSelector": tags$1.definitionOperator,
+                    AtKeyword: tags$1.keyword,
+                    MatchOp: tags$1.compareOperator,
+                    "ChildOp SiblingOp, LogicOp": tags$1.logicOperator,
+                    BinOp: tags$1.arithmeticOperator,
+                    Important: tags$1.modifier,
+                    Comment: tags$1.blockComment,
+                    ParenthesizedContent: tags$1.special(tags$1.name),
+                    ColorLiteral: tags$1.color,
+                    StringLiteral: tags$1.string,
+                    ":": tags$1.punctuation,
+                    "PseudoOp #": tags$1.derefOperator,
+                    "; ,": tags$1.separator,
+                    "( )": tags$1.paren,
+                    "[ ]": tags$1.squareBracket,
+                    "{ }": tags$1.brace
                 })
             ]
         }),
@@ -18898,7 +19349,7 @@ const cm = (function () {
         }
     });
     /// CSS property and value keyword completion.
-    const cssCompletion = cssLanguage.data.of({ autocomplete: completeCSS });
+    cssLanguage.data.of({ autocomplete: completeCSS });
 
     const Targets = ["_blank", "_self", "_top", "_parent"];
     const Charsets = ["ascii", "utf-8", "utf-16", "latin1", "latin1"];
@@ -19285,7 +19736,7 @@ const cm = (function () {
         }
         return open;
     }
-    const identifier$1 = /^[:\-\.\w\u00b7-\uffff]+$/;
+    const identifier = /^[:\-\.\w\u00b7-\uffff]+$/;
     function completeTag(state, tree, from, to) {
         let end = /\s*>/.test(state.sliceDoc(to, to + 5)) ? "" : ">";
         return { from, to,
@@ -19296,7 +19747,7 @@ const cm = (function () {
         let end = /\s*>/.test(state.sliceDoc(to, to + 5)) ? "" : ">";
         return { from, to,
             options: openTags(state.doc, tree).map((tag, i) => ({ label: tag, apply: tag + end, type: "type", boost: 99 - i })),
-            span: identifier$1 };
+            span: identifier };
     }
     function completeStartTag(state, tree, pos) {
         let options = [], level = 0;
@@ -19311,7 +19762,7 @@ const cm = (function () {
         let names = (info && info.attrs ? Object.keys(info.attrs).concat(GlobalAttrNames) : GlobalAttrNames);
         return { from, to,
             options: names.map(attrName => ({ label: attrName, type: "property" })),
-            span: identifier$1 };
+            span: identifier };
     }
     function completeAttrValue(state, tree, from, to) {
         var _a;
@@ -19373,15 +19824,31 @@ const cm = (function () {
     /// JavaScript and CSS parsers to parse the content of `<script>` and
     /// `<style>` tags.
     const htmlLanguage = LezerLanguage.define({
-        parser: parser$1.configure({
+        parser: parser$2.configure({
             props: [
                 indentNodeProp.add({
                     Element(context) {
-                        let closed = /^\s*<\//.test(context.textAfter);
-                        return context.lineIndent(context.state.doc.lineAt(context.node.from)) + (closed ? 0 : context.unit);
+                        let after = /^(\s*)(<\/)?/.exec(context.textAfter);
+                        if (context.node.to <= context.pos + after[0].length)
+                            return context.continue();
+                        return context.lineIndent(context.state.doc.lineAt(context.node.from)) + (after[1] ? 0 : context.unit);
                     },
                     "OpenTag CloseTag SelfClosingTag"(context) {
                         return context.column(context.node.from) + context.unit;
+                    },
+                    Document(context) {
+                        if (context.pos + /\s*/.exec(context.textAfter)[0].length < context.node.to)
+                            return context.continue();
+                        let endElt = null, close;
+                        for (let cur = context.node;;) {
+                            let last = cur.lastChild;
+                            if (!last || last.name != "Element" || last.to != cur.to)
+                                break;
+                            endElt = cur = last;
+                        }
+                        if (endElt && !((close = endElt.lastChild) && (close.name == "CloseTag" || close.name == "SelfClosingTag")))
+                            return context.lineIndent(context.state.doc.lineAt(endElt.from)) + context.unit;
+                        return null;
                     }
                 }),
                 foldNodeProp.add({
@@ -19393,18 +19860,18 @@ const cm = (function () {
                     }
                 }),
                 styleTags({
-                    AttributeValue: tags.string,
-                    "Text RawText": tags.content,
-                    "StartTag StartCloseTag SelfCloserEndTag EndTag SelfCloseEndTag": tags.angleBracket,
-                    TagName: tags.typeName,
-                    "MismatchedCloseTag/TagName": [tags.typeName, tags.invalid],
-                    AttributeName: tags.propertyName,
-                    UnquotedAttributeValue: tags.string,
-                    Is: tags.definitionOperator,
-                    "EntityReference CharacterReference": tags.character,
-                    Comment: tags.blockComment,
-                    ProcessingInst: tags.processingInstruction,
-                    DoctypeDecl: tags.documentMeta
+                    AttributeValue: tags$1.string,
+                    "Text RawText": tags$1.content,
+                    "StartTag StartCloseTag SelfCloserEndTag EndTag SelfCloseEndTag": tags$1.angleBracket,
+                    TagName: tags$1.tagName,
+                    "MismatchedCloseTag/TagName": [tags$1.tagName, tags$1.invalid],
+                    AttributeName: tags$1.propertyName,
+                    UnquotedAttributeValue: tags$1.string,
+                    Is: tags$1.definitionOperator,
+                    "EntityReference CharacterReference": tags$1.character,
+                    Comment: tags$1.blockComment,
+                    ProcessingInst: tags$1.processingInstruction,
+                    DoctypeDecl: tags$1.documentMeta
                 })
             ],
             nested: configureNesting([
@@ -19427,9 +19894,9 @@ const cm = (function () {
     });
     /// HTML tag completion. Opens and closes tags and attributes in a
     /// context-aware way.
-    const htmlCompletion = htmlLanguage.data.of({ autocomplete: completeHTML });
+    htmlLanguage.data.of({ autocomplete: completeHTML });
 
-    class BlockContext {
+    class CompositeBlock {
         constructor(type, 
         // Used for indentation in list items, markup character in lists
         value, from, hash, end, children, positions) {
@@ -19443,7 +19910,7 @@ const cm = (function () {
         }
         static create(type, value, from, parentHash, end) {
             let hash = (parentHash + (parentHash << 8) + type + (value << 4)) | 0;
-            return new BlockContext(type, value, from, hash, end, [], []);
+            return new CompositeBlock(type, value, from, hash, end, [], []);
         }
         toTree(nodeSet, end = this.end) {
             let last = this.children.length - 1;
@@ -19454,7 +19921,7 @@ const cm = (function () {
             return tree;
         }
         copy() {
-            return new BlockContext(this.type, this.value, this.from, this.hash, this.end, this.children.slice(), this.positions.slice());
+            return new CompositeBlock(this.type, this.value, this.from, this.hash, this.end, this.children.slice(), this.positions.slice());
         }
     }
     var Type;
@@ -19467,143 +19934,198 @@ const cm = (function () {
         Type[Type["BulletList"] = 6] = "BulletList";
         Type[Type["OrderedList"] = 7] = "OrderedList";
         Type[Type["ListItem"] = 8] = "ListItem";
-        Type[Type["ATXHeading"] = 9] = "ATXHeading";
-        Type[Type["SetextHeading"] = 10] = "SetextHeading";
-        Type[Type["HTMLBlock"] = 11] = "HTMLBlock";
-        Type[Type["LinkReference"] = 12] = "LinkReference";
-        Type[Type["Paragraph"] = 13] = "Paragraph";
-        Type[Type["CommentBlock"] = 14] = "CommentBlock";
-        Type[Type["ProcessingInstructionBlock"] = 15] = "ProcessingInstructionBlock";
+        Type[Type["ATXHeading1"] = 9] = "ATXHeading1";
+        Type[Type["ATXHeading2"] = 10] = "ATXHeading2";
+        Type[Type["ATXHeading3"] = 11] = "ATXHeading3";
+        Type[Type["ATXHeading4"] = 12] = "ATXHeading4";
+        Type[Type["ATXHeading5"] = 13] = "ATXHeading5";
+        Type[Type["ATXHeading6"] = 14] = "ATXHeading6";
+        Type[Type["SetextHeading1"] = 15] = "SetextHeading1";
+        Type[Type["SetextHeading2"] = 16] = "SetextHeading2";
+        Type[Type["HTMLBlock"] = 17] = "HTMLBlock";
+        Type[Type["LinkReference"] = 18] = "LinkReference";
+        Type[Type["Paragraph"] = 19] = "Paragraph";
+        Type[Type["CommentBlock"] = 20] = "CommentBlock";
+        Type[Type["ProcessingInstructionBlock"] = 21] = "ProcessingInstructionBlock";
         // Inline
-        Type[Type["Escape"] = 16] = "Escape";
-        Type[Type["Entity"] = 17] = "Entity";
-        Type[Type["HardBreak"] = 18] = "HardBreak";
-        Type[Type["Emphasis"] = 19] = "Emphasis";
-        Type[Type["StrongEmphasis"] = 20] = "StrongEmphasis";
-        Type[Type["Link"] = 21] = "Link";
-        Type[Type["Image"] = 22] = "Image";
-        Type[Type["InlineCode"] = 23] = "InlineCode";
-        Type[Type["HTMLTag"] = 24] = "HTMLTag";
-        Type[Type["Comment"] = 25] = "Comment";
-        Type[Type["ProcessingInstruction"] = 26] = "ProcessingInstruction";
-        Type[Type["URL"] = 27] = "URL";
+        Type[Type["Escape"] = 22] = "Escape";
+        Type[Type["Entity"] = 23] = "Entity";
+        Type[Type["HardBreak"] = 24] = "HardBreak";
+        Type[Type["Emphasis"] = 25] = "Emphasis";
+        Type[Type["StrongEmphasis"] = 26] = "StrongEmphasis";
+        Type[Type["Link"] = 27] = "Link";
+        Type[Type["Image"] = 28] = "Image";
+        Type[Type["InlineCode"] = 29] = "InlineCode";
+        Type[Type["HTMLTag"] = 30] = "HTMLTag";
+        Type[Type["Comment"] = 31] = "Comment";
+        Type[Type["ProcessingInstruction"] = 32] = "ProcessingInstruction";
+        Type[Type["URL"] = 33] = "URL";
         // Smaller tokens
-        Type[Type["HeaderMark"] = 28] = "HeaderMark";
-        Type[Type["QuoteMark"] = 29] = "QuoteMark";
-        Type[Type["ListMark"] = 30] = "ListMark";
-        Type[Type["LinkMark"] = 31] = "LinkMark";
-        Type[Type["EmphasisMark"] = 32] = "EmphasisMark";
-        Type[Type["CodeMark"] = 33] = "CodeMark";
-        Type[Type["CodeInfo"] = 34] = "CodeInfo";
-        Type[Type["LinkTitle"] = 35] = "LinkTitle";
-        Type[Type["LinkLabel"] = 36] = "LinkLabel";
+        Type[Type["HeaderMark"] = 34] = "HeaderMark";
+        Type[Type["QuoteMark"] = 35] = "QuoteMark";
+        Type[Type["ListMark"] = 36] = "ListMark";
+        Type[Type["LinkMark"] = 37] = "LinkMark";
+        Type[Type["EmphasisMark"] = 38] = "EmphasisMark";
+        Type[Type["CodeMark"] = 39] = "CodeMark";
+        Type[Type["CodeInfo"] = 40] = "CodeInfo";
+        Type[Type["LinkTitle"] = 41] = "LinkTitle";
+        Type[Type["LinkLabel"] = 42] = "LinkLabel";
     })(Type || (Type = {}));
-    class Line$1 {
+    /// Data structure used to accumulate a block's content during [leaf
+    /// block parsing](#BlockParser.leaf).
+    class LeafBlock {
+        /// @internal
+        constructor(
+        /// The start position of the block.
+        start, 
+        /// The block's text content.
+        content) {
+            this.start = start;
+            this.content = content;
+            /// @internal
+            this.marks = [];
+            /// @internal
+            this.parsers = [];
+        }
+    }
+    /// Data structure used during block-level per-line parsing.
+    class Line {
         constructor() {
-            // The line's text
+            /// The line's full text.
             this.text = "";
-            // The next non-whitespace character
-            this.start = 0;
-            // The column of the next non-whitespace character
-            this.indent = 0;
-            // The base indent provided by the contexts (handled so far)
+            /// The base indent provided by the composite contexts (that have
+            /// been handled so far).
             this.baseIndent = 0;
-            // The position corresponding to the base indent
+            /// The string position corresponding to the base indent.
             this.basePos = 0;
-            // The number of contexts handled
+            /// The number of contexts handled @internal
             this.depth = 0;
-            // Any markers (i.e. block quote markers) parsed for the contexts.
+            /// Any markers (i.e. block quote markers) parsed for the contexts. @internal
             this.markers = [];
-            // The character code of the character after this.start
+            /// The position of the next non-whitespace character beyond any
+            /// list, blockquote, or other composite block markers.
+            this.pos = 0;
+            /// The column of the next non-whitespace character.
+            this.indent = 0;
+            /// The character code of the character after `pos`.
             this.next = -1;
         }
-        moveStart(pos) {
-            this.start = skipSpace(this.text, pos);
-            this.indent = countIndent(this.text, this.start);
-            this.next = this.start == this.text.length ? -1 : this.text.charCodeAt(this.start);
+        /// @internal
+        forward() {
+            if (this.basePos > this.pos)
+                this.forwardInner();
         }
+        /// @internal
+        forwardInner() {
+            let newPos = this.skipSpace(this.basePos);
+            this.indent = this.countIndent(newPos, this.pos, this.indent);
+            this.pos = newPos;
+            this.next = newPos == this.text.length ? -1 : this.text.charCodeAt(newPos);
+        }
+        /// Skip whitespace after the given position, return the position of
+        /// the next non-space character or the end of the line if there's
+        /// only space after `from`.
+        skipSpace(from) { return skipSpace(this.text, from); }
+        /// @internal
         reset(text) {
             this.text = text;
-            this.moveStart(0);
-            this.indent = countIndent(text, this.start);
-            this.baseIndent = this.basePos = 0;
+            this.baseIndent = this.basePos = this.pos = this.indent = 0;
+            this.forwardInner();
             this.depth = 1;
             while (this.markers.length)
                 this.markers.pop();
         }
+        /// Move the line's base position forward to the given position.
+        /// This should only be called by composite [block
+        /// parsers](#BlockParser.parse) or [markup skipping
+        /// functions](#NodeSpec.composite).
+        moveBase(to) {
+            this.basePos = to;
+            this.baseIndent = this.countIndent(to, this.pos, this.indent);
+        }
+        /// Move the line's base position forward to the given _column_.
+        moveBaseColumn(indent) {
+            this.baseIndent = indent;
+            this.basePos = this.findColumn(indent);
+        }
+        /// Store a composite-block-level marker. Should be called from
+        /// [markup skipping functions](#NodeSpec.composite) when they
+        /// consume any non-whitespace characters.
+        addMarker(elt) {
+            this.markers.push(elt);
+        }
+        /// Find the column position at `to`, optionally starting at a given
+        /// position and column.
+        countIndent(to, from = 0, indent = 0) {
+            for (let i = from; i < to; i++)
+                indent += this.text.charCodeAt(i) == 9 ? 4 - indent % 4 : 1;
+            return indent;
+        }
+        /// Find the position corresponding to the given column.
+        findColumn(goal) {
+            let i = 0;
+            for (let indent = 0; i < this.text.length && indent < goal; i++)
+                indent += this.text.charCodeAt(i) == 9 ? 4 - indent % 4 : 1;
+            return i;
+        }
+        /// @internal
+        scrub() {
+            if (!this.baseIndent)
+                return this.text;
+            let result = "";
+            for (let i = 0; i < this.baseIndent; i++)
+                result += " ";
+            return result + this.text.slice(this.basePos);
+        }
     }
-    function skipForList(cx, p, line) {
-        if (line.start == line.text.length ||
-            (cx != p.context && line.indent >= p.contextStack[line.depth + 1].value + line.baseIndent))
+    function skipForList(bl, cx, line) {
+        if (line.pos == line.text.length ||
+            (bl != cx.block && line.indent >= cx.stack[line.depth + 1].value + line.baseIndent))
             return true;
         if (line.indent >= line.baseIndent + 4)
             return false;
-        let size = (cx.type == Type.OrderedList ? isOrderedList : isBulletList)(line, p, false);
+        let size = (bl.type == Type.OrderedList ? isOrderedList : isBulletList)(line, cx, false);
         return size > 0 &&
-            (cx.type != Type.BulletList || isHorizontalRule(line) < 0) &&
-            line.text.charCodeAt(line.start + size - 1) == cx.value;
+            (bl.type != Type.BulletList || isHorizontalRule(line, cx, false) < 0) &&
+            line.text.charCodeAt(line.pos + size - 1) == bl.value;
     }
-    const SkipMarkup = {
-        [Type.Blockquote](cx, p, line) {
+    const DefaultSkipMarkup = {
+        [Type.Blockquote](bl, cx, line) {
             if (line.next != 62 /* '>' */)
                 return false;
-            line.markers.push(elt(Type.QuoteMark, p._pos + line.start, p._pos + line.start + 1));
-            line.basePos = line.start + 2;
-            line.baseIndent = line.indent + 2;
-            line.moveStart(line.start + 1);
-            cx.end = p._pos + line.text.length;
+            line.markers.push(elt(Type.QuoteMark, cx.lineStart + line.pos, cx.lineStart + line.pos + 1));
+            line.moveBase(line.pos + 1);
+            bl.end = cx.lineStart + line.text.length;
             return true;
         },
-        [Type.ListItem](cx, _p, line) {
-            if (line.indent < line.baseIndent + cx.value && line.next > -1)
+        [Type.ListItem](bl, _cx, line) {
+            if (line.indent < line.baseIndent + bl.value && line.next > -1)
                 return false;
-            line.baseIndent += cx.value;
-            line.basePos += cx.value;
+            line.moveBaseColumn(line.baseIndent + bl.value);
             return true;
         },
         [Type.OrderedList]: skipForList,
         [Type.BulletList]: skipForList,
         [Type.Document]() { return true; }
     };
-    let nodeTypes = [NodeType.none];
-    for (let i = 1, name; name = Type[i]; i++) {
-        nodeTypes[i] = NodeType.define({
-            id: i,
-            name,
-            props: i >= Type.Escape ? [] : [[NodeProp.group, i in SkipMarkup ? ["Block", "BlockContext"] : ["Block", "LeafBlock"]]]
-        });
-    }
-    function space$2(ch) { return ch == 32 || ch == 9 || ch == 10 || ch == 13; }
-    // FIXME more incremental
-    function countIndent(line, to) {
-        let indent = 0;
-        for (let i = 0; i < to; i++)
-            indent += line.charCodeAt(i) == 9 ? 4 - indent % 4 : 1;
-        return indent;
-    }
-    function findIndent(line, goal) {
-        let i = 0;
-        for (let indent = 0; i < line.length && indent < goal; i++)
-            indent += line.charCodeAt(i) == 9 ? 4 - indent % 4 : 1;
-        return i;
-    }
+    function space(ch) { return ch == 32 || ch == 9 || ch == 10 || ch == 13; }
     function skipSpace(line, i = 0) {
-        while (i < line.length && space$2(line.charCodeAt(i)))
+        while (i < line.length && space(line.charCodeAt(i)))
             i++;
         return i;
     }
     function skipSpaceBack(line, i, to) {
-        while (i > to && space$2(line.charCodeAt(i - 1)))
+        while (i > to && space(line.charCodeAt(i - 1)))
             i--;
         return i;
     }
     function isFencedCode(line) {
         if (line.next != 96 && line.next != 126 /* '`~' */)
             return -1;
-        let pos = line.start + 1;
+        let pos = line.pos + 1;
         while (pos < line.text.length && line.text.charCodeAt(pos) == line.next)
             pos++;
-        if (pos < line.start + 3)
+        if (pos < line.pos + 3)
             return -1;
         if (line.next == 96)
             for (let i = pos; i < line.text.length; i++)
@@ -19612,32 +20134,35 @@ const cm = (function () {
         return pos;
     }
     function isBlockquote(line) {
-        return line.next != 62 /* '>' */ ? -1 : line.text.charCodeAt(line.start + 1) == 32 ? 2 : 1;
+        return line.next != 62 /* '>' */ ? -1 : line.text.charCodeAt(line.pos + 1) == 32 ? 2 : 1;
     }
-    function isHorizontalRule(line) {
-        if (line.next != 42 && line.next != 45 && line.next != 95 /* '-_*' */)
+    function isHorizontalRule(line, cx, breaking) {
+        if (line.next != 42 && line.next != 45 && line.next != 95 /* '_-*' */)
             return -1;
         let count = 1;
-        for (let pos = line.start + 1; pos < line.text.length; pos++) {
+        for (let pos = line.pos + 1; pos < line.text.length; pos++) {
             let ch = line.text.charCodeAt(pos);
             if (ch == line.next)
                 count++;
-            else if (!space$2(ch))
+            else if (!space(ch))
                 return -1;
         }
+        // Setext headers take precedence
+        if (breaking && line.next == 45 && isSetextUnderline(line) > -1 && line.depth == cx.stack.length)
+            return -1;
         return count < 3 ? -1 : 1;
     }
-    function inList(p, type) {
-        return p.context.type == type ||
-            p.contextStack.length > 1 && p.contextStack[p.contextStack.length - 2].type == type;
+    function inList(cx, type) {
+        return cx.block.type == type ||
+            cx.stack.length > 1 && cx.stack[cx.stack.length - 2].type == type;
     }
-    function isBulletList(line, p, breaking) {
+    function isBulletList(line, cx, breaking) {
         return (line.next == 45 || line.next == 43 || line.next == 42 /* '-+*' */) &&
-            (line.start == line.text.length - 1 || space$2(line.text.charCodeAt(line.start + 1))) &&
-            (!breaking || inList(p, Type.BulletList) || skipSpace(line.text, line.start + 2) < line.text.length) ? 1 : -1;
+            (line.pos == line.text.length - 1 || space(line.text.charCodeAt(line.pos + 1))) &&
+            (!breaking || inList(cx, Type.BulletList) || line.skipSpace(line.pos + 2) < line.text.length) ? 1 : -1;
     }
-    function isOrderedList(line, p, breaking) {
-        let pos = line.start, next = line.next;
+    function isOrderedList(line, cx, breaking) {
+        let pos = line.pos, next = line.next;
         for (;;) {
             if (next >= 48 && next <= 57 /* '0-9' */)
                 pos++;
@@ -19647,24 +20172,35 @@ const cm = (function () {
                 return -1;
             next = line.text.charCodeAt(pos);
         }
-        if (pos == line.start || pos > line.start + 9 ||
+        if (pos == line.pos || pos > line.pos + 9 ||
             (next != 46 && next != 41 /* '.)' */) ||
-            (pos < line.text.length - 1 && !space$2(line.text.charCodeAt(pos + 1))) ||
-            breaking && !inList(p, Type.OrderedList) &&
-                (skipSpace(line.text, pos + 1) == line.text.length || pos > line.start + 1 || line.next != 49 /* '1' */))
+            (pos < line.text.length - 1 && !space(line.text.charCodeAt(pos + 1))) ||
+            breaking && !inList(cx, Type.OrderedList) &&
+                (line.skipSpace(pos + 1) == line.text.length || pos > line.pos + 1 || line.next != 49 /* '1' */))
             return -1;
-        return pos + 1 - line.start;
+        return pos + 1 - line.pos;
     }
     function isAtxHeading(line) {
         if (line.next != 35 /* '#' */)
             return -1;
-        let pos = line.start + 1;
+        let pos = line.pos + 1;
         while (pos < line.text.length && line.text.charCodeAt(pos) == 35)
             pos++;
         if (pos < line.text.length && line.text.charCodeAt(pos) != 32)
             return -1;
-        let size = pos - line.start;
-        return size > 6 ? -1 : size + 1;
+        let size = pos - line.pos;
+        return size > 6 ? -1 : size;
+    }
+    function isSetextUnderline(line) {
+        if (line.next != 45 && line.next != 61 /* '-=' */ || line.indent >= line.baseIndent + 4)
+            return -1;
+        let pos = line.pos + 1;
+        while (pos < line.text.length && line.text.charCodeAt(pos) == line.next)
+            pos++;
+        let end = pos;
+        while (pos < line.text.length && space(line.text.charCodeAt(pos)))
+            pos++;
+        return pos == line.text.length ? end : -1;
     }
     const EmptyLine = /^[ \t]*$/, CommentEnd = /-->/, ProcessingEnd = /\?>/;
     const HTMLBlockStyle = [
@@ -19676,55 +20212,37 @@ const cm = (function () {
         [/^\s*<\/?(?:address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h1|h2|h3|h4|h5|h6|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol|optgroup|option|p|param|section|source|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul)(?:\s|\/?>|$)/i, EmptyLine],
         [/^\s*(?:<\/[a-z][\w-]*\s*>|<[a-z][\w-]*(\s+[a-z:_][\w-.]*(?:\s*=\s*(?:[^\s"'=<>`]+|'[^']*'|"[^"]*"))?)*\s*>)\s*$/i, EmptyLine]
     ];
-    function isHTMLBlock(line, _p, breaking) {
+    function isHTMLBlock(line, _cx, breaking) {
         if (line.next != 60 /* '<' */)
             return -1;
-        let rest = line.text.slice(line.start);
+        let rest = line.text.slice(line.pos);
         for (let i = 0, e = HTMLBlockStyle.length - (breaking ? 1 : 0); i < e; i++)
             if (HTMLBlockStyle[i][0].test(rest))
                 return i;
         return -1;
     }
-    function isSetextUnderline(line) {
-        if (line.next != 45 && line.next != 61 /* '-=' */)
-            return -1;
-        let pos = line.start + 1;
-        while (pos < line.text.length && line.text.charCodeAt(pos) == line.next)
-            pos++;
-        while (pos < line.text.length && space$2(line.text.charCodeAt(pos)))
-            pos++;
-        return pos == line.text.length ? 1 : -1;
-    }
-    const BreakParagraph = [
-        isAtxHeading,
-        isFencedCode,
-        isBlockquote,
-        isBulletList,
-        isOrderedList,
-        isHorizontalRule,
-        isHTMLBlock
-    ];
-    function getListIndent(text, start) {
-        let indentAfter = countIndent(text, start) + 1;
-        let indented = countIndent(text, skipSpace(text, start));
-        return indented >= indentAfter + 4 ? indentAfter : indented;
+    function getListIndent(line, pos) {
+        let indentAfter = line.countIndent(pos, line.pos, line.indent);
+        let indented = line.countIndent(line.skipSpace(pos), pos, indentAfter);
+        return indented >= indentAfter + 5 ? indentAfter + 1 : indented;
     }
     // Rules for parsing blocks. A return value of false means the rule
     // doesn't apply here, true means it does. When true is returned and
     // `p.line` has been updated, the rule is assumed to have consumed a
     // leaf block. Otherwise, it is assumed to have opened a context.
-    const Blocks = [
-        function indentedCode(p, line) {
+    const DefaultBlockParsers = {
+        LinkReference: undefined,
+        IndentedCode(cx, line) {
             let base = line.baseIndent + 4;
             if (line.indent < base)
-                return 0 /* No */;
-            let start = findIndent(line.text, base);
-            let from = p._pos + start, end = p._pos + line.text.length;
+                return false;
+            let start = line.findColumn(base);
+            let from = cx.lineStart + start, end = cx.lineStart + line.text.length;
             let marks = [], pendingMarks = [];
-            for (; p.nextLine();) {
-                if (line.depth < p.contextStack.length)
+            for (; cx.nextLine();) {
+                if (line.depth < cx.stack.length)
                     break;
-                if (line.start == line.text.length) { // Empty
+                if (line.pos == line.text.length) { // Empty
                     for (let m of line.markers)
                         pendingMarks.push(m);
                 }
@@ -19739,141 +20257,133 @@ const cm = (function () {
                     }
                     for (let m of line.markers)
                         marks.push(m);
-                    end = p._pos + line.text.length;
+                    end = cx.lineStart + line.text.length;
                 }
             }
             if (pendingMarks.length)
                 line.markers = pendingMarks.concat(line.markers);
-            let nest = !marks.length && p.parser.codeParser && p.parser.codeParser("");
+            let nest = !marks.length && cx.parser.codeParser && cx.parser.codeParser("");
             if (nest)
-                p.startNested(new NestedParse(from, nest.startParse(p.input.clip(end), from, p.parseContext), tree => new Tree(p.parser.nodeSet.types[Type.CodeBlock], [tree], [0], end - from)));
+                cx.startNested(from, nest.startParse(cx.input.clip(end), from, cx.parseContext), tree => new Tree(cx.parser.nodeSet.types[Type.CodeBlock], [tree], [0], end - from));
             else
-                p.addNode(new Buffer(p).writeElements(marks, -from).finish(Type.CodeBlock, end - from), from);
-            return 1 /* Done */;
+                cx.addNode(cx.buffer.writeElements(marks, -from).finish(Type.CodeBlock, end - from), from);
+            return true;
         },
-        function fencedCode(p, line) {
+        FencedCode(cx, line) {
             let fenceEnd = isFencedCode(line);
             if (fenceEnd < 0)
-                return 0 /* No */;
-            let from = p._pos + line.start, ch = line.next, len = fenceEnd - line.start;
-            let infoFrom = skipSpace(line.text, fenceEnd), infoTo = skipSpaceBack(line.text, line.text.length, infoFrom);
+                return false;
+            let from = cx.lineStart + line.pos, ch = line.next, len = fenceEnd - line.pos;
+            let infoFrom = line.skipSpace(fenceEnd), infoTo = skipSpaceBack(line.text, line.text.length, infoFrom);
             let marks = [elt(Type.CodeMark, from, from + len)], info = "";
             if (infoFrom < infoTo) {
-                marks.push(elt(Type.CodeInfo, p._pos + infoFrom, p._pos + infoTo));
+                marks.push(elt(Type.CodeInfo, cx.lineStart + infoFrom, cx.lineStart + infoTo));
                 info = line.text.slice(infoFrom, infoTo);
             }
             let ownMarks = marks.length, startMarks = ownMarks;
-            let codeStart = p._pos + line.text.length + 1, codeEnd = -1;
-            for (; p.nextLine();) {
-                if (line.depth < p.contextStack.length)
+            let codeStart = cx.lineStart + line.text.length + 1, codeEnd = -1;
+            for (; cx.nextLine();) {
+                if (line.depth < cx.stack.length)
                     break;
                 for (let m of line.markers)
                     marks.push(m);
-                let i = line.start;
+                let i = line.pos;
                 if (line.indent - line.baseIndent < 4)
                     while (i < line.text.length && line.text.charCodeAt(i) == ch)
                         i++;
-                if (i - line.start >= len && skipSpace(line.text, i) == line.text.length) {
-                    marks.push(elt(Type.CodeMark, p._pos + line.start, p._pos + i));
+                if (i - line.pos >= len && line.skipSpace(i) == line.text.length) {
+                    marks.push(elt(Type.CodeMark, cx.lineStart + line.pos, cx.lineStart + i));
                     ownMarks++;
-                    codeEnd = p._pos - 1;
-                    p.nextLine();
+                    codeEnd = cx.lineStart - 1;
+                    cx.nextLine();
                     break;
                 }
             }
-            let to = p.prevLineEnd();
+            let to = cx.prevLineEnd();
             if (codeEnd < 0)
                 codeEnd = to;
             // (Don't try to nest if there are blockquote marks in the region.)
-            let nest = marks.length == ownMarks && p.parser.codeParser && p.parser.codeParser(info);
-            if (nest) {
-                p.startNested(new NestedParse(from, nest.startParse(p.input.clip(codeEnd), codeStart, p.parseContext), tree => {
+            let nest = marks.length == ownMarks && cx.parser.codeParser && cx.parser.codeParser(info);
+            if (nest && codeStart < codeEnd) {
+                cx.startNested(from, nest.startParse(cx.input.clip(codeEnd), codeStart, cx.parseContext), tree => {
                     marks.splice(startMarks, 0, new TreeElement(tree, codeStart));
-                    return elt(Type.FencedCode, from, to, marks).toTree(p.parser.nodeSet, -from);
-                }));
+                    return elt(Type.FencedCode, from, to, marks);
+                });
             }
             else {
-                p.addNode(new Buffer(p).writeElements(marks, -from).finish(Type.FencedCode, p.prevLineEnd() - from), from);
+                cx.addNode(cx.buffer.writeElements(marks, -from).finish(Type.FencedCode, cx.prevLineEnd() - from), from);
             }
-            return 1 /* Done */;
+            return true;
         },
-        function blockquote(p, line) {
+        Blockquote(cx, line) {
             let size = isBlockquote(line);
             if (size < 0)
-                return 0 /* No */;
-            p.startContext(Type.Blockquote, line.start);
-            p.addNode(Type.QuoteMark, p._pos + line.start, p._pos + line.start + 1);
-            line.basePos = line.start + size;
-            line.baseIndent = line.indent + size;
-            line.moveStart(line.start + size);
-            return 2 /* Continue */;
+                return false;
+            cx.startContext(Type.Blockquote, line.pos);
+            cx.addNode(Type.QuoteMark, cx.lineStart + line.pos, cx.lineStart + line.pos + 1);
+            line.moveBase(line.pos + size);
+            return null;
         },
-        function horizontalRule(p, line) {
-            if (isHorizontalRule(line) < 0)
-                return 0 /* No */;
-            let from = p._pos + line.start;
-            p.nextLine();
-            p.addNode(Type.HorizontalRule, from);
-            return 1 /* Done */;
+        HorizontalRule(cx, line) {
+            if (isHorizontalRule(line, cx, false) < 0)
+                return false;
+            let from = cx.lineStart + line.pos;
+            cx.nextLine();
+            cx.addNode(Type.HorizontalRule, from);
+            return true;
         },
-        function bulletList(p, line) {
-            let size = isBulletList(line, p, false);
+        BulletList(cx, line) {
+            let size = isBulletList(line, cx, false);
             if (size < 0)
-                return 0 /* No */;
-            let cxStart = findIndent(line.text, line.baseIndent);
-            if (p.context.type != Type.BulletList)
-                p.startContext(Type.BulletList, cxStart, line.next);
-            let newBase = getListIndent(line.text, line.start + 1);
-            p.startContext(Type.ListItem, cxStart, newBase - line.baseIndent);
-            p.addNode(Type.ListMark, p._pos + line.start, p._pos + line.start + size);
-            line.baseIndent = newBase;
-            line.basePos = findIndent(line.text, newBase);
-            line.moveStart(Math.min(line.text.length, line.start + 2));
-            return 2 /* Continue */;
+                return false;
+            if (cx.block.type != Type.BulletList)
+                cx.startContext(Type.BulletList, line.basePos, line.next);
+            let newBase = getListIndent(line, line.pos + 1);
+            cx.startContext(Type.ListItem, line.basePos, newBase - line.baseIndent);
+            cx.addNode(Type.ListMark, cx.lineStart + line.pos, cx.lineStart + line.pos + size);
+            line.moveBaseColumn(newBase);
+            return null;
         },
-        function orderedList(p, line) {
-            let size = isOrderedList(line, p, false);
+        OrderedList(cx, line) {
+            let size = isOrderedList(line, cx, false);
             if (size < 0)
-                return 0 /* No */;
-            let cxStart = findIndent(line.text, line.baseIndent);
-            if (p.context.type != Type.OrderedList)
-                p.startContext(Type.OrderedList, cxStart, line.text.charCodeAt(line.start + size - 1));
-            let newBase = getListIndent(line.text, line.start + size);
-            p.startContext(Type.ListItem, cxStart, newBase - line.baseIndent);
-            p.addNode(Type.ListMark, p._pos + line.start, p._pos + line.start + size);
-            line.baseIndent = newBase;
-            line.basePos = findIndent(line.text, newBase);
-            line.moveStart(Math.min(line.text.length, line.start + size + 1));
-            return 2 /* Continue */;
+                return false;
+            if (cx.block.type != Type.OrderedList)
+                cx.startContext(Type.OrderedList, line.basePos, line.text.charCodeAt(line.pos + size - 1));
+            let newBase = getListIndent(line, line.pos + size);
+            cx.startContext(Type.ListItem, line.basePos, newBase - line.baseIndent);
+            cx.addNode(Type.ListMark, cx.lineStart + line.pos, cx.lineStart + line.pos + size);
+            line.moveBaseColumn(newBase);
+            return null;
         },
-        function atxHeading(p, line) {
+        ATXHeading(cx, line) {
             let size = isAtxHeading(line);
             if (size < 0)
-                return 0 /* No */;
-            let off = line.start, from = p._pos + off;
+                return false;
+            let off = line.pos, from = cx.lineStart + off;
             let endOfSpace = skipSpaceBack(line.text, line.text.length, off), after = endOfSpace;
             while (after > off && line.text.charCodeAt(after - 1) == line.next)
                 after--;
-            if (after == endOfSpace || after == off || !space$2(line.text.charCodeAt(after - 1)))
+            if (after == endOfSpace || after == off || !space(line.text.charCodeAt(after - 1)))
                 after = line.text.length;
-            let buf = new Buffer(p)
-                .write(Type.HeaderMark, 0, size - 1)
-                .writeElements(parseInline(p, line.text.slice(off + size, after)), size);
+            let buf = cx.buffer
+                .write(Type.HeaderMark, 0, size)
+                .writeElements(cx.parser.parseInline(line.text.slice(off + size + 1, after), from + size + 1), -from);
             if (after < line.text.length)
                 buf.write(Type.HeaderMark, after - off, endOfSpace - off);
-            let node = buf.finish(Type.ATXHeading, line.text.length - off);
-            p.nextLine();
-            p.addNode(node, from);
-            return 1 /* Done */;
+            let node = buf.finish(Type.ATXHeading1 - 1 + size, line.text.length - off);
+            cx.nextLine();
+            cx.addNode(node, from);
+            return true;
         },
-        function htmlBlock(p, line) {
-            let type = isHTMLBlock(line, p, false);
+        HTMLBlock(cx, line) {
+            let type = isHTMLBlock(line, cx, false);
             if (type < 0)
-                return 0 /* No */;
-            let from = p._pos + line.start, end = HTMLBlockStyle[type][1];
+                return false;
+            let from = cx.lineStart + line.pos, end = HTMLBlockStyle[type][1];
             let marks = [], trailing = end != EmptyLine;
-            while (!end.test(line.text) && p.nextLine()) {
-                if (line.depth < p.contextStack.length) {
+            while (!end.test(line.text) && cx.nextLine()) {
+                if (line.depth < cx.stack.length) {
                     trailing = false;
                     break;
                 }
@@ -19881,109 +20391,194 @@ const cm = (function () {
                     marks.push(m);
             }
             if (trailing)
-                p.nextLine();
+                cx.nextLine();
             let nodeType = end == CommentEnd ? Type.CommentBlock : end == ProcessingEnd ? Type.ProcessingInstructionBlock : Type.HTMLBlock;
-            let to = p.prevLineEnd();
-            if (!marks.length && nodeType == Type.HTMLBlock && p.parser.htmlParser) {
-                p.startNested(new NestedParse(from, p.parser.htmlParser.startParse(p.input.clip(to), from, p.parseContext), tree => new Tree(p.parser.nodeSet.types[nodeType], [tree], [0], to - from)));
-                return 1 /* Done */;
-            }
-            p.addNode(new Buffer(p).writeElements(marks, -from).finish(nodeType, to - from), from);
-            return 1 /* Done */;
-        },
-        function paragraph(p, line) {
-            let from = p._pos + line.start, content = line.text.slice(line.start), marks = [];
-            let heading = false;
-            lines: for (; p.nextLine();) {
-                if (line.start == line.text.length)
-                    break;
-                if (line.indent < line.baseIndent + 4) {
-                    if (isSetextUnderline(line) > -1 && line.depth == p.contextStack.length) {
-                        for (let m of line.markers)
-                            marks.push(m);
-                        heading = true;
-                        break;
-                    }
-                    for (let check of BreakParagraph)
-                        if (check(line, p, true) >= 0)
-                            break lines;
-                }
-                for (let m of line.markers)
-                    marks.push(m);
-                content += "\n";
-                content += line.text;
-            }
-            content = clearMarks(content, marks, from);
-            for (;;) {
-                let ref = parseLinkReference(p, content);
-                if (!ref)
-                    break;
-                p.addNode(ref, from);
-                if (content.length <= ref.length + 1 && !heading)
-                    return 1 /* Done */;
-                content = content.slice(ref.length + 1);
-                from += ref.length + 1;
-                // FIXME these are dropped, but should be added to the ref (awkward!)
-                while (marks.length && marks[0].to <= from)
-                    marks.shift();
-            }
-            let inline = injectMarks(parseInline(p, content), marks, from);
-            if (heading) {
-                let node = new Buffer(p)
-                    .writeElements(inline)
-                    .write(Type.HeaderMark, p._pos - from, p._pos + line.text.length - from)
-                    .finish(Type.SetextHeading, p._pos + line.text.length - from);
-                p.nextLine();
-                p.addNode(node, from);
+            let to = cx.prevLineEnd();
+            if (!marks.length && nodeType == Type.HTMLBlock && cx.parser.htmlParser) {
+                cx.startNested(from, cx.parser.htmlParser.startParse(cx.input.clip(to), from, cx.parseContext), tree => new Tree(cx.parser.nodeSet.types[nodeType], [tree], [0], to - from));
             }
             else {
-                p.addNode(new Buffer(p)
-                    .writeElements(inline)
-                    .finish(Type.Paragraph, content.length), from);
+                cx.addNode(cx.buffer.writeElements(marks, -from).finish(nodeType, to - from), from);
             }
-            return 1 /* Done */;
+            return true;
+        },
+        SetextHeading: undefined // Specifies relative precedence for block-continue function
+    };
+    // This implements a state machine that incrementally parses link references. At each
+    // next line, it looks ahead to see if the line continues the reference or not. If it
+    // doesn't and a valid link is available ending before that line, it finishes that.
+    // Similarly, on `finish` (when the leaf is terminated by external circumstances), it
+    // creates a link reference if there's a valid reference up to the current point.
+    class LinkReferenceParser {
+        constructor(leaf) {
+            this.stage = 0 /* Start */;
+            this.elts = [];
+            this.pos = 0;
+            this.start = leaf.start;
+            this.advance(leaf.content);
         }
+        nextLine(cx, line, leaf) {
+            if (this.stage == -1 /* Failed */)
+                return false;
+            let content = leaf.content + "\n" + line.scrub();
+            let finish = this.advance(content);
+            if (finish > -1 && finish < content.length)
+                return this.complete(cx, leaf, finish);
+            return false;
+        }
+        finish(cx, leaf) {
+            if ((this.stage == 2 /* Link */ || this.stage == 3 /* Title */) && skipSpace(leaf.content, this.pos) == leaf.content.length)
+                return this.complete(cx, leaf, leaf.content.length);
+            return false;
+        }
+        complete(cx, leaf, len) {
+            cx.addLeafElement(leaf, elt(Type.LinkReference, this.start, this.start + len, this.elts));
+            return true;
+        }
+        nextStage(elt) {
+            if (elt) {
+                this.pos = elt.to - this.start;
+                this.elts.push(elt);
+                this.stage++;
+                return true;
+            }
+            if (elt === false)
+                this.stage = -1 /* Failed */;
+            return false;
+        }
+        advance(content) {
+            for (;;) {
+                if (this.stage == -1 /* Failed */) {
+                    return -1;
+                }
+                else if (this.stage == 0 /* Start */) {
+                    if (!this.nextStage(parseLinkLabel(content, this.pos, this.start, true)))
+                        return -1;
+                    if (content.charCodeAt(this.pos) != 58 /* ':' */)
+                        return this.stage = -1 /* Failed */;
+                    this.elts.push(elt(Type.LinkMark, this.pos + this.start, this.pos + this.start + 1));
+                    this.pos++;
+                }
+                else if (this.stage == 1 /* Label */) {
+                    if (!this.nextStage(parseURL(content, skipSpace(content, this.pos), this.start)))
+                        return -1;
+                }
+                else if (this.stage == 2 /* Link */) {
+                    let skip = skipSpace(content, this.pos), end = 0;
+                    if (skip > this.pos) {
+                        let title = parseLinkTitle(content, skip, this.start);
+                        if (title) {
+                            let titleEnd = lineEnd(content, title.to - this.start);
+                            if (titleEnd > 0) {
+                                this.nextStage(title);
+                                end = titleEnd;
+                            }
+                        }
+                    }
+                    if (!end)
+                        end = lineEnd(content, this.pos);
+                    return end > 0 && end < content.length ? end : -1;
+                }
+                else { // RefStage.Title
+                    return lineEnd(content, this.pos);
+                }
+            }
+        }
+    }
+    function lineEnd(text, pos) {
+        for (; pos < text.length; pos++) {
+            let next = text.charCodeAt(pos);
+            if (next == 10)
+                break;
+            if (!space(next))
+                return -1;
+        }
+        return pos;
+    }
+    class SetextHeadingParser {
+        nextLine(cx, line, leaf) {
+            let underline = line.depth < cx.stack.length ? -1 : isSetextUnderline(line);
+            let next = line.next;
+            if (underline < 0)
+                return false;
+            let underlineMark = elt(Type.HeaderMark, cx.lineStart + line.pos, cx.lineStart + underline);
+            cx.nextLine();
+            cx.addLeafElement(leaf, elt(next == 61 ? Type.SetextHeading1 : Type.SetextHeading2, leaf.start, cx.prevLineEnd(), [
+                ...cx.parser.parseInline(leaf.content, leaf.start),
+                underlineMark
+            ]));
+            return true;
+        }
+        finish() {
+            return false;
+        }
+    }
+    const DefaultLeafBlocks = {
+        LinkReference(_, leaf) { return leaf.content.charCodeAt(0) == 91 /* '[' */ ? new LinkReferenceParser(leaf) : null; },
+        SetextHeading() { return new SetextHeadingParser; }
+    };
+    const DefaultEndLeaf = [
+        (_, line) => isAtxHeading(line) >= 0,
+        (_, line) => isFencedCode(line) >= 0,
+        (_, line) => isBlockquote(line) >= 0,
+        (p, line) => isBulletList(line, p, true) >= 0,
+        (p, line) => isOrderedList(line, p, true) >= 0,
+        (p, line) => isHorizontalRule(line, p, true) >= 0,
+        (p, line) => isHTMLBlock(line, p, true) >= 0
     ];
     class NestedParse {
-        constructor(from, parser, finish) {
+        constructor(from, parse, finish) {
             this.from = from;
-            this.parser = parser;
+            this.parse = parse;
             this.finish = finish;
         }
     }
-    class Parse$1 {
-        constructor(parser, input, startPos, parseContext) {
+    /// Block-level parsing functions get access to this context object.
+    class BlockContext {
+        /// @internal
+        constructor(
+        /// The parser configuration used.
+        parser, 
+        /// @internal
+        input, 
+        /// @internal
+        startPos, 
+        /// @internal
+        parseContext) {
             this.parser = parser;
             this.input = input;
             this.parseContext = parseContext;
-            this.line = new Line$1();
+            this.line = new Line();
             this.atEnd = false;
             this.nested = null;
-            this._pos = startPos;
-            this.context = BlockContext.create(Type.Document, 0, this._pos, 0, 0);
-            this.contextStack = [this.context];
-            this.fragments = (parseContext === null || parseContext === void 0 ? void 0 : parseContext.fragments) ? new FragmentCursor$1(parseContext.fragments, input) : null;
-            this.updateLine(input.lineAfter(this._pos));
+            this.lineStart = startPos;
+            this.block = CompositeBlock.create(Type.Document, 0, this.lineStart, 0, 0);
+            this.stack = [this.block];
+            this.fragments = (parseContext === null || parseContext === void 0 ? void 0 : parseContext.fragments) ? new FragmentCursor(parseContext.fragments, input) : null;
+            this.updateLine(input.lineAfter(this.lineStart));
         }
         get pos() {
-            return this.nested ? this.nested.parser.pos : this._pos;
+            return this.nested ? this.nested.parse.pos : this.lineStart;
         }
         advance() {
             if (this.nested) {
-                let done = this.nested.parser.advance();
+                let done = this.nested.parse.advance();
                 if (done) {
-                    this.addNode(this.nested.finish(done), this.nested.from);
+                    let node = this.nested.finish(done);
+                    if (node instanceof Element)
+                        node = node.toTree(this.parser.nodeSet);
+                    this.addNode(node, this.nested.from);
                     this.nested = null;
                 }
                 return null;
             }
             let { line } = this;
             for (;;) {
-                while (line.depth < this.contextStack.length)
+                while (line.depth < this.stack.length)
                     this.finishContext();
                 for (let mark of line.markers)
                     this.addNode(mark.type, mark.from, mark.to);
-                if (line.start < line.text.length)
+                if (line.pos < line.text.length)
                     break;
                 // Empty line
                 if (!this.nextLine())
@@ -19991,28 +20586,55 @@ const cm = (function () {
             }
             if (this.fragments && this.reuseFragment(line.basePos))
                 return null;
-            for (;;) {
-                for (let type of Blocks) {
-                    let result = type(this, line);
-                    if (result != 0 /* No */) {
-                        if (result == 1 /* Done */)
-                            return null;
-                        break;
+            start: for (;;) {
+                for (let type of this.parser.blockParsers)
+                    if (type) {
+                        let result = type(this, line);
+                        if (result != false) {
+                            if (result == true)
+                                return null;
+                            line.forward();
+                            continue start;
+                        }
                     }
-                }
+                break;
             }
+            let leaf = new LeafBlock(this.lineStart + line.pos, line.text.slice(line.pos));
+            for (let parse of this.parser.leafBlockParsers)
+                if (parse) {
+                    let parser = parse(this, leaf);
+                    if (parser)
+                        leaf.parsers.push(parser);
+                }
+            lines: while (this.nextLine()) {
+                if (line.pos == line.text.length)
+                    break;
+                if (line.indent < line.baseIndent + 4) {
+                    for (let stop of parser.endLeafBlock)
+                        if (stop(this, line))
+                            break lines;
+                }
+                for (let parser of leaf.parsers)
+                    if (parser.nextLine(this, line, leaf))
+                        return null;
+                leaf.content += "\n" + line.scrub();
+                for (let m of line.markers)
+                    leaf.marks.push(m);
+            }
+            this.finishLeaf(leaf);
+            return null;
         }
         reuseFragment(start) {
-            if (!this.fragments.moveTo(this._pos + start, this._pos) ||
-                !this.fragments.matches(this.context.hash))
+            if (!this.fragments.moveTo(this.lineStart + start, this.lineStart) ||
+                !this.fragments.matches(this.block.hash))
                 return false;
             let taken = this.fragments.takeNodes(this);
             if (!taken)
                 return false;
-            this._pos += taken;
-            if (this._pos < this.input.length) {
-                this._pos++;
-                this.updateLine(this.input.lineAfter(this._pos));
+            this.lineStart += taken;
+            if (this.lineStart < this.input.length) {
+                this.lineStart++;
+                this.updateLine(this.input.lineAfter(this.lineStart));
             }
             else {
                 this.atEnd = true;
@@ -20020,81 +20642,301 @@ const cm = (function () {
             }
             return true;
         }
+        /// Move to the next input line. This should only be called by
+        /// (non-composite) [block parsers](#BlockParser.parse) that consume
+        /// the line directly, or leaf block parser
+        /// [`nextLine`](#LeafBlockParser.nextLine) methods when they
+        /// consume the current line (and return true).
         nextLine() {
-            this._pos += this.line.text.length;
-            if (this._pos >= this.input.length) {
+            this.lineStart += this.line.text.length;
+            if (this.lineStart >= this.input.length) {
                 this.atEnd = true;
                 this.updateLine("");
                 return false;
             }
             else {
-                this._pos++;
-                this.updateLine(this.input.lineAfter(this._pos));
+                this.lineStart++;
+                this.updateLine(this.input.lineAfter(this.lineStart));
                 return true;
             }
         }
+        /// @internal
         updateLine(text) {
             let { line } = this;
             line.reset(text);
-            for (; line.depth < this.contextStack.length; line.depth++) {
-                let cx = this.contextStack[line.depth], handler = SkipMarkup[cx.type];
+            for (; line.depth < this.stack.length; line.depth++) {
+                let cx = this.stack[line.depth], handler = this.parser.skipContextMarkup[cx.type];
                 if (!handler)
                     throw new Error("Unhandled block context " + Type[cx.type]);
                 if (!handler(cx, this, line))
                     break;
+                line.forward();
             }
         }
-        prevLineEnd() { return this.atEnd ? this._pos : this._pos - 1; }
+        /// The end position of the previous line.
+        prevLineEnd() { return this.atEnd ? this.lineStart : this.lineStart - 1; }
+        /// @internal
         startContext(type, start, value = 0) {
-            this.context = BlockContext.create(type, value, this._pos + start, this.context.hash, this._pos + this.line.text.length);
-            this.contextStack.push(this.context);
+            this.block = CompositeBlock.create(type, value, this.lineStart + start, this.block.hash, this.lineStart + this.line.text.length);
+            this.stack.push(this.block);
         }
+        /// Start a composite block. Should only be called from [block
+        /// parser functions](#BlockParser.parse) that return null.
+        startComposite(type, start, value = 0) {
+            this.startContext(this.parser.getNodeType(type), start, value);
+        }
+        /// @internal
         addNode(block, from, to) {
             if (typeof block == "number")
-                block = new Tree(this.parser.nodeSet.types[block], none$7, none$7, (to !== null && to !== void 0 ? to : this.prevLineEnd()) - from);
-            this.context.children.push(block);
-            this.context.positions.push(from - this.context.from);
+                block = new Tree(this.parser.nodeSet.types[block], none, none, (to !== null && to !== void 0 ? to : this.prevLineEnd()) - from);
+            this.block.children.push(block);
+            this.block.positions.push(from - this.block.from);
         }
-        startNested(parse) {
-            this.nested = parse;
+        /// Add a block element. Can be called by [block
+        /// parsers](#BlockParser.parse).
+        addElement(elt) {
+            this.block.children.push(elt.toTree(this.parser.nodeSet));
+            this.block.positions.push(elt.from - this.block.from);
         }
+        /// Add a block element from a [leaf parser](#LeafBlockParser). This
+        /// makes sure any extra composite block markup (such as blockquote
+        /// markers) inside the block are also added to the syntax tree.
+        addLeafElement(leaf, elt) {
+            this.addNode(this.buffer
+                .writeElements(injectMarks(elt.children, leaf.marks), -elt.from)
+                .finish(elt.type, elt.to - elt.from), elt.from);
+        }
+        /// Start a nested parse at the given position. When it finishes,
+        /// the `finish` callback is called with the resulting tree, and
+        /// should return the finished node for the block element.
+        startNested(from, parse, finish) {
+            this.nested = new NestedParse(from, parse, finish);
+        }
+        /// @internal
         finishContext() {
-            this.context = finishContext(this.contextStack, this.parser.nodeSet);
+            this.block = finishContext(this.stack, this.parser.nodeSet);
         }
         finish() {
-            while (this.contextStack.length > 1)
+            while (this.stack.length > 1)
                 this.finishContext();
-            return this.context.toTree(this.parser.nodeSet, this._pos);
+            return this.block.toTree(this.parser.nodeSet, this.lineStart);
         }
         forceFinish() {
-            let cx = this.contextStack.map(cx => cx.copy());
+            let cx = this.stack.map(cx => cx.copy()), pos = this.lineStart;
             if (this.nested) {
                 let inner = cx[cx.length - 1];
-                inner.children.push(this.nested.parser.forceFinish());
-                inner.positions.push(this.nested.from - inner.from);
+                let result = this.nested.finish(this.nested.parse.forceFinish());
+                if (result instanceof Element)
+                    result = result.toTree(this.parser.nodeSet);
+                let len = pos - this.nested.from;
+                if (result.length > len)
+                    result = new Tree(result.type, result.children.filter((_, i) => result.positions[i] <= len), result.positions.filter(p => p <= len), len);
+                inner.children.push(result);
+                inner.positions.push(this.nested.from);
             }
             while (cx.length > 1)
                 finishContext(cx, this.parser.nodeSet);
-            return cx[0].toTree(this.parser.nodeSet, this._pos);
+            return cx[0].toTree(this.parser.nodeSet, pos);
         }
+        /// @internal
+        finishLeaf(leaf) {
+            for (let parser of leaf.parsers)
+                if (parser.finish(this, leaf))
+                    return;
+            let inline = injectMarks(this.parser.parseInline(leaf.content, leaf.start), leaf.marks);
+            this.addNode(this.buffer
+                .writeElements(inline, -leaf.start)
+                .finish(Type.Paragraph, leaf.content.length), leaf.start);
+        }
+        elt(type, from, to, children) {
+            if (typeof type == "string")
+                return elt(this.parser.getNodeType(type), from, to, children);
+            return new TreeElement(type, from);
+        }
+        /// @internal
+        get buffer() { return new Buffer(this.parser.nodeSet); }
     }
+    /// A Markdown parser configuration.
     class MarkdownParser {
         /// @internal
-        constructor(nodeSet, codeParser, htmlParser) {
+        constructor(
+        /// The parser's syntax [node
+        /// types](https://lezer.codemirror.net/docs/ref/#tree.NodeSet).
+        nodeSet, 
+        /// @internal
+        codeParser, 
+        /// @internal
+        htmlParser, 
+        /// @internal
+        blockParsers, 
+        /// @internal
+        leafBlockParsers, 
+        /// @internal
+        blockNames, 
+        /// @internal
+        endLeafBlock, 
+        /// @internal
+        skipContextMarkup, 
+        /// @internal
+        inlineParsers, 
+        /// @internal
+        inlineNames) {
             this.nodeSet = nodeSet;
             this.codeParser = codeParser;
             this.htmlParser = htmlParser;
+            this.blockParsers = blockParsers;
+            this.leafBlockParsers = leafBlockParsers;
+            this.blockNames = blockNames;
+            this.endLeafBlock = endLeafBlock;
+            this.skipContextMarkup = skipContextMarkup;
+            this.inlineParsers = inlineParsers;
+            this.inlineNames = inlineNames;
+            /// @internal
+            this.nodeTypes = Object.create(null);
+            for (let t of nodeSet.types)
+                this.nodeTypes[t.name] = t.id;
         }
         /// Start a parse on the given input.
         startParse(input, startPos = 0, parseContext = {}) {
-            return new Parse$1(this, input, startPos, parseContext);
+            return new BlockContext(this, input, startPos, parseContext);
         }
         /// Reconfigure the parser.
-        configure(config) {
-            return new MarkdownParser(config.props ? this.nodeSet.extend(...config.props) : this.nodeSet, config.codeParser || this.codeParser, config.htmlParser || this.htmlParser);
+        configure(spec) {
+            let config = resolveConfig(spec);
+            if (!config)
+                return this;
+            let { nodeSet, skipContextMarkup } = this;
+            let blockParsers = this.blockParsers.slice(), leafBlockParsers = this.leafBlockParsers.slice(), blockNames = this.blockNames.slice(), inlineParsers = this.inlineParsers.slice(), inlineNames = this.inlineNames.slice(), endLeafBlock = this.endLeafBlock.slice();
+            if (nonEmpty(config.defineNodes)) {
+                skipContextMarkup = Object.assign({}, skipContextMarkup);
+                let nodeTypes = nodeSet.types.slice();
+                for (let s of config.defineNodes) {
+                    let { name, block, composite } = typeof s == "string" ? { name: s } : s;
+                    if (nodeTypes.some(t => t.name == name))
+                        continue;
+                    if (composite)
+                        skipContextMarkup[nodeTypes.length] =
+                            (bl, cx, line) => composite(cx, line, bl.value);
+                    let id = nodeTypes.length;
+                    let group = composite ? ["Block", "BlockContext"] : !block ? undefined
+                        : id >= Type.ATXHeading1 && id <= Type.SetextHeading2 ? ["Block", "LeafBlock", "Heading"] : ["Block", "LeafBlock"];
+                    nodeTypes.push(NodeType.define({
+                        id,
+                        name,
+                        props: group && [[NodeProp.group, group]]
+                    }));
+                }
+                nodeSet = new NodeSet(nodeTypes);
+            }
+            if (nonEmpty(config.props))
+                nodeSet = nodeSet.extend(...config.props);
+            if (nonEmpty(config.remove)) {
+                for (let rm of config.remove) {
+                    let block = this.blockNames.indexOf(rm), inline = this.inlineNames.indexOf(rm);
+                    if (block > -1)
+                        blockParsers[block] = leafBlockParsers[block] = undefined;
+                    if (inline > -1)
+                        inlineParsers[inline] = undefined;
+                }
+            }
+            if (nonEmpty(config.parseBlock)) {
+                for (let spec of config.parseBlock) {
+                    let found = blockNames.indexOf(spec.name);
+                    if (found > -1) {
+                        blockParsers[found] = spec.parse;
+                        leafBlockParsers[found] = spec.leaf;
+                    }
+                    else {
+                        let pos = spec.before ? findName(blockNames, spec.before)
+                            : spec.after ? findName(blockNames, spec.after) + 1 : blockNames.length - 1;
+                        blockParsers.splice(pos, 0, spec.parse);
+                        leafBlockParsers.splice(pos, 0, spec.leaf);
+                        blockNames.splice(pos, 0, spec.name);
+                    }
+                    if (spec.endLeaf)
+                        endLeafBlock.push(spec.endLeaf);
+                }
+            }
+            if (nonEmpty(config.parseInline)) {
+                for (let spec of config.parseInline) {
+                    let found = inlineNames.indexOf(spec.name);
+                    if (found > -1) {
+                        inlineParsers[found] = spec.parse;
+                    }
+                    else {
+                        let pos = spec.before ? findName(inlineNames, spec.before)
+                            : spec.after ? findName(inlineNames, spec.after) + 1 : inlineNames.length - 1;
+                        inlineParsers.splice(pos, 0, spec.parse);
+                        inlineNames.splice(pos, 0, spec.name);
+                    }
+                }
+            }
+            return new MarkdownParser(nodeSet, config.codeParser || this.codeParser, config.htmlParser || this.htmlParser, blockParsers, leafBlockParsers, blockNames, endLeafBlock, skipContextMarkup, inlineParsers, inlineNames);
+        }
+        /// @internal
+        getNodeType(name) {
+            let found = this.nodeTypes[name];
+            if (found == null)
+                throw new RangeError(`Unknown node type '${name}'`);
+            return found;
+        }
+        /// Parse the given piece of inline text at the given offset,
+        /// returning an array of [`Element`](#Element) objects representing
+        /// the inline content.
+        parseInline(text, offset) {
+            let cx = new InlineContext(this, text, offset);
+            outer: for (let pos = offset; pos < cx.end;) {
+                let next = cx.char(pos);
+                for (let token of this.inlineParsers)
+                    if (token) {
+                        let result = token(cx, next, pos);
+                        if (result >= 0) {
+                            pos = result;
+                            continue outer;
+                        }
+                    }
+                pos++;
+            }
+            return cx.resolveMarkers(0);
         }
     }
-    const parser$3 = new MarkdownParser(new NodeSet(nodeTypes), null, null);
+    function nonEmpty(a) {
+        return a != null && a.length > 0;
+    }
+    function resolveConfig(spec) {
+        if (!Array.isArray(spec))
+            return spec;
+        if (spec.length == 0)
+            return null;
+        let conf = resolveConfig(spec[0]);
+        if (spec.length == 1)
+            return conf;
+        let rest = resolveConfig(spec.slice(1));
+        if (!rest || !conf)
+            return conf || rest;
+        let conc = (a, b) => (a || none).concat(b || none);
+        return { props: conc(conf.props, rest.props),
+            codeParser: rest.codeParser || conf.codeParser,
+            htmlParser: rest.htmlParser || conf.htmlParser,
+            defineNodes: conc(conf.defineNodes, rest.defineNodes),
+            parseBlock: conc(conf.parseBlock, rest.parseBlock),
+            parseInline: conc(conf.parseInline, rest.parseInline),
+            remove: conc(conf.remove, rest.remove) };
+    }
+    function findName(names, name) {
+        let found = names.indexOf(name);
+        if (found < 0)
+            throw new RangeError(`Position specified relative to unknown parser ${name}`);
+        return found;
+    }
+    let nodeTypes = [NodeType.none];
+    for (let i = 1, name; name = Type[i]; i++) {
+        nodeTypes[i] = NodeType.define({
+            id: i,
+            name,
+            props: i >= Type.Escape ? [] : [[NodeProp.group, i in DefaultSkipMarkup ? ["Block", "BlockContext"] : ["Block", "LeafBlock"]]]
+        });
+    }
     function finishContext(stack, nodeSet) {
         let cx = stack.pop();
         let top = stack[stack.length - 1];
@@ -20102,12 +20944,12 @@ const cm = (function () {
         top.positions.push(cx.from - top.from);
         return top;
     }
-    const none$7 = [];
+    const none = [];
     class Buffer {
-        constructor(p) {
+        constructor(nodeSet) {
+            this.nodeSet = nodeSet;
             this.content = [];
             this.nodes = [];
-            this.nodeSet = p.parser.nodeSet;
         }
         write(type, from, to, children = 0) {
             this.content.push(type, from, to, 4 + children * 4);
@@ -20128,21 +20970,33 @@ const cm = (function () {
             });
         }
     }
-    class Element$1 {
-        constructor(type, from, to, children = null) {
+    /// Elements are used to compose syntax nodes during parsing.
+    class Element {
+        /// @internal
+        constructor(
+        /// The node's
+        /// [id](https://lezer.codemirror.net/docs/ref/#tree.NodeType.id).
+        type, 
+        /// The start of the node, as an offset from the start of the document.
+        from, 
+        /// The end of the node.
+        to, 
+        /// The node's child nodes @internal
+        children = none) {
             this.type = type;
             this.from = from;
             this.to = to;
             this.children = children;
         }
+        /// @internal
         writeTo(buf, offset) {
             let startOff = buf.content.length;
-            if (this.children)
-                buf.writeElements(this.children, offset);
+            buf.writeElements(this.children, offset);
             buf.content.push(this.type, this.from + offset, this.to + offset, buf.content.length + 4 - startOff);
         }
-        toTree(nodeSet, offset) {
-            return new Tree(nodeSet.types[this.type], this.children ? this.children.map(ch => ch.toTree(nodeSet, this.from)) : [], this.children ? this.children.map(ch => ch.from + offset) : [], this.to - this.from);
+        /// @internal
+        toTree(nodeSet) {
+            return new Buffer(nodeSet).writeElements(this.children, -this.from).finish(this.type, this.to - this.from);
         }
     }
     class TreeElement {
@@ -20151,6 +21005,8 @@ const cm = (function () {
             this.from = from;
         }
         get to() { return this.from + this.tree.length; }
+        get type() { return this.tree.type.id; }
+        get children() { return none; }
         writeTo(buf, offset) {
             buf.nodes.push(this.tree);
             buf.content.push(buf.nodes.length - 1, this.from + offset, this.to + offset, -1);
@@ -20158,14 +21014,17 @@ const cm = (function () {
         toTree() { return this.tree; }
     }
     function elt(type, from, to, children) {
-        return new Element$1(type, from, to, children);
+        return new Element(type, from, to, children);
     }
-    class InlineMarker {
-        constructor(type, from, to, value) {
+    const EmphasisUnderscore = { resolve: "Emphasis", mark: "EmphasisMark" };
+    const EmphasisAsterisk = { resolve: "Emphasis", mark: "EmphasisMark" };
+    const LinkStart = {}, ImageStart = {};
+    class InlineDelimiter {
+        constructor(type, from, to, side) {
             this.type = type;
             this.from = from;
             this.to = to;
-            this.value = value;
+            this.side = side;
         }
     }
     const Escapable = "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~";
@@ -20174,33 +21033,33 @@ const cm = (function () {
         Punctuation = /[\p{Pc}|\p{Pd}|\p{Pe}|\p{Pf}|\p{Pi}|\p{Po}|\p{Ps}]/u;
     }
     catch (_) { }
-    const InlineTokens = [
-        function escape(cx, next, start) {
-            if (next != 92 /* '\\' */ || start == cx.text.length - 1)
+    const DefaultInline = {
+        Escape(cx, next, start) {
+            if (next != 92 /* '\\' */ || start == cx.end - 1)
                 return -1;
-            let escaped = cx.text.charCodeAt(start + 1);
+            let escaped = cx.char(start + 1);
             for (let i = 0; i < Escapable.length; i++)
                 if (Escapable.charCodeAt(i) == escaped)
                     return cx.append(elt(Type.Escape, start, start + 2));
             return -1;
         },
-        function entity(cx, next, start) {
+        Entity(cx, next, start) {
             if (next != 38 /* '&' */)
                 return -1;
-            let m = /^(?:#\d+|#x[a-f\d]+|\w+);/i.exec(cx.text.slice(start + 1, start + 31));
+            let m = /^(?:#\d+|#x[a-f\d]+|\w+);/i.exec(cx.slice(start + 1, start + 31));
             return m ? cx.append(elt(Type.Entity, start, start + 1 + m[0].length)) : -1;
         },
-        function code(cx, next, start) {
-            if (next != 96 /* '`' */ || start && cx.text.charCodeAt(start - 1) == 96)
+        InlineCode(cx, next, start) {
+            if (next != 96 /* '`' */ || start && cx.char(start - 1) == 96)
                 return -1;
             let pos = start + 1;
-            while (pos < cx.text.length && cx.text.charCodeAt(pos) == 96)
+            while (pos < cx.end && cx.char(pos) == 96)
                 pos++;
             let size = pos - start, curSize = 0;
-            for (; pos < cx.text.length; pos++) {
-                if (cx.text.charCodeAt(pos) == 96) {
+            for (; pos < cx.end; pos++) {
+                if (cx.char(pos) == 96) {
                     curSize++;
-                    if (curSize == size && cx.text.charCodeAt(pos + 1) != 96)
+                    if (curSize == size && cx.char(pos + 1) != 96)
                         return cx.append(elt(Type.InlineCode, start, pos + 1, [
                             elt(Type.CodeMark, start, start + size),
                             elt(Type.CodeMark, pos + 1 - size, pos + 1)
@@ -20212,10 +21071,10 @@ const cm = (function () {
             }
             return -1;
         },
-        function htmlTagOrURL(cx, next, start) {
-            if (next != 60 /* '<' */ || start == cx.text.length - 1)
+        HTMLTag(cx, next, start) {
+            if (next != 60 /* '<' */ || start == cx.end - 1)
                 return -1;
-            let after = cx.text.slice(start + 1);
+            let after = cx.slice(start + 1, cx.end);
             let url = /^(?:[a-z][-\w+.]+:[^\s>]+|[a-z\d.!#$%&'*+/=?^_`{|}~-]+@[a-z\d](?:[a-z\d-]{0,61}[a-z\d])?(?:\.[a-z\d](?:[a-z\d-]{0,61}[a-z\d])?)*)>/i.exec(after);
             if (url)
                 return cx.append(elt(Type.URL, start, start + 1 + url[0].length));
@@ -20230,86 +21089,90 @@ const cm = (function () {
                 return -1;
             let children = [];
             if (cx.parser.htmlParser) {
-                let p = cx.parser.htmlParser.startParse(stringInput(cx.text.slice(start, start + 1 + m[0].length)), 0, {}), tree;
+                let p = cx.parser.htmlParser.startParse(stringInput(cx.slice(start, start + 1 + m[0].length)), 0, {}), tree;
                 while (!(tree = p.advance())) { }
                 children = tree.children.map((ch, i) => new TreeElement(ch, start + tree.positions[i]));
             }
             return cx.append(elt(Type.HTMLTag, start, start + 1 + m[0].length, children));
         },
-        function emphasis(cx, next, start) {
+        Emphasis(cx, next, start) {
             if (next != 95 && next != 42)
                 return -1;
             let pos = start + 1;
-            while (pos < cx.text.length && cx.text.charCodeAt(pos) == next)
+            while (cx.char(pos) == next)
                 pos++;
-            let before = cx.text.charAt(start - 1), after = cx.text.charAt(pos);
+            let before = cx.slice(start - 1, start), after = cx.slice(pos, pos + 1);
             let pBefore = Punctuation.test(before), pAfter = Punctuation.test(after);
             let sBefore = /\s|^$/.test(before), sAfter = /\s|^$/.test(after);
             let leftFlanking = !sAfter && (!pAfter || sBefore || pBefore);
             let rightFlanking = !sBefore && (!pBefore || sAfter || pAfter);
             let canOpen = leftFlanking && (next == 42 || !rightFlanking || pBefore);
             let canClose = rightFlanking && (next == 42 || !leftFlanking || pAfter);
-            return cx.append(new InlineMarker(Type.Emphasis, start, pos, (canOpen ? 1 /* Open */ : 0) | (canClose ? 2 /* Close */ : 0)));
+            return cx.append(new InlineDelimiter(next == 95 ? EmphasisUnderscore : EmphasisAsterisk, start, pos, (canOpen ? 1 /* Open */ : 0) | (canClose ? 2 /* Close */ : 0)));
         },
-        function hardBreak(cx, next, start) {
-            if (next == 92 /* '\\' */ && cx.text.charCodeAt(start + 1) == 10 /* '\n' */)
+        HardBreak(cx, next, start) {
+            if (next == 92 /* '\\' */ && cx.char(start + 1) == 10 /* '\n' */)
                 return cx.append(elt(Type.HardBreak, start, start + 2));
             if (next == 32) {
                 let pos = start + 1;
-                while (pos < cx.text.length && cx.text.charCodeAt(pos) == 32)
+                while (cx.char(pos) == 32)
                     pos++;
-                if (cx.text.charCodeAt(pos) == 10 && pos >= start + 2)
+                if (cx.char(pos) == 10 && pos >= start + 2)
                     return cx.append(elt(Type.HardBreak, start, pos + 1));
             }
             return -1;
         },
-        function linkOpen(cx, next, start) {
-            return next == 91 /* '[' */ ? cx.append(new InlineMarker(Type.Link, start, start + 1, 1)) : -1;
+        Link(cx, next, start) {
+            return next == 91 /* '[' */ ? cx.append(new InlineDelimiter(LinkStart, start, start + 1, 1 /* Open */)) : -1;
         },
-        function imageOpen(cx, next, start) {
-            return next == 33 /* '!' */ && start < cx.text.length - 1 && cx.text.charCodeAt(start + 1) == 91 /* '[' */
-                ? cx.append(new InlineMarker(Type.Image, start, start + 2, 1)) : -1;
+        Image(cx, next, start) {
+            return next == 33 /* '!' */ && cx.char(start + 1) == 91 /* '[' */
+                ? cx.append(new InlineDelimiter(ImageStart, start, start + 2, 1 /* Open */)) : -1;
         },
-        function linkEnd(cx, next, start) {
+        LinkEnd(cx, next, start) {
             if (next != 93 /* ']' */)
                 return -1;
+            // Scanning back to the next link/image start marker
             for (let i = cx.parts.length - 1; i >= 0; i--) {
                 let part = cx.parts[i];
-                if (part instanceof InlineMarker && (part.type == Type.Link || part.type == Type.Image)) {
-                    if (!part.value) {
+                if (part instanceof InlineDelimiter && (part.type == LinkStart || part.type == ImageStart)) {
+                    // If this one has been set invalid (because it would produce
+                    // a nested link) or there's no valid link here ignore both.
+                    if (!part.side || cx.skipSpace(part.to) == start && !/[(\[]/.test(cx.slice(start + 1, start + 2))) {
                         cx.parts[i] = null;
                         return -1;
                     }
-                    if (skipSpace(cx.text, part.to) == start && !/[(\[]/.test(cx.text[start + 1]))
-                        return -1;
-                    let content = cx.resolveMarkers(i + 1);
-                    cx.parts.length = i;
-                    let link = cx.parts[i] = finishLink(cx.text, content, part.type, part.from, start + 1);
-                    for (let j = 0; j < i; j++) {
-                        let p = cx.parts[j];
-                        if (part.type == Type.Link && p instanceof InlineMarker && p.type == Type.Link)
-                            p.value = 0;
-                    }
+                    // Finish the content and replace the entire range in
+                    // this.parts with the link/image node.
+                    let content = cx.takeContent(i);
+                    let link = cx.parts[i] = finishLink(cx, content, part.type == LinkStart ? Type.Link : Type.Image, part.from, start + 1);
+                    // Set any open-link markers before this link to invalid.
+                    if (part.type == LinkStart)
+                        for (let j = 0; j < i; j++) {
+                            let p = cx.parts[j];
+                            if (p instanceof InlineDelimiter && p.type == LinkStart)
+                                p.side = 0;
+                        }
                     return link.to;
                 }
             }
             return -1;
-        },
-    ];
-    function finishLink(text, content, type, start, startPos) {
-        let next = startPos < text.length ? text.charCodeAt(startPos) : -1, endPos = startPos;
+        }
+    };
+    function finishLink(cx, content, type, start, startPos) {
+        let { text } = cx, next = cx.char(startPos), endPos = startPos;
         content.unshift(elt(Type.LinkMark, start, start + (type == Type.Image ? 2 : 1)));
         content.push(elt(Type.LinkMark, startPos - 1, startPos));
         if (next == 40 /* '(' */) {
-            let pos = skipSpace(text, startPos + 1);
-            let dest = parseURL(text, pos), title;
+            let pos = cx.skipSpace(startPos + 1);
+            let dest = parseURL(text, pos - cx.offset, cx.offset), title;
             if (dest) {
-                pos = skipSpace(text, dest.to);
-                title = parseLinkTitle(text, pos);
+                pos = cx.skipSpace(dest.to);
+                title = parseLinkTitle(text, pos - cx.offset, cx.offset);
                 if (title)
-                    pos = skipSpace(text, title.to);
+                    pos = cx.skipSpace(title.to);
             }
-            if (text.charCodeAt(pos) == 41 /* ')' */) {
+            if (cx.char(pos) == 41 /* ')' */) {
                 content.push(elt(Type.LinkMark, startPos, startPos + 1));
                 endPos = pos + 1;
                 if (dest)
@@ -20320,7 +21183,7 @@ const cm = (function () {
             }
         }
         else if (next == 91 /* '[' */) {
-            let label = parseLinkLabel(text, startPos, false);
+            let label = parseLinkLabel(text, startPos - cx.offset, cx.offset, false);
             if (label) {
                 content.push(label);
                 endPos = label.to;
@@ -20328,15 +21191,18 @@ const cm = (function () {
         }
         return elt(type, start, endPos, content);
     }
-    function parseURL(text, start) {
+    // These return `null` when falling off the end of the input, `false`
+    // when parsing fails otherwise (for use in the incremental link
+    // reference parser).
+    function parseURL(text, start, offset) {
         let next = text.charCodeAt(start);
         if (next == 60 /* '<' */) {
             for (let pos = start + 1; pos < text.length; pos++) {
                 let ch = text.charCodeAt(pos);
                 if (ch == 62 /* '>' */)
-                    return elt(Type.URL, start, pos + 1);
+                    return elt(Type.URL, start + offset, pos + 1 + offset);
                 if (ch == 60 || ch == 10 /* '<\n' */)
-                    break;
+                    return false;
             }
             return null;
         }
@@ -20344,7 +21210,7 @@ const cm = (function () {
             let depth = 0, pos = start;
             for (let escaped = false; pos < text.length; pos++) {
                 let ch = text.charCodeAt(pos);
-                if (space$2(ch)) {
+                if (space(ch)) {
                     break;
                 }
                 else if (escaped) {
@@ -20362,117 +21228,124 @@ const cm = (function () {
                     escaped = true;
                 }
             }
-            return pos > start ? elt(Type.URL, start, pos) : null;
+            return pos > start ? elt(Type.URL, start + offset, pos + offset) : pos == text.length ? null : false;
         }
     }
-    function parseLinkTitle(text, start) {
+    function parseLinkTitle(text, start, offset) {
         let next = text.charCodeAt(start);
         if (next != 39 && next != 34 && next != 40 /* '"\'(' */)
-            return null;
+            return false;
         let end = next == 40 ? 41 : next;
         for (let pos = start + 1, escaped = false; pos < text.length; pos++) {
             let ch = text.charCodeAt(pos);
             if (escaped)
                 escaped = false;
             else if (ch == end)
-                return elt(Type.LinkTitle, start, pos + 1);
+                return elt(Type.LinkTitle, start + offset, pos + 1 + offset);
             else if (ch == 92 /* '\\' */)
                 escaped = true;
         }
         return null;
     }
-    function parseLinkLabel(text, start, requireNonWS) {
+    function parseLinkLabel(text, start, offset, requireNonWS) {
         for (let escaped = false, pos = start + 1, end = Math.min(text.length, pos + 999); pos < end; pos++) {
             let ch = text.charCodeAt(pos);
             if (escaped)
                 escaped = false;
             else if (ch == 93 /* ']' */)
-                return requireNonWS ? null : elt(Type.LinkLabel, start, pos + 1);
+                return requireNonWS ? false : elt(Type.LinkLabel, start + offset, pos + 1 + offset);
             else {
-                if (requireNonWS && !space$2(ch))
+                if (requireNonWS && !space(ch))
                     requireNonWS = false;
                 if (ch == 91 /* '[' */)
-                    break;
+                    return false;
                 else if (ch == 92 /* '\\' */)
                     escaped = true;
             }
         }
         return null;
     }
-    function lineEnd(text, pos) {
-        for (; pos < text.length; pos++) {
-            let next = text.charCodeAt(pos);
-            if (next == 10)
-                break;
-            if (!space$2(next))
-                return -1;
-        }
-        return pos;
-    }
-    function parseLinkReference(p, text) {
-        if (text.charCodeAt(0) != 91 /* '[' */)
-            return null;
-        let ref = parseLinkLabel(text, 0, true);
-        if (!ref || text.charCodeAt(ref.to) != 58 /* ':' */)
-            return null;
-        let elts = [ref, elt(Type.LinkMark, ref.to, ref.to + 1)];
-        let url = parseURL(text, skipSpace(text, ref.to + 1));
-        if (!url)
-            return null;
-        elts.push(url);
-        let pos = skipSpace(text, url.to), title, end = 0;
-        if (pos > url.to && (title = parseLinkTitle(text, pos))) {
-            let afterURL = lineEnd(text, title.to);
-            if (afterURL > 0) {
-                elts.push(title);
-                end = afterURL;
-            }
-        }
-        if (end == 0)
-            end = lineEnd(text, url.to);
-        return end < 0 ? null : new Buffer(p).writeElements(elts).finish(Type.LinkReference, end);
-    }
+    /// Inline parsing functions get access to this context, and use it to
+    /// read the content and emit syntax nodes.
     class InlineContext {
-        constructor(parser, text) {
+        /// @internal
+        constructor(
+        /// The parser that is being used.
+        parser, 
+        /// The text of this inline section.
+        text, 
+        /// The starting offset of the section in the document.
+        offset) {
             this.parser = parser;
             this.text = text;
+            this.offset = offset;
+            /// @internal
             this.parts = [];
         }
+        /// Get the character code at the given (document-relative)
+        /// position.
+        char(pos) { return pos >= this.end ? -1 : this.text.charCodeAt(pos - this.offset); }
+        /// The position of the end of this inline section.
+        get end() { return this.offset + this.text.length; }
+        /// Get a substring of this inline section. Again uses
+        /// document-relative positions.
+        slice(from, to) { return this.text.slice(from - this.offset, to - this.offset); }
+        /// @internal
         append(elt) {
             this.parts.push(elt);
             return elt.to;
         }
+        /// Add a [delimiter](#DelimiterType) at this given position. `open`
+        /// and `close` indicate whether this delimiter is opening, closing,
+        /// or both. Returns the end of the delimiter, for convenient
+        /// returning from [parse functions](#InlineParser.parse).
+        addDelimiter(type, from, to, open, close) {
+            return this.append(new InlineDelimiter(type, from, to, (open ? 1 /* Open */ : 0) | (close ? 2 /* Close */ : 0)));
+        }
+        /// Add an inline element. Returns the end of the element.
+        addElement(elt) {
+            return this.append(elt);
+        }
+        /// @internal
         resolveMarkers(from) {
             for (let i = from; i < this.parts.length; i++) {
                 let close = this.parts[i];
-                if (!(close instanceof InlineMarker && close.type == Type.Emphasis && (close.value & 2 /* Close */)))
+                if (!(close instanceof InlineDelimiter && close.type.resolve && (close.side & 2 /* Close */)))
                     continue;
-                let type = this.text.charCodeAt(close.from), closeSize = close.to - close.from;
-                let open, openSize = 0, j = i - 1;
+                let emp = close.type == EmphasisUnderscore || close.type == EmphasisAsterisk;
+                let closeSize = close.to - close.from;
+                let open, j = i - 1;
                 for (; j >= from; j--) {
                     let part = this.parts[j];
-                    if (!(part instanceof InlineMarker && (part.value & 1 /* Open */) && this.text.charCodeAt(part.from) == type))
+                    if (!(part instanceof InlineDelimiter && (part.side & 1 /* Open */) && part.type == close.type) ||
+                        emp && ((close.side & 1 /* Open */) || (part.side & 2 /* Close */)) &&
+                            (part.to - part.from + closeSize) % 3 == 0 && ((part.to - part.from) % 3 || closeSize % 3))
                         continue;
-                    openSize = part.to - part.from;
-                    if (!((close.value & 1 /* Open */) || (part.value & 2 /* Close */)) ||
-                        (openSize + closeSize) % 3 || (openSize % 3 == 0 && closeSize % 3 == 0)) {
-                        open = part;
-                        break;
-                    }
+                    open = part;
+                    break;
                 }
                 if (!open)
                     continue;
-                let size = Math.min(2, openSize, closeSize);
-                let start = open.to - size, end = close.from + size, content = [elt(Type.EmphasisMark, start, open.to)];
+                let type = close.type.resolve, content = [];
+                let start = open.from, end = close.to;
+                if (emp) {
+                    let size = Math.min(2, open.to - open.from, closeSize);
+                    start = open.to - size;
+                    end = close.from + size;
+                    type = size == 1 ? "Emphasis" : "StrongEmphasis";
+                }
+                if (open.type.mark)
+                    content.push(this.elt(open.type.mark, start, open.to));
                 for (let k = j + 1; k < i; k++) {
-                    if (this.parts[k] instanceof Element$1)
+                    if (this.parts[k] instanceof Element)
                         content.push(this.parts[k]);
                     this.parts[k] = null;
                 }
-                content.push(elt(Type.EmphasisMark, close.from, end));
-                let element = elt(size == 1 ? Type.Emphasis : Type.StrongEmphasis, open.to - size, close.from + size, content);
-                this.parts[j] = open.from == start ? null : new InlineMarker(open.type, open.from, start, open.value);
-                let keep = this.parts[i] = close.to == end ? null : new InlineMarker(close.type, end, close.to, close.value);
+                if (close.type.mark)
+                    content.push(this.elt(close.type.mark, close.from, end));
+                let element = this.elt(type, start, end, content);
+                this.parts[j] = emp && open.from != start ? new InlineDelimiter(open.type, open.from, start, open.side) : null;
+                let keep = this.parts[i] = emp && close.to != end ? new InlineDelimiter(close.type, end, close.to, close.side) : null;
                 if (keep)
                     this.parts.splice(i, 0, element);
                 else
@@ -20481,54 +21354,58 @@ const cm = (function () {
             let result = [];
             for (let i = from; i < this.parts.length; i++) {
                 let part = this.parts[i];
-                if (part instanceof Element$1)
+                if (part instanceof Element)
                     result.push(part);
             }
             return result;
         }
-    }
-    function parseInline(p, text) {
-        let cx = new InlineContext(p.parser, text);
-        outer: for (let pos = 0; pos < text.length;) {
-            let next = text.charCodeAt(pos);
-            for (let token of InlineTokens) {
-                let result = token(cx, next, pos);
-                if (result >= 0) {
-                    pos = result;
-                    continue outer;
-                }
+        /// Find an opening delimiter of the given type. Returns `null` if
+        /// no delimiter is found, or an index that can be passed to
+        /// [`takeContent`](#InlineContext.takeContent) otherwise.
+        findOpeningDelimiter(type) {
+            for (let i = this.parts.length - 1; i >= 0; i--) {
+                let part = this.parts[i];
+                if (part instanceof InlineDelimiter && part.type == type)
+                    return i;
             }
-            pos++;
+            return null;
         }
-        return cx.resolveMarkers(0);
-    }
-    function clearMarks(content, marks, offset) {
-        if (!marks.length)
+        /// Remove all inline elements and delimiters starting from the
+        /// given index (which you should get from
+        /// [`findOpeningDelimiter`](#InlineContext.findOpeningDelimiter),
+        /// resolve delimiters inside of them, and return them as an array
+        /// of elements.
+        takeContent(startIndex) {
+            let content = this.resolveMarkers(startIndex);
+            this.parts.length = startIndex;
             return content;
-        let result = "", pos = 0;
-        for (let m of marks) {
-            let from = m.from - offset, to = m.to - offset;
-            result += content.slice(pos, from);
-            for (let i = from; i < to; i++)
-                result += " ";
-            pos = to;
         }
-        result += content.slice(pos);
-        return result;
+        /// Skip space after the given (document) position, returning either
+        /// the position of the next non-space character or the end of the
+        /// section.
+        skipSpace(from) { return skipSpace(this.text, from - this.offset) + this.offset; }
+        elt(type, from, to, children) {
+            if (typeof type == "string")
+                return elt(this.parser.getNodeType(type), from, to, children);
+            return new TreeElement(type, from);
+        }
     }
-    function injectMarks(elts, marks, offset) {
-        let eI = 0;
+    function injectMarks(elements, marks) {
+        if (!marks.length)
+            return elements;
+        if (!elements.length)
+            return marks;
+        let elts = elements.slice(), eI = 0;
         for (let mark of marks) {
-            let m = elt(mark.type, mark.from - offset, mark.to - offset);
-            while (eI < elts.length && elts[eI].to < m.to)
+            while (eI < elts.length && elts[eI].to < mark.to)
                 eI++;
-            if (eI < elts.length && elts[eI].from < m.from) {
+            if (eI < elts.length && elts[eI].from < mark.from) {
                 let e = elts[eI];
-                if (e instanceof Element$1)
-                    elts[eI] = new Element$1(e.type, e.from, e.to, e.children ? injectMarks(e.children.slice(), [m], 0) : [m]);
+                if (e instanceof Element)
+                    elts[eI] = new Element(e.type, e.from, e.to, injectMarks(e.children, [mark]));
             }
             else {
-                elts.splice(eI++, 0, m);
+                elts.splice(eI++, 0, mark);
             }
         }
         return elts;
@@ -20544,7 +21421,7 @@ const cm = (function () {
     // These are blocks that can span blank lines, and should thus only be
     // reused if their next sibling is also being reused.
     const NotLast = [Type.CodeBlock, Type.ListItem, Type.OrderedList, Type.BulletList];
-    class FragmentCursor$1 {
+    class FragmentCursor {
         constructor(fragments, input) {
             this.fragments = fragments;
             this.input = input;
@@ -20595,9 +21472,9 @@ const cm = (function () {
             let tree = this.cursor.tree;
             return tree && ContextHash.get(tree) == hash;
         }
-        takeNodes(p) {
+        takeNodes(cx) {
             let cur = this.cursor, off = this.fragment.offset;
-            let start = p._pos, end = start, blockI = p.context.children.length;
+            let start = cx.lineStart, end = start, blockI = cx.block.children.length;
             let prevEnd = end, prevI = blockI;
             for (;;) {
                 if (cur.to - off >= this.fragmentEnd) {
@@ -20605,7 +21482,7 @@ const cm = (function () {
                         continue;
                     break;
                 }
-                p.addNode(cur.tree, cur.from - off);
+                cx.addNode(cur.tree, cur.from - off);
                 // Taken content must always end in a block, because incremental
                 // parsing happens on block boundaries. Never stop directly
                 // after an indented code block, since those can continue after
@@ -20613,46 +21490,254 @@ const cm = (function () {
                 if (cur.type.is("Block")) {
                     if (NotLast.indexOf(cur.type.id) < 0) {
                         end = cur.to - off;
-                        blockI = p.context.children.length;
+                        blockI = cx.block.children.length;
                     }
                     else {
                         end = prevEnd;
                         blockI = prevI;
                         prevEnd = cur.to - off;
-                        prevI = p.context.children.length;
+                        prevI = cx.block.children.length;
                     }
                 }
                 if (!cur.nextSibling())
                     break;
             }
-            while (p.context.children.length > blockI) {
-                p.context.children.pop();
-                p.context.positions.pop();
+            while (cx.block.children.length > blockI) {
+                cx.block.children.pop();
+                cx.block.positions.pop();
             }
             return end - start;
         }
     }
+    /// The default CommonMark parser.
+    const parser = new MarkdownParser(new NodeSet(nodeTypes), null, null, Object.keys(DefaultBlockParsers).map(n => DefaultBlockParsers[n]), Object.keys(DefaultBlockParsers).map(n => DefaultLeafBlocks[n]), Object.keys(DefaultBlockParsers), DefaultEndLeaf, DefaultSkipMarkup, Object.keys(DefaultInline).map(n => DefaultInline[n]), Object.keys(DefaultInline));
+
+    const StrikethroughDelim = { resolve: "Strikethrough", mark: "StrikethroughMark" };
+    /// An extension that implements
+    /// [GFM-style](https://github.github.com/gfm/#strikethrough-extension-)
+    /// Strikethrough syntax using `~~` delimiters.
+    const Strikethrough = {
+        defineNodes: ["Strikethrough", "StrikethroughMark"],
+        parseInline: [{
+                name: "Strikethrough",
+                parse(cx, next, pos) {
+                    if (next != 126 /* '~' */ || cx.char(pos + 1) != 126)
+                        return -1;
+                    return cx.addDelimiter(StrikethroughDelim, pos, pos + 2, true, true);
+                },
+                after: "Emphasis"
+            }]
+    };
+    function parseRow(cx, line, startI = 0, elts, offset = 0) {
+        let count = 0, first = true, cellStart = -1, cellEnd = -1, esc = false;
+        let parseCell = () => {
+            elts.push(cx.elt("TableCell", offset + cellStart, offset + cellEnd, cx.parser.parseInline(line.slice(cellStart, cellEnd), offset + cellStart)));
+        };
+        for (let i = startI; i < line.length; i++) {
+            let next = line.charCodeAt(i);
+            if (next == 124 /* '|' */ && !esc) {
+                if (!first || cellStart > -1)
+                    count++;
+                first = false;
+                if (elts) {
+                    if (cellStart > -1)
+                        parseCell();
+                    elts.push(cx.elt("TableDelimiter", i + offset, i + offset + 1));
+                }
+                cellStart = cellEnd = -1;
+            }
+            else if (esc || next != 32 && next != 9) {
+                if (cellStart < 0)
+                    cellStart = i;
+                cellEnd = i + 1;
+            }
+            esc = !esc && next == 92;
+        }
+        if (cellStart > -1) {
+            count++;
+            if (elts)
+                parseCell();
+        }
+        return count;
+    }
+    function hasPipe(str, start) {
+        for (let i = start; i < str.length; i++) {
+            let next = str.charCodeAt(i);
+            if (next == 124 /* '|' */)
+                return true;
+            if (next == 92 /* '\\' */)
+                i++;
+        }
+        return false;
+    }
+    class TableParser {
+        constructor() {
+            // Null means we haven't seen the second line yet, false means this
+            // isn't a table, and an array means this is a table and we've
+            // parsed the given rows so far.
+            this.rows = null;
+        }
+        nextLine(cx, line, leaf) {
+            if (this.rows == null) { // Second line
+                this.rows = false;
+                let lineText;
+                if ((line.next == 45 || line.next == 58 || line.next == 124 /* '-:|' */) &&
+                    /^\|?(\s*:?-+:?\s*\|)+(\s*:?-+:?\s*)?$/.test(lineText = line.text.slice(line.pos))) {
+                    let firstRow = [], firstCount = parseRow(cx, leaf.content, 0, firstRow, leaf.start);
+                    if (firstCount == parseRow(cx, lineText, line.pos))
+                        this.rows = [cx.elt("TableHeader", leaf.start, leaf.start + leaf.content.length, firstRow),
+                            cx.elt("TableDelimiter", cx.lineStart + line.pos, cx.lineStart + line.text.length)];
+                }
+            }
+            else if (this.rows) { // Line after the second
+                let content = [];
+                parseRow(cx, line.text, line.pos, content, cx.lineStart);
+                this.rows.push(cx.elt("TableRow", cx.lineStart + line.pos, cx.lineStart + line.text.length, content));
+            }
+            return false;
+        }
+        finish(cx, leaf) {
+            if (this.rows) {
+                this.emit(cx, leaf);
+                return true;
+            }
+            return false; // FIXME
+        }
+        emit(cx, leaf) {
+            cx.addLeafElement(leaf, cx.elt("Table", leaf.start, leaf.start + leaf.content.length, this.rows));
+        }
+    }
+    /// This extension provides
+    /// [GFM-style](https://github.github.com/gfm/#tables-extension-)
+    /// tables, using syntax like this:
+    ///
+    /// ```
+    /// | head 1 | head 2 |
+    /// | ---    | ---    |
+    /// | cell 1 | cell 2 |
+    /// ```
+    const Table = {
+        defineNodes: [
+            { name: "Table", block: true },
+            "TableHeader",
+            "TableRow",
+            "TableCell",
+            "TableDelimiter"
+        ],
+        parseBlock: [{
+                name: "Table",
+                leaf(_, leaf) { return hasPipe(leaf.content, 0) ? new TableParser : null; },
+                before: "SetextHeading"
+            }]
+    };
+    class TaskParser {
+        nextLine() { return false; }
+        finish(cx, leaf) {
+            cx.addLeafElement(leaf, cx.elt("Task", leaf.start, leaf.start + leaf.content.length, [
+                cx.elt("TaskMarker", leaf.start, leaf.start + 3),
+                ...cx.parser.parseInline(leaf.content.slice(3), leaf.start + 3)
+            ]));
+            return true;
+        }
+    }
+    /// Extension providing
+    /// [GFM-style](https://github.github.com/gfm/#task-list-items-extension-)
+    /// task list items, where list items can be prefixed with `[ ]` or
+    /// `[x]` to add a checkbox.
+    const TaskList = {
+        defineNodes: [
+            { name: "Task", block: true },
+            "TaskMarker"
+        ],
+        parseBlock: [{
+                name: "TaskList",
+                leaf(cx, leaf) {
+                    return /^\[[ xX]\]/.test(leaf.content) && cx.parser.nodeSet.types[cx.block.type].name == "ListItem" ? new TaskParser : null;
+                },
+                after: "SetextHeading"
+            }]
+    };
+    /// Extension bundle containing [`Table`](#Table),
+    /// [`TaskList`](#TaskList) and [`Strikethrough`](#Strikethrough).
+    const GFM = [Table, TaskList, Strikethrough];
+    function parseSubSuper(ch, node, mark) {
+        return (cx, next, pos) => {
+            if (next != ch || cx.char(pos + 1) == ch)
+                return -1;
+            let elts = [cx.elt(mark, pos, pos + 1)];
+            for (let i = pos + 1; i < cx.end; i++) {
+                let next = cx.char(i);
+                if (next == ch)
+                    return cx.addElement(cx.elt(node, pos, i + 1, elts.concat(cx.elt(mark, i, i + 1))));
+                if (next == 92 /* '\\' */)
+                    elts.push(cx.elt("Escape", i, i++ + 2));
+                if (space(next))
+                    break;
+            }
+            return -1;
+        };
+    }
+    /// Extension providing
+    /// [Pandoc-style](https://pandoc.org/MANUAL.html#superscripts-and-subscripts)
+    /// superscript using `^` markers.
+    const Superscript = {
+        defineNodes: ["Superscript", "SuperscriptMark"],
+        parseInline: [{
+                name: "Superscript",
+                parse: parseSubSuper(94 /* '^' */, "Superscript", "SuperscriptMark")
+            }]
+    };
+    /// Extension providing
+    /// [Pandoc-style](https://pandoc.org/MANUAL.html#superscripts-and-subscripts)
+    /// subscript using `~` markers.
+    const Subscript = {
+        defineNodes: ["Subscript", "SubscriptMark"],
+        parseInline: [{
+                name: "Subscript",
+                parse: parseSubSuper(126 /* '~' */, "Subscript", "SubscriptMark")
+            }]
+    };
+    /// Extension that parses two colons with only letters, underscores,
+    /// and numbers between them as `Emoji` nodes.
+    const Emoji = {
+        defineNodes: ["Emoji"],
+        parseInline: [{
+                name: "Emoji",
+                parse(cx, next, pos) {
+                    let match;
+                    if (next != 58 /* ':' */ || !(match = /^[a-zA-Z_0-9]+:/.exec(cx.slice(pos + 1, cx.end))))
+                        return -1;
+                    return cx.addElement(cx.elt("Emoji", pos, pos + 1 + match[0].length));
+                }
+            }]
+    };
 
     const data = defineLanguageFacet({ block: { open: "<!--", close: "-->" } });
-    const parser$4 = parser$3.configure({
+    const commonmark = parser.configure({
         props: [
             styleTags({
-                "Blockquote/...": tags.quote,
-                HorizontalRule: tags.contentSeparator,
-                "ATXHeading/... SetextHeading/...": tags.heading,
-                "Comment CommentBlock": tags.comment,
-                Escape: tags.escape,
-                Entity: tags.character,
-                "Emphasis/...": tags.emphasis,
-                "StrongEmphasis/...": tags.strong,
-                "Link/... Image/...": tags.link,
-                "OrderedList/... BulletList/...": tags.list,
-                "BlockQuote/...": tags.quote,
-                InlineCode: tags.monospace,
-                URL: tags.url,
-                "HeaderMark HardBreak QuoteMark ListMark LinkMark EmphasisMark CodeMark": tags.processingInstruction,
-                "CodeInfo LinkLabel": tags.labelName,
-                LinkTitle: tags.string
+                "Blockquote/...": tags$1.quote,
+                HorizontalRule: tags$1.contentSeparator,
+                "ATXHeading1/... SetextHeading1/...": tags$1.heading1,
+                "ATXHeading2/... SetextHeading2/...": tags$1.heading2,
+                "ATXHeading3/...": tags$1.heading3,
+                "ATXHeading4/...": tags$1.heading4,
+                "ATXHeading5/...": tags$1.heading5,
+                "ATXHeading6/...": tags$1.heading6,
+                "Comment CommentBlock": tags$1.comment,
+                Escape: tags$1.escape,
+                Entity: tags$1.character,
+                "Emphasis/...": tags$1.emphasis,
+                "StrongEmphasis/...": tags$1.strong,
+                "Link/... Image/...": tags$1.link,
+                "OrderedList/... BulletList/...": tags$1.list,
+                "BlockQuote/...": tags$1.quote,
+                InlineCode: tags$1.monospace,
+                URL: tags$1.url,
+                "HeaderMark HardBreak QuoteMark ListMark LinkMark EmphasisMark CodeMark": tags$1.processingInstruction,
+                "CodeInfo LinkLabel": tags$1.labelName,
+                LinkTitle: tags$1.string,
+                Paragraph: tags$1.content
             }),
             foldNodeProp.add(type => {
                 if (!type.is("Block") || type.is("Document"))
@@ -20668,14 +21753,34 @@ const cm = (function () {
         ],
         htmlParser: htmlLanguage.parser.configure({ dialect: "noMatch" }),
     });
-    /// Language support for Markdown/CommonMark.
-    const markdownLanguage = new Language(data, parser$4);
+    /// Language support for strict CommonMark.
+    const commonmarkLanguage = mkLang(commonmark);
+    const extended = commonmark.configure([GFM, Subscript, Superscript, Emoji, {
+            props: [
+                styleTags({
+                    "TableDelimiter SubscriptMark SuperscriptMark StrikethroughMark": tags$1.processingInstruction,
+                    "TableHeader/...": tags$1.heading,
+                    "Strikethrough/...": tags$1.deleted,
+                    TaskMarker: tags$1.atom,
+                    Task: tags$1.list,
+                    Emoji: tags$1.character,
+                    "Subscript Superscript": tags$1.special(tags$1.content),
+                    TableCell: tags$1.content
+                })
+            ]
+        }]);
+    /// Language support for [GFM](https://github.github.com/gfm/) plus
+    /// subscript, superscript, and emoji syntax.
+    const markdownLanguage = mkLang(extended);
+    function mkLang(parser) {
+        return new Language(data, parser, parser.nodeSet.types.find(t => t.name == "Document"));
+    }
     // Create an instance of the Markdown language that will, for code
     // blocks, try to find a language that matches the block's info
     // string in `languages` or, if none if found, use `defaultLanguage`
     // to parse the block.
-    function markdownWithCodeLanguages(languages, defaultLanguage) {
-        return new Language(data, parser$4.configure({
+    function addCodeLanguages(languages, defaultLanguage) {
+        return {
             codeParser(info) {
                 let found = info && LanguageDescription.matchLanguageName(languages, info, true);
                 if (!found)
@@ -20685,10 +21790,10 @@ const cm = (function () {
                 found.load();
                 return EditorParseContext.skippingParser;
             }
-        }));
+        };
     }
 
-    function nodeStart$1(node, doc) {
+    function nodeStart(node, doc) {
         return doc.sliceString(node.from, node.from + 50);
     }
     function gatherMarkup(node, line, doc) {
@@ -20705,13 +21810,13 @@ const cm = (function () {
                 pos += match[0].length;
             }
             else if (node.name == "ListItem" && node.parent.name == "OrderedList" &&
-                (match = /^\s*\d+([.)])\s*/.exec(nodeStart$1(node, doc)))) {
+                (match = /^\s*\d+([.)])\s*/.exec(nodeStart(node, doc)))) {
                 let len = match[1].length >= 4 ? match[0].length - match[1].length + 1 : match[0].length;
                 markup.push({ from: pos, string: line.slice(pos, pos + len).replace(/\S/g, " "), node });
                 pos += len;
             }
             else if (node.name == "ListItem" && node.parent.name == "BulletList" &&
-                (match = /^\s*[-+*] (\s*)/.exec(nodeStart$1(node, doc)))) {
+                (match = /^\s*[-+*] (\s*)/.exec(nodeStart(node, doc)))) {
                 let len = match[1].length >= 4 ? match[0].length - match[1].length : match[0].length;
                 markup.push({ from: pos, string: line.slice(pos, pos + len).replace(/\S/g, " "), node });
                 pos += len;
@@ -20777,6 +21882,8 @@ const cm = (function () {
                     }
                 }
                 let insert = markup.map(m => m.string).join("");
+                if (range.from - line.from < insert.length)
+                    insert = "";
                 changes.push({ from, to: range.from, insert: Text.of(["", insert]) });
                 return { range: EditorSelection.cursor(from + 1 + insert.length), changes };
             }
@@ -20834,92 +21941,114 @@ const cm = (function () {
     ];
     /// Markdown language support.
     function markdown(config = {}) {
-        let { codeLanguages, defaultCodeLanguage, addKeymap = true } = config;
-        let language = codeLanguages || defaultCodeLanguage ? markdownWithCodeLanguages(codeLanguages || [], defaultCodeLanguage)
-            : markdownLanguage;
-        return new LanguageSupport(language, addKeymap ? Prec.extend(keymap.of(markdownKeymap)) : []);
+        let { codeLanguages, defaultCodeLanguage, addKeymap = true, base: { parser } = commonmarkLanguage } = config;
+        let extensions = config.extensions ? [config.extensions] : [];
+        if (!(parser instanceof MarkdownParser))
+            throw new RangeError("Base parser provided to `markdown` should be a Markdown parser");
+        if (codeLanguages || defaultCodeLanguage)
+            extensions.push(addCodeLanguages(codeLanguages || [], defaultCodeLanguage));
+        return new LanguageSupport(mkLang(parser.configure(extensions)), addKeymap ? Prec.extend(keymap.of(markdownKeymap)) : []);
     }
 
-    const chalky = "#e5c07b", coral = "#e06c75", cyan = "#56b6c2", invalid = "#ffffff", ivory = "#abb2bf", stone = "#5c6370", malibu = "#61afef", sage = "#98c379", whiskey = "#d19a66", violet = "#c678dd", background = "#282c34", selection = "#3E4451", cursor = "#528bff";
+    // Using https://github.com/one-dark/vscode-one-dark-theme/ as reference for the colors
+    const chalky = "#e5c07b", coral = "#e06c75", cyan = "#56b6c2", invalid = "#ffffff", ivory = "#abb2bf", stone = "#7d8799", // Brightened compared to original to increase contrast
+    malibu = "#61afef", sage = "#98c379", whiskey = "#d19a66", violet = "#c678dd", darkBackground = "#21252b", highlightBackground = "#2c313a", background = "#282c34", selection = "#3E4451", cursor = "#528bff";
     /// The editor theme styles for One Dark.
     const oneDarkTheme = EditorView.theme({
-        $: {
+        "&": {
             color: ivory,
             backgroundColor: background,
             "& ::selection": { backgroundColor: selection },
             caretColor: cursor
         },
-        "$$focused $cursor": { borderLeftColor: cursor },
-        "$$focused $selectionBackground": { backgroundColor: selection },
-        $panels: { backgroundColor: background, color: ivory },
-        "$panels.top": { borderBottom: "2px solid black" },
-        "$panels.bottom": { borderTop: "2px solid black" },
-        $searchMatch: {
+        "&.cm-focused .cm-cursor": { borderLeftColor: cursor },
+        "&.cm-focused .cm-selectionBackground, .cm-selectionBackground": { backgroundColor: selection },
+        ".cm-panels": { backgroundColor: darkBackground, color: ivory },
+        ".cm-panels.cm-panels-top": { borderBottom: "2px solid black" },
+        ".cm-panels.cm-panels-bottom": { borderTop: "2px solid black" },
+        ".cm-searchMatch": {
             backgroundColor: "#72a1ff59",
             outline: "1px solid #457dff"
         },
-        "$searchMatch.selected": {
+        ".cm-searchMatch.cm-searchMatch-selected": {
             backgroundColor: "#6199ff2f"
         },
-        $activeLine: { backgroundColor: "#2c313c" },
-        $selectionMatch: { backgroundColor: "#aafe661a" },
-        "$matchingBracket, $nonmatchingBracket": {
+        ".cm-activeLine": { backgroundColor: highlightBackground },
+        ".cm-selectionMatch": { backgroundColor: "#aafe661a" },
+        ".cm-matchingBracket, .cm-nonmatchingBracket": {
             backgroundColor: "#bad0f847",
             outline: "1px solid #515a6b"
         },
-        $gutters: {
+        ".cm-gutters": {
             backgroundColor: background,
-            color: "#545868",
+            color: stone,
             border: "none"
         },
-        "$gutterElement.lineNumber": { color: "inherit" },
-        $foldPlaceholder: {
-            backgroundColor: "none",
+        ".cm-lineNumbers .cm-gutterElement": { color: "inherit" },
+        ".cm-foldPlaceholder": {
+            backgroundColor: "transparent",
             border: "none",
             color: "#ddd"
         },
-        $tooltip: {
+        ".cm-tooltip": {
             border: "1px solid #181a1f",
-            backgroundColor: "#606862"
+            backgroundColor: darkBackground
         },
-        "$tooltip.autocomplete": {
+        ".cm-tooltip-autocomplete": {
             "& > ul > li[aria-selected]": {
-                backgroundColor: background,
+                backgroundColor: highlightBackground,
                 color: ivory
             }
         }
     }, { dark: true });
     /// The highlighting style for code in the One Dark theme.
-    const oneDarkHighlightStyle = HighlightStyle.define({ tag: tags.keyword,
-        color: violet }, { tag: [tags.name, tags.deleted, tags.character, tags.propertyName, tags.macroName],
-        color: coral }, { tag: [tags.processingInstruction, tags.string, tags.inserted],
-        color: sage }, { tag: [tags.function(tags.variableName), tags.labelName],
-        color: malibu }, { tag: [tags.color, tags.constant(tags.name), tags.standard(tags.name)],
-        color: whiskey }, { tag: [tags.definition(tags.name), tags.separator],
-        color: ivory }, { tag: [tags.typeName, tags.className, tags.number, tags.changed, tags.annotation, tags.modifier, tags.self, tags.namespace],
-        color: chalky }, { tag: [tags.operator, tags.operatorKeyword, tags.url, tags.escape, tags.regexp, tags.link, tags.special(tags.string)],
-        color: cyan }, { tag: [tags.meta, tags.comment],
-        color: stone }, { tag: tags.strong,
-        fontWeight: "bold" }, { tag: tags.emphasis,
-        fontStyle: "italic" }, { tag: tags.link,
-        color: stone,
-        textDecoration: "underline" }, { tag: tags.heading,
-        fontWeight: "bold",
-        color: coral }, { tag: [tags.atom, tags.bool, tags.special(tags.variableName)],
-        color: whiskey }, { tag: tags.invalid,
-        color: invalid });
+    const oneDarkHighlightStyle = HighlightStyle.define([
+        { tag: tags$1.keyword,
+            color: violet },
+        { tag: [tags$1.name, tags$1.deleted, tags$1.character, tags$1.propertyName, tags$1.macroName],
+            color: coral },
+        { tag: [tags$1.function(tags$1.variableName), tags$1.labelName],
+            color: malibu },
+        { tag: [tags$1.color, tags$1.constant(tags$1.name), tags$1.standard(tags$1.name)],
+            color: whiskey },
+        { tag: [tags$1.definition(tags$1.name), tags$1.separator],
+            color: ivory },
+        { tag: [tags$1.typeName, tags$1.className, tags$1.number, tags$1.changed, tags$1.annotation, tags$1.modifier, tags$1.self, tags$1.namespace],
+            color: chalky },
+        { tag: [tags$1.operator, tags$1.operatorKeyword, tags$1.url, tags$1.escape, tags$1.regexp, tags$1.link, tags$1.special(tags$1.string)],
+            color: cyan },
+        { tag: [tags$1.meta, tags$1.comment],
+            color: stone },
+        { tag: tags$1.strong,
+            fontWeight: "bold" },
+        { tag: tags$1.emphasis,
+            fontStyle: "italic" },
+        { tag: tags$1.link,
+            color: stone,
+            textDecoration: "underline" },
+        { tag: tags$1.heading,
+            fontWeight: "bold",
+            color: coral },
+        { tag: [tags$1.atom, tags$1.bool, tags$1.special(tags$1.variableName)],
+            color: whiskey },
+        { tag: [tags$1.processingInstruction, tags$1.string, tags$1.inserted],
+            color: sage },
+        { tag: tags$1.invalid,
+            color: invalid },
+    ]);
     /// Extension to enable the One Dark theme (both the editor theme and
     /// the highlight style).
     const oneDark = [oneDarkTheme, oneDarkHighlightStyle];
 
     let editor = new EditorView({
-      state: EditorState.create({
-        //extensions: [basicSetup, markdown(), oneDark]
-        extensions: [basicSetup, markdown()]
-      }),
-      parent: document.getElementById("codemirror")
+        state: EditorState.create({
+            //extensions: [basicSetup, markdown(), oneDark]
+            extensions: [basicSetup, markdown()]
+        }),
+        parent: document.getElementById("codemirror")
     });
 
     return editor;
 
 }());
+
